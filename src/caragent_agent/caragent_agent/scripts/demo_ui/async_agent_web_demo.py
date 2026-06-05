@@ -1,0 +1,3280 @@
+"""Minimal local web UI for AsyncAgent message input and live plan inspection."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import threading
+import time
+from collections import deque
+from datetime import datetime
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+from caragent_agent.agents.async_agent import AsyncAgent
+from caragent_agent.agents.async_agent.execution.support import (
+    normalize_turn_response_items,
+)
+from caragent_agent.agents.async_agent.planning.plan_graph import (
+    iter_plan_edges,
+    summarize_plan_graph,
+    validate_plan_graph,
+)
+from caragent_agent.agents.async_agent.planning.task_graph import (
+    collect_ordered_task_ids_for_plan,
+    get_task_progress_context,
+)
+from caragent_agent.config.config import config
+from caragent_agent.config.runtime_paths import (
+    get_default_scene_dataset_dir,
+    normalize_runtime_path,
+)
+from caragent_agent.impression_graph.scene_memory import SceneMemory
+from caragent_agent.io_adapters import (
+    adapt_turn_result_language,
+    current_controller_image,
+    detect_language,
+    describe_image_for_navigation,
+    image_from_data_url,
+    image_to_data_url,
+    normalize_language,
+    prepare_user_message_for_agent,
+)
+
+DEFAULT_DATASET_DIR = get_default_scene_dataset_dir()
+LOG_ENTRY_START_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\]")
+
+APP_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CarAgent Plan Console</title>
+  <style>
+    :root {
+      --bg: #f4efe7;
+      --panel: rgba(255, 252, 247, 0.92);
+      --panel-strong: #fffdf9;
+      --line: #d7caba;
+      --text: #231b14;
+      --muted: #756657;
+      --accent: #b95c37;
+      --accent-deep: #8f3f20;
+      --ok: #2f7d4d;
+      --warn: #9c6a14;
+      --wait: #376ea6;
+      --fail: #a23535;
+      --shadow: 0 18px 40px rgba(62, 41, 23, 0.12);
+      --radius: 18px;
+      --mono: "Consolas", "SFMono-Regular", monospace;
+      --sans: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(255,255,255,0.7), transparent 28%),
+        linear-gradient(160deg, #efe4d2 0%, #f5f0e9 45%, #e8dccf 100%);
+      min-height: 100vh;
+    }
+
+    .shell {
+      max-width: 1480px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+
+    .hero {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: flex-start;
+      margin-bottom: 18px;
+      padding: 22px 24px;
+      border: 1px solid rgba(137, 103, 71, 0.18);
+      border-radius: 24px;
+      background: linear-gradient(135deg, rgba(255,255,255,0.78), rgba(246,235,221,0.92));
+      box-shadow: var(--shadow);
+    }
+
+    .hero h1 {
+      margin: 0;
+      font-size: clamp(28px, 4vw, 40px);
+      line-height: 1;
+      letter-spacing: 0.02em;
+    }
+
+    .hero p {
+      margin: 10px 0 0;
+      color: var(--muted);
+      max-width: 680px;
+    }
+
+    .meta-chip-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      justify-content: flex-end;
+    }
+
+    .meta-chip {
+      padding: 10px 14px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.8);
+      border: 1px solid rgba(137, 103, 71, 0.16);
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(360px, 1.15fr) minmax(340px, 0.85fr);
+      gap: 18px;
+    }
+
+    .panel {
+      border-radius: var(--radius);
+      border: 1px solid rgba(137, 103, 71, 0.16);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      min-height: 0;
+    }
+
+    .panel-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      padding: 16px 18px;
+      border-bottom: 1px solid rgba(137, 103, 71, 0.12);
+      background: rgba(255,255,255,0.58);
+    }
+
+    .panel-head h2 {
+      margin: 0;
+      font-size: 17px;
+    }
+
+    .panel-head .sub {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .conversation {
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      min-height: 78vh;
+    }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(120px, 1fr));
+      gap: 12px;
+      padding: 16px 18px 0;
+    }
+
+    .summary-card {
+      padding: 14px;
+      border-radius: 16px;
+      background: var(--panel-strong);
+      border: 1px solid rgba(137, 103, 71, 0.12);
+    }
+
+    .summary-card .k {
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+
+    .summary-card .v {
+      font-size: 18px;
+      font-weight: 700;
+      word-break: break-word;
+    }
+
+    .history {
+      padding: 18px;
+      overflow: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .turn {
+      padding: 14px 16px;
+      border-radius: 18px;
+      border: 1px solid rgba(137, 103, 71, 0.1);
+      background: rgba(255,255,255,0.8);
+    }
+
+    .turn.user {
+      background: linear-gradient(135deg, rgba(255,247,240,0.98), rgba(248,235,225,0.92));
+    }
+
+    .turn.system {
+      background: linear-gradient(135deg, rgba(241,247,255,0.98), rgba(226,237,248,0.92));
+    }
+
+    .turn.running {
+      border-style: dashed;
+      border-color: rgba(185, 92, 55, 0.28);
+    }
+
+    .turn.failed {
+      border-color: rgba(162, 53, 53, 0.22);
+      background: linear-gradient(135deg, rgba(255,248,248,0.98), rgba(252,236,236,0.92));
+    }
+
+    .turn-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 8px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    .turn-role {
+      font-weight: 700;
+      color: var(--text);
+    }
+
+    .turn-badges {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .turn-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      background: rgba(35, 27, 20, 0.06);
+      color: var(--muted);
+    }
+
+    .turn-badge.running { color: var(--accent-deep); }
+    .turn-badge.completed { color: var(--ok); }
+    .turn-badge.failed { color: var(--fail); }
+
+    .turn-content {
+      white-space: pre-wrap;
+      line-height: 1.55;
+    }
+
+    .turn-answer {
+      margin-top: 10px;
+      padding-top: 10px;
+      border-top: 1px dashed rgba(137, 103, 71, 0.18);
+      color: var(--text);
+      white-space: pre-wrap;
+      line-height: 1.55;
+    }
+
+    .turn-answer strong {
+      color: var(--accent-deep);
+      display: block;
+      margin-bottom: 6px;
+    }
+
+    .turn-answer + .turn-answer {
+      margin-top: 8px;
+      padding-top: 8px;
+      border-top: 1px dashed rgba(137, 103, 71, 0.12);
+    }
+
+    .turn-trace {
+      margin-top: 12px;
+      padding: 12px;
+      border-radius: 14px;
+      background: rgba(255,255,255,0.68);
+      border: 1px solid rgba(137, 103, 71, 0.1);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .turn-trace-title {
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    .trace-row {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 10px;
+      align-items: start;
+    }
+
+    .trace-node {
+      padding: 4px 9px;
+      border-radius: 999px;
+      background: rgba(185, 92, 55, 0.1);
+      color: var(--accent-deep);
+      font-size: 11px;
+      font-family: var(--mono);
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .trace-text {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .turn-note {
+      margin-top: 10px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      font-size: 13px;
+      line-height: 1.45;
+      background: rgba(255,255,255,0.66);
+      border: 1px solid rgba(137, 103, 71, 0.1);
+      color: var(--muted);
+    }
+
+    .turn-note.error {
+      background: rgba(162, 53, 53, 0.08);
+      border-color: rgba(162, 53, 53, 0.16);
+      color: var(--fail);
+    }
+
+    .composer {
+      padding: 16px 18px 18px;
+      border-top: 1px solid rgba(137, 103, 71, 0.12);
+      background: rgba(255,255,255,0.58);
+    }
+
+    .composer-top {
+      display: grid;
+      grid-template-columns: 140px repeat(4, auto);
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+
+    .composer textarea,
+    .composer select,
+    .composer button {
+      font: inherit;
+    }
+
+    .composer textarea,
+    .composer select {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: rgba(255,255,255,0.92);
+      color: var(--text);
+      padding: 12px 14px;
+    }
+
+    .composer textarea {
+      min-height: 110px;
+      resize: vertical;
+      line-height: 1.5;
+    }
+
+    .btn {
+      border: 0;
+      border-radius: 14px;
+      padding: 12px 16px;
+      cursor: pointer;
+      font-weight: 700;
+      transition: transform 120ms ease, opacity 120ms ease;
+    }
+
+    .btn:hover { transform: translateY(-1px); }
+    .btn:disabled { opacity: 0.65; cursor: wait; }
+
+    .btn-primary {
+      background: linear-gradient(135deg, var(--accent), var(--accent-deep));
+      color: white;
+    }
+
+    .btn-secondary {
+      background: rgba(255,255,255,0.9);
+      border: 1px solid rgba(137, 103, 71, 0.16);
+      color: var(--text);
+    }
+
+    .composer-note {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      margin-bottom: 10px;
+      padding: 12px 14px;
+      border-radius: 14px;
+      border: 1px solid rgba(137, 103, 71, 0.12);
+      background: rgba(255,255,255,0.84);
+    }
+
+    .composer-note strong {
+      font-size: 13px;
+    }
+
+    .composer-note span {
+      font-size: 13px;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+
+    .composer-note.ready strong,
+    .composer-note.active_plan strong {
+      color: var(--ok);
+    }
+
+    .composer-note.waiting strong {
+      color: var(--wait);
+    }
+
+    .composer-note.busy strong,
+    .composer-note.settling strong {
+      color: var(--accent-deep);
+    }
+
+    .io-toolbar {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, auto));
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+
+    .io-toolbar label {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .io-toolbar input[type="file"] {
+      max-width: 210px;
+      font-size: 12px;
+    }
+
+    .image-preview {
+      display: none;
+      gap: 12px;
+      align-items: flex-start;
+      margin-bottom: 10px;
+      padding: 10px;
+      border: 1px solid rgba(137, 103, 71, 0.12);
+      border-radius: 14px;
+      background: rgba(255,255,255,0.72);
+    }
+
+    .image-preview img {
+      width: 132px;
+      height: 88px;
+      object-fit: cover;
+      border-radius: 10px;
+      border: 1px solid rgba(137, 103, 71, 0.16);
+      background: white;
+    }
+
+    .image-preview-text {
+      flex: 1;
+      min-width: 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    .side {
+      display: grid;
+      grid-template-rows: auto auto auto;
+      gap: 18px;
+      min-height: 78vh;
+    }
+
+    .status-strip {
+      padding: 16px 18px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .status-pill {
+      padding: 8px 12px;
+      border-radius: 999px;
+      font-size: 13px;
+      background: rgba(255,255,255,0.88);
+      border: 1px solid rgba(137, 103, 71, 0.14);
+      color: var(--muted);
+    }
+
+    .tasks {
+      padding: 16px 18px 18px;
+      overflow: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .plan-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 0 18px 4px;
+    }
+
+    .view-toggle {
+      display: inline-flex;
+      gap: 4px;
+      padding: 4px;
+      border-radius: 999px;
+      border: 1px solid rgba(137, 103, 71, 0.16);
+      background: rgba(255,255,255,0.72);
+    }
+
+    .view-toggle button {
+      border: 0;
+      border-radius: 999px;
+      padding: 7px 12px;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .view-toggle button.active {
+      background: var(--accent);
+      color: #fffaf2;
+      box-shadow: 0 6px 14px rgba(185, 92, 55, 0.18);
+    }
+
+    .plan-toolbar-note {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .plan-graph {
+      display: none;
+      padding: 16px 18px 18px;
+      overflow: auto;
+    }
+
+    .graph-summary {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(86px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+
+    .graph-chip {
+      padding: 10px 12px;
+      border-radius: 14px;
+      border: 1px solid rgba(137, 103, 71, 0.12);
+      background: rgba(255,255,255,0.82);
+    }
+
+    .graph-chip .k {
+      color: var(--muted);
+      font-size: 11px;
+      margin-bottom: 5px;
+    }
+
+    .graph-chip .v {
+      font-weight: 800;
+      font-size: 15px;
+    }
+
+    .graph-section {
+      margin-top: 14px;
+    }
+
+    .graph-section-title {
+      margin: 0 0 8px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .graph-node-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+    }
+
+    .graph-canvas-wrap {
+      border-radius: 18px;
+      border: 1px solid rgba(137, 103, 71, 0.14);
+      background:
+        radial-gradient(circle at 18px 18px, rgba(137,103,71,0.08) 1px, transparent 1px),
+        linear-gradient(135deg, rgba(255,255,255,0.9), rgba(248,239,228,0.76));
+      background-size: 22px 22px, auto;
+      overflow: auto;
+      min-height: 280px;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.72);
+    }
+
+    .graph-svg {
+      display: block;
+      min-width: 100%;
+    }
+
+    .svg-edge {
+      fill: none;
+      stroke: rgba(117, 102, 87, 0.54);
+      stroke-width: 2.2;
+      cursor: pointer;
+      transition: stroke 140ms ease, stroke-width 140ms ease;
+    }
+
+    .svg-edge.branch {
+      stroke: rgba(55, 110, 166, 0.64);
+      stroke-dasharray: 8 5;
+    }
+
+    .svg-edge:hover,
+    .svg-edge.selected {
+      stroke: var(--accent);
+      stroke-width: 3.4;
+    }
+
+    .svg-edge-label {
+      cursor: pointer;
+    }
+
+    .svg-edge-label rect {
+      fill: rgba(255,255,255,0.88);
+      stroke: rgba(137, 103, 71, 0.18);
+    }
+
+    .svg-edge-label text {
+      font-size: 11px;
+      fill: var(--muted);
+      font-weight: 700;
+    }
+
+    .svg-edge-label:hover rect,
+    .svg-edge-label.selected rect {
+      fill: rgba(255,248,240,0.96);
+      stroke: var(--accent);
+    }
+
+    .svg-node {
+      cursor: pointer;
+    }
+
+    .svg-node rect {
+      fill: rgba(255,255,255,0.92);
+      stroke: rgba(137, 103, 71, 0.22);
+      stroke-width: 1.3;
+      filter: drop-shadow(0 8px 16px rgba(62, 41, 23, 0.10));
+      transition: stroke 140ms ease, stroke-width 140ms ease, fill 140ms ease;
+    }
+
+    .svg-node.current rect {
+      stroke: var(--accent);
+      stroke-width: 2.4;
+      fill: rgba(255,248,240,0.98);
+    }
+
+    .svg-node:hover rect,
+    .svg-node.selected rect {
+      stroke: var(--accent-deep);
+      stroke-width: 2.6;
+    }
+
+    .svg-node-title {
+      font-size: 13px;
+      font-weight: 800;
+      fill: var(--text);
+    }
+
+    .svg-node-sub {
+      font-size: 11px;
+      fill: var(--muted);
+      font-weight: 700;
+    }
+
+    .graph-detail {
+      margin-top: 12px;
+      padding: 14px;
+      border-radius: 16px;
+      border: 1px solid rgba(137, 103, 71, 0.14);
+      background: rgba(255,255,255,0.82);
+    }
+
+    .graph-detail-title {
+      font-weight: 850;
+      margin-bottom: 8px;
+    }
+
+    .graph-detail-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px 12px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .graph-detail-grid strong {
+      color: var(--text);
+    }
+
+    .graph-node {
+      padding: 12px;
+      border-radius: 16px;
+      border: 1px solid rgba(137, 103, 71, 0.14);
+      background: rgba(255,255,255,0.86);
+    }
+
+    .graph-node.current {
+      border-color: rgba(185, 92, 55, 0.42);
+      box-shadow: 0 0 0 3px rgba(185, 92, 55, 0.08);
+    }
+
+    .graph-node-title {
+      font-weight: 800;
+      line-height: 1.35;
+      margin-bottom: 8px;
+    }
+
+    .edge-list,
+    .issue-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .edge-row,
+    .issue-row {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 12px;
+      border-radius: 14px;
+      border: 1px solid rgba(137, 103, 71, 0.12);
+      background: rgba(255,255,255,0.78);
+      font-size: 13px;
+    }
+
+    .edge-arrow {
+      font-family: var(--mono);
+      font-weight: 800;
+      color: var(--accent-deep);
+    }
+
+    .issue-row.error {
+      border-color: rgba(162, 53, 53, 0.22);
+      background: rgba(255,248,248,0.9);
+    }
+
+    .issue-row.warning {
+      border-color: rgba(156, 106, 20, 0.22);
+      background: rgba(255,249,238,0.9);
+    }
+
+    .task {
+      padding: 14px 16px;
+      border-radius: 18px;
+      background: rgba(255,255,255,0.86);
+      border: 1px solid rgba(137, 103, 71, 0.14);
+    }
+
+    .task.current {
+      border-color: rgba(185, 92, 55, 0.4);
+      box-shadow: 0 0 0 3px rgba(185, 92, 55, 0.08);
+    }
+
+    .task-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: flex-start;
+      margin-bottom: 8px;
+    }
+
+    .task-title {
+      font-weight: 700;
+      line-height: 1.45;
+    }
+
+    .task-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+
+    .tag {
+      border-radius: 999px;
+      padding: 5px 10px;
+      font-size: 12px;
+      font-weight: 700;
+      background: rgba(35, 27, 20, 0.06);
+      color: var(--muted);
+    }
+
+    .tag.pending { color: var(--muted); }
+    .tag.in_progress, .tag.running { color: var(--accent-deep); }
+    .tag.waiting { color: var(--wait); }
+    .tag.completed { color: var(--ok); }
+    .tag.failed, .tag.cancelled { color: var(--fail); }
+
+    .task-detail {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+    }
+
+    .side {
+      display: grid;
+      grid-template-rows: minmax(300px, 1fr) minmax(440px, 1.4fr);
+      gap: 18px;
+    }
+
+    .logs {
+      padding: 16px 18px 18px;
+      overflow: auto;
+      min-height: 440px;
+      max-height: 58vh;
+      background: rgba(255,255,255,0.52);
+    }
+
+    .console-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 0 18px 12px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .console-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .console-indicator {
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--accent-deep);
+    }
+
+    .mini-btn {
+      border: 1px solid rgba(137, 103, 71, 0.18);
+      background: rgba(255,255,255,0.76);
+      color: var(--ink);
+      border-radius: 999px;
+      padding: 6px 12px;
+      cursor: pointer;
+      font-size: 12px;
+      transition: transform 140ms ease, background 140ms ease;
+    }
+
+    .mini-btn:hover {
+      transform: translateY(-1px);
+      background: rgba(255,255,255,0.92);
+    }
+
+    .console-pre {
+      margin: 0;
+      min-height: 220px;
+      padding: 12px 14px;
+      border-radius: 14px;
+      border: 1px solid rgba(137, 103, 71, 0.12);
+      background: rgba(34, 28, 24, 0.96);
+      color: #f6ead9;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 12px;
+      line-height: 1.5;
+      font-family: var(--mono);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+    }
+
+    .log-line {
+      display: block;
+      white-space: pre-wrap;
+      margin-bottom: 6px;
+    }
+
+    .log-line.log-dim { color: #c8b8a4; }
+    .log-line.log-ingest { color: #e4b15f; }
+    .log-line.log-orchestrate { color: #89d1ff; }
+    .log-line.log-plan { color: #8de0b5; }
+    .log-line.log-execute { color: #ffd27d; }
+    .log-line.log-tool { color: #d8a9ff; }
+    .log-line.log-response { color: #f2a6a6; }
+
+    .log-line.log-warning {
+      color: #ffb86e;
+      font-weight: 600;
+    }
+
+    .log-line.log-error {
+      color: #ff8f8f;
+      font-weight: 600;
+    }
+
+    .empty {
+      padding: 18px;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    .error-banner {
+      display: none;
+      margin: 0 18px 14px;
+      padding: 12px 14px;
+      border-radius: 14px;
+      background: rgba(162, 53, 53, 0.08);
+      border: 1px solid rgba(162, 53, 53, 0.18);
+      color: var(--fail);
+      white-space: pre-wrap;
+    }
+
+    @media (max-width: 1120px) {
+      .layout {
+        grid-template-columns: 1fr;
+      }
+
+      .conversation,
+      .side {
+        min-height: auto;
+      }
+    }
+
+    @media (max-width: 720px) {
+      .shell { padding: 14px; }
+      .hero { padding: 18px; }
+      .summary-grid { grid-template-columns: repeat(2, minmax(120px, 1fr)); }
+      .composer-top { grid-template-columns: 1fr 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <section class="hero">
+      <div>
+        <h1>CarAgent Plan Console</h1>
+        <p>Send messages on the left and watch the live plan, task progress, and colored console logs on the right.</p>
+      </div>
+      <div class="meta-chip-row">
+        <div class="meta-chip">Thread: <span id="thread-id">-</span></div>
+        <div class="meta-chip">Updated: <span id="updated-at">-</span></div>
+      </div>
+    </section>
+
+    <div class="layout">
+      <section class="panel conversation">
+        <div>
+          <div class="panel-head">
+            <div>
+              <h2>Session</h2>
+              <div class="sub">User input, controller updates, and agent replies appear here.</div>
+            </div>
+          </div>
+          <div class="summary-grid">
+            <div class="summary-card"><div class="k">Current Plan</div><div class="v" id="summary-plan">-</div></div>
+            <div class="summary-card"><div class="k">Current Task</div><div class="v" id="summary-task">-</div></div>
+            <div class="summary-card"><div class="k">Next Action</div><div class="v" id="summary-next-action">idle</div></div>
+            <div class="summary-card"><div class="k">Visible Tasks</div><div class="v" id="summary-task-count">0</div></div>
+          </div>
+        </div>
+
+        <div class="error-banner" id="error-banner"></div>
+        <div class="history" id="history"></div>
+
+        <form class="composer" id="composer">
+          <div class="composer-top">
+            <div class="meta-chip">Send user message</div>
+            <button class="btn btn-secondary" type="button" id="clear-btn">Clear</button>
+            <button class="btn btn-secondary" type="button" id="refresh-btn">Refresh</button>
+            <button class="btn btn-primary" type="submit" id="send-btn">Send</button>
+          </div>
+          <div class="composer-note ready" id="composer-note">
+            <strong>Ready for input</strong>
+            <span>Send a new instruction. Controller arrivals are handled automatically by the watchdog.</span>
+          </div>
+          <div class="io-toolbar">
+            <label>Input
+              <select id="input-language">
+                <option value="auto">Auto</option>
+                <option value="zh">中文</option>
+                <option value="en">English</option>
+              </select>
+            </label>
+            <label>Reply
+              <select id="output-language">
+                <option value="auto">Auto</option>
+                <option value="zh">中文</option>
+                <option value="en">English</option>
+              </select>
+            </label>
+            <button class="btn btn-secondary" type="button" id="capture-btn">Capture</button>
+            <input type="file" id="image-upload" accept="image/*">
+            <button class="btn btn-secondary" type="button" id="describe-image-btn">Describe Image</button>
+          </div>
+          <div class="image-preview" id="image-preview">
+            <img id="image-preview-img" alt="Selected or captured frame">
+            <div class="image-preview-text" id="image-preview-text"></div>
+          </div>
+          <textarea id="message-input" placeholder="Enter a user instruction. Controller arrivals are handled automatically."></textarea>
+        </form>
+      </section>
+
+      <section class="side">
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Plan Snapshot</h2>
+              <div class="sub">Current plan, active task, wait states, and post-edit task ordering.</div>
+            </div>
+          </div>
+          <div class="status-strip" id="status-strip"></div>
+          <div class="plan-toolbar">
+            <div class="view-toggle" aria-label="Plan view mode">
+              <button class="active" type="button" id="plan-view-list">List</button>
+              <button type="button" id="plan-view-graph">Graph</button>
+            </div>
+            <div class="plan-toolbar-note">Graph mode uses the read-only PlanGraph adapter.</div>
+          </div>
+          <div class="tasks" id="tasks"></div>
+          <div class="plan-graph" id="plan-graph"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Live Console</h2>
+              <div class="sub">Merged workflow, tool, and controller logs with color coding for easier demos.</div>
+            </div>
+          </div>
+          <div class="console-toolbar">
+            <div>Auto-follow only stays on while the console is near the bottom.</div>
+            <div class="console-actions">
+              <span class="console-indicator" id="console-follow-indicator">Following latest</span>
+              <button class="mini-btn" type="button" id="console-jump-btn">Jump to latest</button>
+            </div>
+          </div>
+          <div class="logs" id="logs"></div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <script>
+    const historyEl = document.getElementById("history");
+    const tasksEl = document.getElementById("tasks");
+    const planGraphEl = document.getElementById("plan-graph");
+    const planViewListBtnEl = document.getElementById("plan-view-list");
+    const planViewGraphBtnEl = document.getElementById("plan-view-graph");
+    const logsEl = document.getElementById("logs");
+    const statusStripEl = document.getElementById("status-strip");
+    const errorBannerEl = document.getElementById("error-banner");
+    const formEl = document.getElementById("composer");
+    const messageInputEl = document.getElementById("message-input");
+    const sendBtnEl = document.getElementById("send-btn");
+    const clearBtnEl = document.getElementById("clear-btn");
+    const refreshBtnEl = document.getElementById("refresh-btn");
+    const composerNoteEl = document.getElementById("composer-note");
+    const consoleJumpBtnEl = document.getElementById("console-jump-btn");
+    const consoleFollowIndicatorEl = document.getElementById("console-follow-indicator");
+    const inputLanguageEl = document.getElementById("input-language");
+    const outputLanguageEl = document.getElementById("output-language");
+    const captureBtnEl = document.getElementById("capture-btn");
+    const imageUploadEl = document.getElementById("image-upload");
+    const describeImageBtnEl = document.getElementById("describe-image-btn");
+    const imagePreviewEl = document.getElementById("image-preview");
+    const imagePreviewImgEl = document.getElementById("image-preview-img");
+    const imagePreviewTextEl = document.getElementById("image-preview-text");
+    let refreshTimer = null;
+    let refreshInFlight = false;
+    let logAutoFollow = true;
+    let historyAutoFollow = true;
+    let planViewMode = "list";
+    let selectedGraphItem = null;
+    let selectedImageDataUrl = "";
+
+    function escapeHtml(text) {
+      const normalized = text === null || text === undefined ? "" : String(text);
+      return normalized
+        .split("&").join("&amp;")
+        .split("<").join("&lt;")
+        .split(">").join("&gt;");
+    }
+
+    function formatJsonInline(value) {
+      if (value === null || value === undefined || value === "") {
+        return "-";
+      }
+      if (typeof value === "string") {
+        return value;
+      }
+      return JSON.stringify(value);
+    }
+
+    function isNearBottom(element, threshold = 24) {
+      if (!element) {
+        return true;
+      }
+      return element.scrollHeight - element.scrollTop - element.clientHeight <= threshold;
+    }
+
+    function updateConsoleFollowIndicator() {
+      consoleFollowIndicatorEl.textContent = logAutoFollow ? "Following latest" : "Scroll locked";
+    }
+
+    function scheduleRefresh(delayMs) {
+      if (refreshTimer) {
+        window.clearTimeout(refreshTimer);
+      }
+      refreshTimer = window.setTimeout(() => {
+        refreshState();
+      }, delayMs);
+    }
+
+    async function request(path, options = {}) {
+      const response = await fetch(path, {
+        headers: { "Content-Type": "application/json" },
+        ...options,
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || "Request failed");
+      }
+      return data;
+    }
+
+    function renderStepTrace(stepTrace) {
+      const trace = Array.isArray(stepTrace) ? stepTrace.slice(-6) : [];
+      if (!trace.length) {
+        return "";
+      }
+
+      const rows = trace.map((step) => {
+        const parts = [];
+        if (step.latest_event && step.latest_event.summary) {
+          parts.push(step.latest_event.summary);
+        }
+        if (step.focus_task && step.focus_task.description) {
+          parts.push(step.focus_task.description);
+        }
+        if (!parts.length && step.current_plan_id) {
+          parts.push("plan " + step.current_plan_id + " updated");
+        }
+        const traceText = parts.length ? parts.join(" | ") : "State updated";
+        return `
+          <div class="trace-row">
+            <div class="trace-node">${escapeHtml(step.node || "node")}</div>
+            <div class="trace-text">${escapeHtml(traceText)}</div>
+          </div>
+        `;
+      }).join("");
+
+      return `
+        <div class="turn-trace">
+          <div class="turn-trace-title">Workflow</div>
+          ${rows}
+        </div>
+      `;
+    }
+
+    function renderHistory(turns) {
+      if (!turns.length) {
+        historyEl.innerHTML = '<div class="empty">No messages yet.</div>';
+        return;
+      }
+      const shouldStick = historyAutoFollow || isNearBottom(historyEl, 36);
+      historyEl.innerHTML = turns.map((turn) => renderTurn(turn)).join("");
+      if (shouldStick) {
+        historyEl.scrollTop = historyEl.scrollHeight;
+      }
+    }
+
+    function isSystemStatusTurn(turn) {
+      const source = String(turn.source || "");
+      return source === "controller" || source === "controller-watchdog";
+    }
+
+    function renderTurn(turn) {
+      const status = turn.status || "completed";
+      const statusLabel = {
+        running: "Running",
+        completed: "Completed",
+        failed: "Failed",
+      }[status] || status;
+      const liveNodeBadge = turn.live_node && status === "running"
+        ? '<span class="turn-badge running">' + escapeHtml(turn.live_node) + "</span>"
+        : "";
+      const systemStatusBadge = turn.display_kind === "system_status"
+        ? '<span class="turn-badge">status update</span>'
+        : "";
+      const imageBadge = turn.image_attached
+        ? '<span class="turn-badge">image attached</span>'
+        : "";
+      const responseItems = Array.isArray(turn.response_items) ? turn.response_items : [];
+      const legacyResponse = turn.response && !responseItems.length
+        ? [{ response_text: turn.response, response_type: turn.response_type || "result" }]
+        : responseItems;
+      const responseHtml = legacyResponse.map((item, index) => {
+        const labelMap = {
+          result: "Assistant Result",
+          progress: "Assistant Progress",
+          error: "Assistant Error",
+        };
+        const itemType = item.response_type || "result";
+        const itemLabel = labelMap[itemType] || "Assistant Reply";
+        const suffix = legacyResponse.length > 1 ? " #" + (index + 1) : "";
+        return '<div class="turn-answer"><strong>' + escapeHtml(itemLabel + suffix) + '</strong>' + escapeHtml(item.response_text || "") + "</div>";
+      }).join("");
+      const traceHtml = renderStepTrace(turn.step_trace || []);
+      const noteHtml = !legacyResponse.length && status === "running"
+        ? '<div class="turn-note">The workflow is still running. Plan and task state will refresh live as nodes finish.</div>'
+        : "";
+      const errorHtml = turn.error
+        ? '<div class="turn-note error">' + escapeHtml(turn.error) + "</div>"
+        : "";
+      const agentMessageHtml = turn.agent_message
+        ? '<div class="turn-note"><strong>Agent input</strong><span>' + escapeHtml(turn.agent_message) + "</span></div>"
+        : "";
+      const traceHtmlForTurn = isSystemStatusTurn(turn) ? "" : traceHtml;
+
+      return [
+        '<article class="turn ' + escapeHtml(turn.role) + ' ' + escapeHtml(status) + '">',
+        '  <div class="turn-head">',
+        '    <div class="turn-badges"><span class="turn-role">' + escapeHtml(turn.role_label) + '</span><span class="turn-badge">' + escapeHtml(turn.source) + '</span><span class="turn-badge ' + escapeHtml(status) + '">' + escapeHtml(statusLabel) + "</span>" + liveNodeBadge + systemStatusBadge + imageBadge + "</div>",
+        '    <div>' + escapeHtml(turn.created_at) + "</div>",
+        "  </div>",
+        '  <div class="turn-content">' + escapeHtml(turn.content) + "</div>",
+        agentMessageHtml,
+        traceHtmlForTurn,
+        responseHtml,
+        noteHtml,
+        errorHtml,
+        "</article>",
+      ].join("");
+    }
+
+    function renderTasks(tasks) {
+      if (!tasks.length) {
+        tasksEl.innerHTML = '<div class="empty">No active tasks.</div>';
+        return;
+      }
+
+      tasksEl.innerHTML = tasks.map((task) => `
+        <article class="task ${task.is_current ? "current" : ""}">
+          <div class="task-head">
+            <div class="task-title">${escapeHtml(task.title)}</div>
+            <div class="tag ${escapeHtml(task.status)}">${escapeHtml(task.status)}</div>
+          </div>
+          <div class="task-meta">
+            ${task.sequence_label ? `<span class="tag">${escapeHtml(task.sequence_label)}</span>` : ""}
+            <span class="tag">${escapeHtml(task.type)}</span>
+            ${task.wait_for_event ? `<span class="tag">wait: ${escapeHtml(task.wait_for_event)}</span>` : ""}
+            ${task.is_inserted ? `<span class="tag">inserted</span>` : ""}
+          </div>
+          <div class="task-detail">${escapeHtml(task.detail)}</div>
+        </article>
+      `).join("");
+    }
+
+    function applyPlanViewMode() {
+      const showGraph = planViewMode === "graph";
+      tasksEl.style.display = showGraph ? "none" : "flex";
+      planGraphEl.style.display = showGraph ? "block" : "none";
+      planViewListBtnEl.classList.toggle("active", !showGraph);
+      planViewGraphBtnEl.classList.toggle("active", showGraph);
+    }
+
+    function formatTaskRef(taskId) {
+      return taskId === null || taskId === undefined ? "-" : "#" + escapeHtml(taskId);
+    }
+
+    function truncateText(text, maxLength) {
+      const normalized = String(text || "").replace(/\s+/g, " ").trim();
+      if (normalized.length <= maxLength) {
+        return normalized;
+      }
+      return normalized.slice(0, Math.max(0, maxLength - 3)).trimEnd() + "...";
+    }
+
+    function buildGraphLayout(nodes, edges) {
+      const nodeMap = new Map(nodes.map((node) => [Number(node.task_id), node]));
+      const validEdges = edges.filter((edge) => nodeMap.has(Number(edge.source)) && nodeMap.has(Number(edge.target)));
+      const indegree = new Map(nodes.map((node) => [Number(node.task_id), 0]));
+      validEdges.forEach((edge) => {
+        const target = Number(edge.target);
+        indegree.set(target, (indegree.get(target) || 0) + 1);
+      });
+
+      const levels = new Map(nodes.map((node) => [Number(node.task_id), 0]));
+      const roots = nodes.filter((node) => node.is_root || (indegree.get(Number(node.task_id)) || 0) === 0);
+      roots.forEach((node) => levels.set(Number(node.task_id), 0));
+
+      for (let pass = 0; pass < nodes.length; pass += 1) {
+        let changed = false;
+        validEdges.forEach((edge) => {
+          const source = Number(edge.source);
+          const target = Number(edge.target);
+          const nextLevel = (levels.get(source) || 0) + 1;
+          if (nextLevel > (levels.get(target) || 0)) {
+            levels.set(target, nextLevel);
+            changed = true;
+          }
+        });
+        if (!changed) break;
+      }
+
+      const grouped = new Map();
+      nodes.forEach((node) => {
+        const level = levels.get(Number(node.task_id)) || 0;
+        if (!grouped.has(level)) grouped.set(level, []);
+        grouped.get(level).push(node);
+      });
+      grouped.forEach((items) => items.sort((a, b) => Number(a.task_id) - Number(b.task_id)));
+
+      const nodeWidth = 210;
+      const nodeHeight = 82;
+      const columnGap = 238;
+      const rowGap = 132;
+      const marginX = 42;
+      const marginY = 34;
+      const positioned = new Map();
+      const maxLevel = Math.max(0, ...Array.from(grouped.keys()));
+      let maxRows = 1;
+
+      grouped.forEach((items, level) => {
+        maxRows = Math.max(maxRows, items.length);
+        items.forEach((node, index) => {
+          positioned.set(Number(node.task_id), {
+            ...node,
+            x: marginX + index * columnGap,
+            y: marginY + level * rowGap,
+            width: nodeWidth,
+            height: nodeHeight,
+          });
+        });
+      });
+
+      return {
+        nodes: Array.from(positioned.values()),
+        edges: validEdges,
+        nodeMap: positioned,
+        width: marginX * 2 + nodeWidth + (maxRows - 1) * columnGap,
+        height: marginY * 2 + nodeHeight + maxLevel * rowGap,
+      };
+    }
+
+    function renderGraphDetail(type, item) {
+      const detailEl = document.getElementById("graph-detail");
+      if (!detailEl || !item) {
+        return;
+      }
+
+      if (type === "edge") {
+        detailEl.innerHTML = `
+          <div class="graph-detail-title">Edge ${formatTaskRef(item.source)} -&gt; ${formatTaskRef(item.target)}</div>
+          <div class="graph-detail-grid">
+            <div><strong>kind</strong><br>${escapeHtml(item.kind || "edge")}</div>
+            <div><strong>branch label</strong><br>${escapeHtml(item.label || "-")}</div>
+            <div><strong>source</strong><br>${formatTaskRef(item.source)}</div>
+            <div><strong>target</strong><br>${formatTaskRef(item.target)}</div>
+          </div>
+        `;
+        return;
+      }
+
+      detailEl.innerHTML = `
+        <div class="graph-detail-title">${formatTaskRef(item.task_id)} ${escapeHtml(item.description || "")}</div>
+        <div class="graph-detail-grid">
+          <div><strong>status</strong><br>${escapeHtml(item.status || "pending")}</div>
+          <div><strong>type</strong><br>${escapeHtml(item.type || "action")}</div>
+          <div><strong>plan_id</strong><br>${escapeHtml(item.plan_id || "-")}</div>
+          <div><strong>next_task_id</strong><br>${formatJsonInline(item.next_task_id)}</div>
+          <div><strong>depends_on</strong><br>${escapeHtml(formatJsonInline(item.depends_on || []))}</div>
+          <div><strong>branches</strong><br>${escapeHtml(formatJsonInline(item.branches || {}))}</div>
+          <div><strong>wait_for_event</strong><br>${escapeHtml(item.wait_for_event || "-")}</div>
+          <div><strong>latest_result</strong><br>${escapeHtml(item.latest_result_summary || "-")}</div>
+        </div>
+      `;
+    }
+
+    function selectGraphItem(type, item, element) {
+      selectedGraphItem = { type, item };
+      planGraphEl.querySelectorAll(".selected").forEach((selectedEl) => selectedEl.classList.remove("selected"));
+      if (element) {
+        element.classList.add("selected");
+        const edgeIndex = element.getAttribute("data-edge-index");
+        if (edgeIndex !== null) {
+          planGraphEl.querySelectorAll(`[data-edge-index="${edgeIndex}"]`).forEach((edgeEl) => edgeEl.classList.add("selected"));
+        }
+      }
+      renderGraphDetail(type, item);
+    }
+
+    function renderPlanGraph(planGraph) {
+      const summary = (planGraph || {}).summary || {};
+      const nodes = Array.isArray((planGraph || {}).nodes) ? planGraph.nodes : [];
+      const edges = Array.isArray((planGraph || {}).edges) ? planGraph.edges : [];
+      const issues = Array.isArray((planGraph || {}).issues) ? planGraph.issues : [];
+      const previousCanvas = planGraphEl.querySelector(".graph-canvas-wrap");
+      const previousScrollLeft = previousCanvas ? previousCanvas.scrollLeft : 0;
+      const previousScrollTop = previousCanvas ? previousCanvas.scrollTop : 0;
+      const previousSelection = selectedGraphItem;
+
+      if (!nodes.length) {
+        planGraphEl.innerHTML = '<div class="empty">No active plan graph.</div>';
+        return;
+      }
+
+      const summaryHtml = [
+        ["Nodes", summary.node_count || nodes.length || 0],
+        ["Edges", summary.edge_count || edges.length || 0],
+        ["DAG", summary.is_dag === false ? "no" : "yes"],
+        ["Issues", issues.length],
+      ].map(([label, value]) => `
+        <div class="graph-chip">
+          <div class="k">${escapeHtml(label)}</div>
+          <div class="v">${escapeHtml(value)}</div>
+        </div>
+      `).join("");
+
+      const layout = buildGraphLayout(nodes, edges);
+      const markerId = "plan-arrow-" + Math.random().toString(36).slice(2);
+      const edgeSvg = layout.edges.map((edge, index) => {
+        const source = layout.nodeMap.get(Number(edge.source));
+        const target = layout.nodeMap.get(Number(edge.target));
+        if (!source || !target) return "";
+        const x1 = source.x + source.width / 2;
+        const y1 = source.y + source.height;
+        const x2 = target.x + target.width / 2;
+        const y2 = target.y;
+        const bend = Math.max(48, Math.abs(y2 - y1) / 2);
+        const path = `M ${x1} ${y1} C ${x1} ${y1 + bend}, ${x2} ${y2 - bend}, ${x2} ${y2}`;
+        const label = edge.label || edge.kind || "";
+        const labelX = (x1 + x2) / 2 - 38;
+        const labelY = (y1 + y2) / 2 - 11;
+        return `
+          <path class="svg-edge ${escapeHtml(edge.kind || "sequence")}" data-edge-index="${index}" d="${path}" marker-end="url(#${markerId})"></path>
+          ${label ? `
+            <g class="svg-edge-label" data-edge-index="${index}" transform="translate(${labelX}, ${labelY})">
+              <rect rx="10" ry="10" width="76" height="22"></rect>
+              <text x="38" y="15" text-anchor="middle">${escapeHtml(truncateText(label, 12))}</text>
+            </g>
+          ` : ""}
+        `;
+      }).join("");
+
+      const nodeSvg = layout.nodes.map((node) => `
+        <g class="svg-node ${node.is_current ? "current" : ""}" data-node-id="${escapeHtml(node.task_id)}" transform="translate(${node.x}, ${node.y})">
+          <rect rx="16" ry="16" width="${node.width}" height="${node.height}"></rect>
+          <text class="svg-node-title" x="16" y="25">${formatTaskRef(node.task_id)} ${escapeHtml(truncateText(node.description || "", 22))}</text>
+          <text class="svg-node-sub" x="16" y="49">${escapeHtml(node.status || "pending")} | ${escapeHtml(node.type || "action")}</text>
+          <text class="svg-node-sub" x="16" y="67">${node.is_root ? "root" : ""}${node.is_root && node.is_leaf ? " | " : ""}${node.is_leaf ? "leaf" : ""}</text>
+        </g>
+      `).join("");
+
+      const topologyHtml = `
+        <div class="graph-canvas-wrap" id="graph-canvas-wrap">
+          <svg class="graph-svg" width="${layout.width}" height="${layout.height}" viewBox="0 0 ${layout.width} ${layout.height}" role="img" aria-label="Plan topology graph">
+            <defs>
+              <marker id="${markerId}" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+                <path d="M0,0 L0,6 L8,3 z" fill="rgba(117, 102, 87, 0.74)"></path>
+              </marker>
+            </defs>
+            ${edgeSvg}
+            ${nodeSvg}
+          </svg>
+        </div>
+      `;
+
+      const issuesHtml = issues.length
+        ? issues.map((issue) => `
+          <div class="issue-row ${escapeHtml(issue.severity || "warning")}">
+            <span class="tag ${escapeHtml(issue.severity || "warning")}">${escapeHtml(issue.severity || "warning")}</span>
+            <span>${escapeHtml(issue.message || issue.code || "Plan graph issue")}</span>
+            <span class="tag">${escapeHtml(issue.code || "")}</span>
+          </div>
+        `).join("")
+        : '<div class="empty">No PlanGraph validation issues.</div>';
+
+      planGraphEl.innerHTML = `
+        <div class="graph-summary">${summaryHtml}</div>
+        <div class="graph-section">
+          <h3 class="graph-section-title">Topology</h3>
+          ${topologyHtml}
+          <div class="graph-detail" id="graph-detail"></div>
+        </div>
+        <div class="graph-section">
+          <h3 class="graph-section-title">Validation</h3>
+          <div class="issue-list">${issuesHtml}</div>
+        </div>
+      `;
+
+      const nodeById = new Map(nodes.map((node) => [String(node.task_id), node]));
+      planGraphEl.querySelectorAll(".svg-node").forEach((nodeEl) => {
+        nodeEl.addEventListener("click", () => {
+          const node = nodeById.get(nodeEl.getAttribute("data-node-id"));
+          if (node) {
+            selectGraphItem("node", node, nodeEl);
+          }
+        });
+      });
+      planGraphEl.querySelectorAll("[data-edge-index]").forEach((edgeEl) => {
+        edgeEl.addEventListener("click", () => {
+          const edge = layout.edges[Number(edgeEl.getAttribute("data-edge-index"))];
+          if (edge) {
+            selectGraphItem("edge", edge, edgeEl);
+          }
+        });
+      });
+
+      const canvasEl = document.getElementById("graph-canvas-wrap");
+      if (canvasEl) {
+        canvasEl.scrollLeft = previousScrollLeft;
+        canvasEl.scrollTop = previousScrollTop;
+      }
+
+      if (previousSelection && previousSelection.type === "edge") {
+        const selectedEdge = layout.edges.find((edge) =>
+          String(edge.source) === String(previousSelection.item.source)
+          && String(edge.target) === String(previousSelection.item.target)
+          && String(edge.kind || "") === String(previousSelection.item.kind || "")
+          && String(edge.label || "") === String(previousSelection.item.label || "")
+        );
+        if (selectedEdge) {
+          const selectedIndex = layout.edges.indexOf(selectedEdge);
+          const selectedEdgeEl = planGraphEl.querySelector(`[data-edge-index="${selectedIndex}"]`);
+          selectGraphItem("edge", selectedEdge, selectedEdgeEl);
+          return;
+        }
+      }
+
+      if (previousSelection && previousSelection.type === "node") {
+        const selectedNode = nodes.find((node) => String(node.task_id) === String(previousSelection.item.task_id));
+        if (selectedNode) {
+          const selectedNodeEl = planGraphEl.querySelector(`.svg-node[data-node-id="${selectedNode.task_id}"]`);
+          selectGraphItem("node", selectedNode, selectedNodeEl);
+          return;
+        }
+      }
+
+      const preferredNode = nodes.find((node) => node.is_current) || nodes[0];
+      if (preferredNode) {
+        const preferredNodeEl = planGraphEl.querySelector(`.svg-node[data-node-id="${preferredNode.task_id}"]`);
+        selectGraphItem("node", preferredNode, preferredNodeEl);
+      }
+    }
+
+    function renderEvents(events) {
+      if (!events.length) {
+        eventsEl.innerHTML = '<div class="empty">No recent events.</div>';
+        return;
+      }
+
+      eventsEl.innerHTML = events.map((event) => `
+        <article class="event">
+          <div class="event-type">${escapeHtml(event.type)}</div>
+          <div>${escapeHtml(event.summary || "-")}</div>
+          <div class="sub" style="margin-top:8px;color:#756657;font-size:12px;">
+            ${escapeHtml(event.created_at)}${event.task_id !== null ? ` · task #${escapeHtml(event.task_id)}` : ""}
+          </div>
+        </article>
+      `).join("");
+    }
+
+    function renderStatusStrip(state) {
+      const pills = [
+        `current_plan_id: ${formatJsonInline(state.current_plan_id)}`,
+        `current_task_id: ${formatJsonInline(state.current_task_id)}`,
+        `next_action: ${formatJsonInline(state.next_action_type)}`,
+        `user_facing_response: ${state.user_facing_response ? "ready" : "empty"}`,
+      ];
+      statusStripEl.innerHTML = pills.map((text) => `<span class="status-pill">${escapeHtml(text)}</span>`).join("");
+    }
+
+    function renderSummary(state, payload) {
+      document.getElementById("thread-id").textContent = payload.thread_id || "-";
+      document.getElementById("updated-at").textContent = payload.updated_at || "-";
+      document.getElementById("summary-plan").textContent = state.current_plan_id || "-";
+      document.getElementById("summary-task").textContent = state.current_task_label || "-";
+      document.getElementById("summary-next-action").textContent = state.next_action_type || "idle";
+      document.getElementById("summary-task-count").textContent = String(state.visible_task_count || 0);
+    }
+
+    function renderError(errorText) {
+      if (!errorText) {
+        errorBannerEl.style.display = "none";
+        errorBannerEl.textContent = "";
+        return;
+      }
+      errorBannerEl.style.display = "block";
+      errorBannerEl.textContent = errorText;
+    }
+
+    function renderPayload(payload) {
+      renderSummary(payload.state, payload);
+      renderStatusStrip(payload.state);
+      renderHistory(payload.conversation_history || payload.turn_history || []);
+      renderTasks(payload.state.tasks || []);
+      renderPlanGraph(payload.state.plan_graph || {});
+      applyPlanViewMode();
+      renderError(payload.latest_error || "");
+    }
+
+    async function refreshState() {
+      const payload = await request("/api/state");
+      renderPayload(payload);
+    }
+
+    async function sendMessage(message, role) {
+      sendBtnEl.disabled = true;
+      try {
+        const payload = await request("/api/message", {
+          method: "POST",
+          body: JSON.stringify({ message, role }),
+        });
+        renderPayload(payload);
+      } finally {
+        sendBtnEl.disabled = false;
+      }
+    }
+
+    // Override the legacy render helpers below with state-driven live UI behavior.
+    function classifyLogLine(line) {
+      const text = String(line || "");
+      if (!text.trim()) {
+        return "log-dim";
+      }
+      if (/error|traceback|exception|failed/i.test(text)) {
+        return "log-error";
+      }
+      if (/warning|warn/i.test(text)) {
+        return "log-warning";
+      }
+      if (/Tool |Invoking tool|Tool Result|tool_call/i.test(text)) {
+        return "log-tool";
+      }
+      if (/^.*\bExecute\b|React Agent/i.test(text)) {
+        return "log-execute";
+      }
+      if (/^.*\bPlan\b/i.test(text)) {
+        return "log-plan";
+      }
+      if (/^.*\bOrchestrate\b|Route After Orchestrate/i.test(text)) {
+        return "log-orchestrate";
+      }
+      if (/^.*\bIngest\b/i.test(text)) {
+        return "log-ingest";
+      }
+      if (/^.*\bResponse\b/i.test(text)) {
+        return "log-response";
+      }
+      return "log-dim";
+    }
+
+    function renderEvents(events) {
+      if (!events.length) {
+        eventsEl.innerHTML = '<div class="empty">No recent events.</div>';
+        return;
+      }
+
+      eventsEl.innerHTML = events.map((event) => `
+        <article class="event">
+          <div class="event-type">${escapeHtml(event.type)}</div>
+          <div>${escapeHtml(event.summary || "-")}</div>
+          <div class="sub" style="margin-top:8px;color:#756657;font-size:12px;">
+            ${escapeHtml(event.created_at || "-")}
+            ${event.source ? ` | ${escapeHtml(event.source)}` : ""}
+            ${event.task_id !== null && event.task_id !== undefined ? ` | task #${escapeHtml(event.task_id)}` : ""}
+          </div>
+        </article>
+      `).join("");
+    }
+
+    function renderStatusStrip(state) {
+      const pills = [
+        `status: ${formatJsonInline(state.agent_status)}`,
+        `plan: ${formatJsonInline(state.current_plan_id)}`,
+        `task: ${formatJsonInline(state.current_task_id)}`,
+        `next action: ${formatJsonInline(state.next_action_type)}`,
+        `input mode: ${formatJsonInline((state.input_window || {}).mode || "ready")}`,
+        `response: ${state.user_facing_response ? "ready" : "empty"}`,
+      ];
+      statusStripEl.innerHTML = pills.map((text) => `<span class="status-pill">${escapeHtml(text)}</span>`).join("");
+    }
+
+    function renderLogs(consoleEntries) {
+      const entries = Array.isArray(consoleEntries)
+        ? consoleEntries
+        : String(consoleEntries || "").split(/\\r?\\n/).filter((line) => line.trim());
+      if (!entries.length) {
+        logsEl.innerHTML = '<div class="empty">No log output is available for this session yet.</div>';
+        return;
+      }
+      const shouldStick = logAutoFollow || isNearBottom(logsEl, 36);
+      const html = entries.map((entry) => {
+        const text = String(entry || "");
+        const firstLine = text.split(/\\r?\\n/, 1)[0] || "";
+        const cls = classifyLogLine(firstLine);
+        return `<span class="log-line ${cls}">${escapeHtml(text)}</span>`;
+      }).join("");
+      logsEl.innerHTML = `<pre class="console-pre">${html}</pre>`;
+      if (shouldStick) {
+        logsEl.scrollTop = logsEl.scrollHeight;
+        logAutoFollow = true;
+      }
+      updateConsoleFollowIndicator();
+    }
+
+    function renderSummary(state, payload) {
+      document.getElementById("thread-id").textContent = payload.thread_id || "-";
+      document.getElementById("updated-at").textContent = payload.updated_at || "-";
+      document.getElementById("summary-plan").textContent = state.current_plan_id || "-";
+      document.getElementById("summary-task").textContent = state.current_task_label || state.agent_status || "-";
+      document.getElementById("summary-next-action").textContent = state.processing ? "processing" : (state.next_action_type || "idle");
+      document.getElementById("summary-task-count").textContent = String(state.visible_task_count || 0);
+    }
+
+    function updateComposerState(state) {
+      const inputWindow = state.input_window || {};
+      const locked = Boolean(inputWindow.locked);
+      const mode = inputWindow.mode || "ready";
+      const noteTitle = inputWindow.title || "Ready for input";
+      const noteDetail = inputWindow.detail || "Send a new instruction when ready.";
+      const placeholder = "Enter a user instruction. Controller arrivals are handled automatically.";
+
+      window.__carAgentLatestState = state;
+      composerNoteEl.className = "composer-note " + escapeHtml(mode);
+      composerNoteEl.innerHTML = "<strong>" + escapeHtml(noteTitle) + "</strong><span>" + escapeHtml(noteDetail) + "</span>";
+      messageInputEl.disabled = locked;
+      messageInputEl.placeholder = placeholder;
+      sendBtnEl.disabled = locked || (!messageInputEl.value.trim() && !selectedImageDataUrl);
+      clearBtnEl.disabled = state.processing;
+      refreshBtnEl.disabled = refreshInFlight;
+    }
+
+    function renderPayload(payload) {
+      const state = payload.state || {};
+      renderSummary(state, payload);
+      renderStatusStrip(state);
+      renderHistory(payload.conversation_history || payload.turn_history || []);
+      renderTasks(state.tasks || []);
+      renderPlanGraph(state.plan_graph || {});
+      applyPlanViewMode();
+      renderLogs(payload.console_entries || payload.console_output || "");
+      updateComposerState(state);
+      renderError(payload.latest_error || "");
+    }
+
+    async function refreshState() {
+      if (refreshInFlight) {
+        return;
+      }
+
+      refreshInFlight = true;
+      refreshBtnEl.disabled = true;
+      try {
+        const payload = await request("/api/state");
+        renderPayload(payload);
+        const state = payload.state || {};
+        const inputWindow = state.input_window || {};
+        const nextDelay = state.processing
+          ? 350
+          : inputWindow.mode === "waiting"
+            ? 800
+            : 1400;
+        scheduleRefresh(nextDelay);
+      } catch (error) {
+        renderError(error.message || String(error));
+        scheduleRefresh(1800);
+      } finally {
+        refreshInFlight = false;
+        const latestState = window.__carAgentLatestState || null;
+        if (latestState) {
+          updateComposerState(latestState);
+        } else {
+          refreshBtnEl.disabled = false;
+        }
+      }
+    }
+
+    function showImagePreview(dataUrl, text) {
+      selectedImageDataUrl = dataUrl || "";
+      if (selectedImageDataUrl) {
+        imagePreviewImgEl.src = selectedImageDataUrl;
+      }
+      imagePreviewTextEl.textContent = text || "";
+      imagePreviewEl.style.display = selectedImageDataUrl || text ? "flex" : "none";
+    }
+
+    function readSelectedImageAsDataUrl() {
+      const file = imageUploadEl.files && imageUploadEl.files[0];
+      if (!file) {
+        return Promise.resolve("");
+      }
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ""));
+        reader.onerror = () => reject(reader.error || new Error("Image read failed"));
+        reader.readAsDataURL(file);
+      });
+    }
+
+    async function captureCurrentImage() {
+      captureBtnEl.disabled = true;
+      try {
+        const payload = await request("/api/current-image");
+        if (!payload.image_data_url) {
+          throw new Error(payload.error || "Current image is unavailable");
+        }
+        showImagePreview(payload.image_data_url, "Captured current robot camera frame.");
+      } catch (error) {
+        renderError(error.message || String(error));
+      } finally {
+        captureBtnEl.disabled = false;
+      }
+    }
+
+    async function describeSelectedImage() {
+      describeImageBtnEl.disabled = true;
+      try {
+        const dataUrl = selectedImageDataUrl || await readSelectedImageAsDataUrl();
+        if (!dataUrl) {
+          throw new Error("Choose an image first, or capture the current camera frame.");
+        }
+        showImagePreview(dataUrl, "Describing image for navigation search...");
+        const payload = await request("/api/upload-image", {
+          method: "POST",
+          body: JSON.stringify({
+            image_data_url: dataUrl,
+            input_language: inputLanguageEl.value,
+            output_language: outputLanguageEl.value,
+            submit: false,
+          }),
+        });
+        const description = payload.description || "";
+        showImagePreview(dataUrl, description);
+        const prefix = outputLanguageEl.value === "zh" || inputLanguageEl.value === "zh"
+          ? "\u8fd9\u662f\u4e00\u5f20\u76ee\u6807\u56fe\u7247\u751f\u6210\u7684\u7d27\u51d1\u68c0\u7d22\u63cf\u8ff0\u3002\u8bf7\u5728\u573a\u666f\u8bb0\u5fc6\u91cc\u5feb\u901f\u627e\u5230\u6700\u63a5\u8fd1\u7684\u5019\u9009\u5173\u952e\u5e27\u5e76\u5bfc\u822a\u8fc7\u53bb\uff1b\u4e0d\u8981\u8ffd\u6c42\u5b8c\u7f8e\u9010\u9879\u5339\u914d\uff0c\u5982\u679c\u591a\u4e2a\u5019\u9009\u5dee\u4e0d\u591a\u5c31\u9009\u6700\u597d\u7684\u4e00\u4e2a\uff1a"
+          : "This is a compact search description generated from a target image. Quickly find the closest matching candidate keyframe in scene memory and navigate there; do not require a perfect detail-by-detail match, and if several candidates are close, choose the best one:";
+        messageInputEl.value = prefix + "\\n" + description;
+        updateComposerState(window.__carAgentLatestState || { input_window: { locked: false, mode: "ready" }, processing: false });
+      } catch (error) {
+        renderError(error.message || String(error));
+      } finally {
+        describeImageBtnEl.disabled = false;
+      }
+    }
+
+    async function sendMessage(message) {
+      sendBtnEl.disabled = true;
+      messageInputEl.disabled = true;
+      try {
+        const imageDataUrl = selectedImageDataUrl || await readSelectedImageAsDataUrl();
+        const payload = await request("/api/message", {
+          method: "POST",
+          body: JSON.stringify({
+            message,
+            role: "user",
+            input_language: inputLanguageEl.value,
+            output_language: outputLanguageEl.value,
+            image_data_url: imageDataUrl,
+          }),
+        });
+        renderPayload(payload);
+        messageInputEl.value = "";
+        selectedImageDataUrl = "";
+        imageUploadEl.value = "";
+        showImagePreview("", "");
+        scheduleRefresh(200);
+        return payload;
+      } catch (error) {
+        renderError(error.message || String(error));
+        scheduleRefresh(1200);
+        throw error;
+      } finally {
+        const latestState = window.__carAgentLatestState || null;
+        if (latestState) {
+          updateComposerState(latestState);
+        } else {
+          sendBtnEl.disabled = false;
+          messageInputEl.disabled = false;
+        }
+      }
+    }
+
+    formEl.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (sendBtnEl.disabled) return;
+      const message = messageInputEl.value.trim();
+      if (!message && !selectedImageDataUrl && !(imageUploadEl.files && imageUploadEl.files[0])) return;
+      try {
+        await sendMessage(message);
+      } catch (error) {
+        // Error state is already rendered above.
+      }
+    });
+
+    captureBtnEl.addEventListener("click", captureCurrentImage);
+    describeImageBtnEl.addEventListener("click", describeSelectedImage);
+    imageUploadEl.addEventListener("change", async () => {
+      try {
+        const dataUrl = await readSelectedImageAsDataUrl();
+        if (dataUrl) {
+          showImagePreview(dataUrl, "Image attached. Add text if needed, then click Send. Describe Image is optional for preview/debug.");
+          const latestState = window.__carAgentLatestState || {
+            input_window: { locked: false, mode: "ready" },
+            processing: false,
+          };
+          updateComposerState(latestState);
+        }
+      } catch (error) {
+        renderError(error.message || String(error));
+      }
+    });
+
+    messageInputEl.addEventListener("input", () => {
+      const latestState = window.__carAgentLatestState || {
+        input_window: {
+          mode: "ready",
+          title: "Ready for input",
+          detail: "Send a new instruction when ready.",
+          locked: false,
+        },
+        processing: false,
+      };
+      updateComposerState(latestState);
+    });
+
+    logsEl.addEventListener("scroll", () => {
+      logAutoFollow = isNearBottom(logsEl, 36);
+      updateConsoleFollowIndicator();
+    });
+
+    historyEl.addEventListener("scroll", () => {
+      historyAutoFollow = isNearBottom(historyEl, 36);
+    });
+
+    consoleJumpBtnEl.addEventListener("click", () => {
+      logsEl.scrollTop = logsEl.scrollHeight;
+      logAutoFollow = true;
+      updateConsoleFollowIndicator();
+    });
+
+    planViewListBtnEl.addEventListener("click", () => {
+      planViewMode = "list";
+      applyPlanViewMode();
+    });
+
+    planViewGraphBtnEl.addEventListener("click", () => {
+      planViewMode = "graph";
+      applyPlanViewMode();
+    });
+
+    document.getElementById("refresh-btn").addEventListener("click", async () => {
+      await refreshState();
+    });
+    document.getElementById("clear-btn").addEventListener("click", async () => {
+      clearBtnEl.disabled = true;
+      try {
+        const payload = await request("/api/clear", { method: "POST", body: "{}" });
+        renderPayload(payload);
+      } catch (error) {
+        renderError(error.message || String(error));
+      } finally {
+        clearBtnEl.disabled = false;
+        const latestState = window.__carAgentLatestState || null;
+        if (latestState) {
+          updateComposerState(latestState);
+        }
+      }
+    });
+    window.__carAgentLatestState = null;
+    updateConsoleFollowIndicator();
+    applyPlanViewMode();
+    refreshState();
+  </script>
+</body>
+</html>
+"""
+
+
+def _now_display() -> str:
+    """Return a human-readable local timestamp for UI updates and turn history."""
+
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _normalize_task_detail(task: dict[str, Any]) -> str:
+    """Render compact task metadata as a multi-line detail block for task cards."""
+
+    details: list[str] = []
+    if task.get("plan_id"):
+        details.append(f"plan_id: {task['plan_id']}")
+    if task.get("next_task_id") is not None:
+        details.append(f"next_task_id: {task['next_task_id']}")
+    if task.get("depends_on"):
+        details.append(f"depends_on: {task['depends_on']}")
+    if task.get("latest_result_summary"):
+        details.append(f"latest_result: {task['latest_result_summary']}")
+    if task.get("terminal_reason"):
+        details.append(f"terminal_reason: {task['terminal_reason']}")
+    return "\n".join(details)
+
+
+class AsyncAgentWebApp:
+    """Serve one AsyncAgent instance behind a tiny browser-based console."""
+
+    def __init__(self, agent: AsyncAgent, thread_id: str):
+        """Initialize web-session state and cached agent state."""
+
+        self.agent = agent
+        self.thread_id = thread_id
+        self.io_cfg = config.get("io", {})
+        self.last_input_language = str(self.io_cfg.get("input_language", "auto"))
+        self.last_output_language = str(self.io_cfg.get("output_language", "auto"))
+        self.lock = threading.RLock()
+        self.turn_history: list[dict[str, Any]] = []
+        self.latest_error: str | None = None
+        self.updated_at = _now_display()
+        self.turn_counter = 0
+        self.processing_turn_id: int | None = None
+        self.controller_arrival_turn_id: int | None = None
+        self.state_cache: dict[str, Any] = self.agent.get_thread_state(thread_id) or {}
+        self.max_log_lines = 28
+        if hasattr(self.agent, "add_controller_arrival_turn_listener"):
+            self.agent.add_controller_arrival_turn_listener(
+                self._handle_background_controller_arrival_turn
+            )
+
+    def _build_task_view(self, state: dict[str, Any]) -> list[dict[str, Any]]:
+        """Convert raw task records into ordered task cards for the UI."""
+
+        tasks = state.get("tasks", {}) or {}
+        current_plan_id = state.get("current_plan_id")
+        current_task_id = state.get("current_task_id")
+        ordered_task_ids = collect_ordered_task_ids_for_plan(
+            tasks,
+            plan_id=current_plan_id,
+        )
+        if not ordered_task_ids:
+            ordered_task_ids = collect_ordered_task_ids_for_plan(tasks, plan_id=None)
+
+        remaining_task_ids = [task_id for task_id in sorted(tasks) if task_id not in ordered_task_ids]
+        visible_task_ids = ordered_task_ids + remaining_task_ids
+        ordered_index = {
+            task_id: index + 1 for index, task_id in enumerate(ordered_task_ids)
+        }
+        ordered_total = len(ordered_task_ids)
+        task_cards: list[dict[str, Any]] = []
+
+        for task_id in visible_task_ids:
+            task = tasks[task_id]
+            latest_result = (task.get("result") or [])[-1] if task.get("result") else None
+            sequence_label = None
+            if task_id in ordered_index and ordered_total > 0:
+                sequence_label = f"step {ordered_index[task_id]}/{ordered_total}"
+
+            task_view = {
+                "task_id": task_id,
+                "title": f"Task #{task_id}: {task.get('description', '')}",
+                "type": task.get("type", "action"),
+                "status": task.get("status", "pending"),
+                "is_current": task_id == current_task_id,
+                "is_inserted": bool(task.get("inserted")),
+                "wait_for_event": task.get("wait_for_event"),
+                "plan_id": task.get("plan_id"),
+                "next_task_id": task.get("next_task_id"),
+                "depends_on": task.get("depends_on"),
+                "latest_result_summary": latest_result.get("summary") if latest_result else None,
+                "terminal_reason": task.get("terminal_reason"),
+                "sequence_label": sequence_label,
+            }
+            task_view["detail"] = _normalize_task_detail(task_view)
+            task_cards.append(task_view)
+
+        return task_cards
+
+    def _build_plan_graph_view(self, state: dict[str, Any]) -> dict[str, Any]:
+        """Build a read-only PlanGraph payload for the UI graph tab."""
+
+        tasks = state.get("tasks", {}) or {}
+        current_plan_id = state.get("current_plan_id")
+        current_task_id = state.get("current_task_id")
+        ordered_task_ids = collect_ordered_task_ids_for_plan(
+            tasks,
+            plan_id=current_plan_id,
+        )
+        plan_id = current_plan_id if ordered_task_ids else None
+        if not ordered_task_ids:
+            ordered_task_ids = collect_ordered_task_ids_for_plan(tasks, plan_id=None)
+
+        try:
+            summary = summarize_plan_graph(tasks, plan_id=plan_id)
+            edges = iter_plan_edges(tasks, plan_id=plan_id)
+            issues = validate_plan_graph(tasks, plan_id=plan_id)
+        except Exception as exc:
+            return {
+                "summary": {
+                    "plan_id": plan_id,
+                    "node_count": 0,
+                    "edge_count": 0,
+                    "root_task_ids": [],
+                    "leaf_task_ids": [],
+                    "is_dag": False,
+                },
+                "nodes": [],
+                "edges": [],
+                "issues": [
+                    {
+                        "severity": "error",
+                        "code": "plan_graph_build_failed",
+                        "task_id": -1,
+                        "message": f"Failed to build PlanGraph view: {exc}",
+                        "details": {},
+                    }
+                ],
+            }
+
+        root_ids = set(summary.get("root_task_ids") or [])
+        leaf_ids = set(summary.get("leaf_task_ids") or [])
+        scoped_task_ids = [
+            task_id
+            for task_id in ordered_task_ids
+            if task_id in tasks and (plan_id is None or tasks[task_id].get("plan_id") == plan_id)
+        ]
+        nodes = [
+            {
+                "task_id": task_id,
+                "description": tasks[task_id].get("description", ""),
+                "type": tasks[task_id].get("type", "action"),
+                "status": tasks[task_id].get("status", "pending"),
+                "is_current": task_id == current_task_id,
+                "is_root": task_id in root_ids,
+                "is_leaf": task_id in leaf_ids,
+                "plan_id": tasks[task_id].get("plan_id"),
+                "next_task_id": tasks[task_id].get("next_task_id"),
+                "depends_on": tasks[task_id].get("depends_on") or [],
+                "branches": tasks[task_id].get("branches") or {},
+                "wait_for_event": tasks[task_id].get("wait_for_event"),
+                "latest_result_summary": (
+                    (tasks[task_id].get("result") or [])[-1].get("summary")
+                    if tasks[task_id].get("result")
+                    else None
+                ),
+            }
+            for task_id in scoped_task_ids
+        ]
+
+        return {
+            "summary": summary,
+            "nodes": nodes,
+            "edges": edges,
+            "issues": issues,
+        }
+
+    def _build_event_view(self, state: dict[str, Any]) -> list[dict[str, Any]]:
+        """Convert recent structured events into short UI-friendly event cards."""
+
+        event_views: list[dict[str, Any]] = []
+        for event in list(state.get("events", []))[-3:]:
+            payload = event.get("payload", {}) or {}
+            event_views.append(
+                {
+                    "event_id": event.get("event_id"),
+                    "type": event.get("type"),
+                    "source": event.get("source"),
+                    "task_id": event.get("task_id"),
+                    "created_at": event.get("created_at"),
+                    "summary": payload.get("summary") or payload.get("content") or "",
+                }
+            )
+        return event_views
+
+    def _read_log_tail(self, file_path: Path, max_lines: int) -> str:
+        """Read the latest lines from one log file without loading excessive history."""
+
+        if not file_path.exists() or not file_path.is_file():
+            return ""
+
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="replace") as handle:
+                lines = deque(handle, maxlen=max_lines)
+        except Exception:
+            return ""
+
+        return "".join(lines).strip()
+
+    def _read_log_tail_entries(self, file_path: Path, max_lines: int) -> list[str]:
+        """Read the latest grouped log entries from one log file."""
+
+        text = self._read_log_tail(file_path, max_lines)
+        if not text:
+            return []
+
+        entries: list[str] = []
+        current_lines: list[str] = []
+        for raw_line in text.splitlines():
+            line = raw_line.rstrip()
+            if LOG_ENTRY_START_RE.match(line):
+                if current_lines:
+                    entry = "\n".join(current_lines).strip()
+                    if entry:
+                        entries.append(entry)
+                current_lines = [line]
+                continue
+
+            if not current_lines:
+                continue
+
+            if not line.strip():
+                current_lines.append("")
+            else:
+                current_lines.append(line)
+
+        if current_lines:
+            entry = "\n".join(current_lines).strip()
+            if entry:
+                entries.append(entry)
+
+        return entries
+
+    def _build_console_entries(self) -> list[str]:
+        """Build merged console entries while preserving multi-line log blocks."""
+
+        logger = getattr(self.agent, "logger", None)
+        if logger is None or not hasattr(logger, "get_session_dir"):
+            return []
+
+        session_dir_raw = logger.get_session_dir()
+        if not session_dir_raw:
+            return []
+
+        session_dir = Path(session_dir_raw)
+        log_specs = [
+            ("foreground", session_dir / "foreground_workflow_agents.log"),
+            ("background", session_dir / "background_agents.log"),
+            ("physical", session_dir / "physical_layer.log"),
+        ]
+
+        merged_entries: list[tuple[str, int, str]] = []
+        sequence = 0
+        for _, file_path in log_specs:
+            for entry in self._read_log_tail_entries(file_path, self.max_log_lines * 6):
+                first_line = entry.splitlines()[0] if entry.splitlines() else ""
+                timestamp_key = first_line[:32]
+                merged_entries.append((timestamp_key, sequence, entry))
+                sequence += 1
+
+        if not merged_entries:
+            return []
+
+        merged_entries.sort(key=lambda item: (item[0], item[1]))
+        return [entry for _, _, entry in merged_entries[-120:]]
+
+    def _build_console_output(self) -> str:
+        """Build one merged console-style stream from the current logger session files."""
+
+        return "\n\n".join(self._build_console_entries())
+
+    def _build_input_window_view(self, state: dict[str, Any]) -> dict[str, Any]:
+        """Describe whether the composer should be open, locked, or waiting-focused."""
+
+        next_action = state.get("next_action", {}) or {}
+        next_action_type = next_action.get("type", "idle")
+        current_task_id = state.get("current_task_id")
+        tasks = state.get("tasks", {}) or {}
+        current_task = tasks.get(current_task_id) if current_task_id in tasks else None
+
+        if self.processing_turn_id is not None:
+            return {
+                "locked": True,
+                "mode": "busy",
+                "title": "Agent is processing the latest turn",
+                "detail": "Planning and execution updates are streaming live. Input will reopen when this turn settles.",
+            }
+
+        if current_task and current_task.get("status") == "waiting":
+            wait_for_event = current_task.get("wait_for_event") or "external_event"
+            return {
+                "locked": False,
+                "mode": "waiting",
+                "title": "Awaiting external event",
+                "detail": f"Current task is waiting for {wait_for_event}. Controller arrivals are handled automatically.",
+            }
+
+        if next_action_type in {"plan", "execute"}:
+            return {
+                "locked": True,
+                "mode": "settling",
+                "title": "State is settling",
+                "detail": "The workflow is transitioning between nodes. The composer will reopen automatically in a moment.",
+            }
+
+        if state.get("current_plan_id"):
+            return {
+                "locked": False,
+                "mode": "active_plan",
+                "title": "Plan is active",
+                "detail": "You can send a follow-up instruction. The planner may insert, replace, or cancel future work.",
+            }
+
+        return {
+            "locked": False,
+            "mode": "ready",
+            "title": "Ready for input",
+            "detail": "Send a new instruction. Controller arrivals are handled automatically.",
+        }
+
+    def _get_state_snapshot_locked(
+        self,
+        state_override: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Return the safest currently-available state snapshot for payload rendering."""
+
+        if state_override is not None:
+            self.state_cache = state_override
+            return state_override
+
+        if self.processing_turn_id is not None:
+            return dict(self.state_cache)
+
+        state = self.agent.get_thread_state(self.thread_id) or {}
+        self.state_cache = state
+        return state
+
+    def _find_turn_locked(self, turn_id: int) -> dict[str, Any] | None:
+        """Locate one stored turn entry by id while the caller already holds the app lock."""
+
+        for turn in reversed(self.turn_history):
+            if turn.get("turn_id") == turn_id:
+                return turn
+        return None
+
+    def _merge_response_items(
+        self,
+        existing_items: Any,
+        new_items: Any,
+    ) -> list[dict[str, Any]]:
+        """Append only previously unseen response items while preserving order."""
+
+        merged_items = normalize_turn_response_items(existing_items)
+        incoming_items = normalize_turn_response_items(new_items)
+        seen_response_ids = {
+            str(item.get("response_id") or "").strip()
+            for item in merged_items
+            if str(item.get("response_id") or "").strip()
+        }
+        seen_response_keys = {
+            (
+                str(item.get("response_type") or "").strip(),
+                str(item.get("response_text") or "").strip(),
+            )
+            for item in merged_items
+        }
+        for item in incoming_items:
+            response_id = str(item.get("response_id") or "").strip()
+            response_key = (
+                str(item.get("response_type") or "").strip(),
+                str(item.get("response_text") or "").strip(),
+            )
+            if response_id and response_id in seen_response_ids:
+                continue
+            if response_key in seen_response_keys:
+                continue
+            merged_items.append(item)
+            if response_id:
+                seen_response_ids.add(response_id)
+            seen_response_keys.add(response_key)
+        return merged_items
+
+    def _apply_stream_update_locked(self, turn_id: int, update: dict[str, Any]) -> None:
+        """Apply one streamed node update to cached UI state for live refresh."""
+
+        turn = self._find_turn_locked(turn_id)
+        if turn is None:
+            return
+
+        node_state = update.get("node_state")
+        persisted_state = update.get("state")
+        merged_state = dict(self.state_cache)
+        if isinstance(node_state, dict):
+            merged_state.update(node_state)
+        if isinstance(persisted_state, dict) and persisted_state:
+            merged_state.update(persisted_state)
+        if merged_state:
+            self.state_cache = merged_state
+
+        step_summary = update.get("step_summary")
+        if isinstance(step_summary, dict):
+            step_trace = list(turn.get("step_trace", []))
+            step_trace.append(step_summary)
+            turn["step_trace"] = step_trace[-24:]
+            response_items = normalize_turn_response_items(
+                step_summary.get("turn_response_items")
+            )
+            if response_items:
+                existing_items = self._merge_response_items(
+                    turn.get("response_items"),
+                    response_items,
+                )
+                turn["response_items"] = existing_items
+                turn["response"] = str(
+                    existing_items[-1].get("response_text") or ""
+                )
+
+        turn["visited_nodes"] = list(update.get("visited_nodes", []) or [])
+        turn["status"] = "running"
+        turn["live_node"] = str(update.get("node_name") or "")
+        turn["updated_at"] = _now_display()
+        self.updated_at = _now_display()
+
+    def _finalize_turn_locked(
+        self,
+        turn_id: int,
+        turn_result: dict[str, Any],
+    ) -> None:
+        """Store one completed turn result and release the composer lock."""
+
+        turn = self._find_turn_locked(turn_id)
+        if turn is None:
+            self.processing_turn_id = None
+            self.state_cache = turn_result.get("state", {}) or self.state_cache
+            self.updated_at = _now_display()
+            return
+
+        response_text = str(turn_result.get("turn_response_text") or "").strip()
+        final_response_items = normalize_turn_response_items(
+            turn_result.get("response_items", [])
+        )
+        if turn_result.get("language_adapted"):
+            response_items = final_response_items
+        else:
+            response_items = self._merge_response_items(
+                turn.get("response_items"),
+                final_response_items,
+            )
+        if not response_text:
+            response_text = str(
+                (turn_result.get("state", {}) or {}).get("user_facing_response") or ""
+            ).strip()
+        if not response_text and response_items:
+            response_text = str(response_items[-1].get("response_text") or "").strip()
+
+        turn["response"] = response_text
+        turn["response_items"] = response_items
+        turn["turn_response_type"] = str(turn_result.get("turn_response_type") or "")
+        turn["output_language"] = str(turn_result.get("output_language") or "")
+        if turn_result.get("agent_message") and turn_result.get("agent_message") != turn.get("content"):
+            turn["agent_message"] = str(turn_result.get("agent_message") or "")
+        turn["status"] = "completed"
+        turn["visited_nodes"] = list(turn_result.get("visited_nodes", []) or [])
+        turn["step_trace"] = list(turn_result.get("step_trace", []) or [])[-24:]
+        turn["updated_at"] = _now_display()
+        turn["finished_at"] = _now_display()
+        turn["saw_plan_node"] = bool(turn_result.get("saw_plan_node"))
+        turn["saw_navigation_activity"] = bool(
+            turn_result.get("saw_navigation_activity")
+        )
+        self.state_cache = turn_result.get("state", {}) or self.state_cache
+        self.processing_turn_id = None
+        self.latest_error = None
+        self.updated_at = _now_display()
+
+    def _adapt_controller_turn_result_language(
+        self,
+        turn_result: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Use the latest UI language preference for background arrival turns."""
+
+        output_language = self.last_output_language or str(
+            self.io_cfg.get("output_language", "auto")
+        )
+        input_language = self.last_input_language or "auto"
+        return adapt_turn_result_language(
+            turn_result,
+            output_language=output_language,
+            original_input_language=input_language,
+        )
+
+    def _append_completed_controller_arrival_turn_locked(
+        self,
+        turn_result: dict[str, Any],
+    ) -> None:
+        """Append a completed background controller arrival turn to web history."""
+
+        if turn_result.get("thread_id") != self.thread_id:
+            return
+        turn_result = self._adapt_controller_turn_result_language(turn_result)
+
+        turn_id = self.controller_arrival_turn_id
+        turn = self._find_turn_locked(turn_id) if turn_id is not None else None
+        if turn is None:
+            self.turn_counter += 1
+            turn_id = self.turn_counter
+            turn = {
+                "turn_id": turn_id,
+                "role": "system",
+                "role_label": "Controller Arrival",
+                "source": "controller-watchdog",
+                "content": str(turn_result.get("message") or ""),
+                "response": "",
+                "response_items": [],
+                "created_at": _now_display(),
+                "updated_at": _now_display(),
+                "visited_nodes": [],
+                "step_trace": [],
+                "status": "running",
+                "live_node": "",
+            }
+            self.turn_history.append(turn)
+
+        final_response_items = normalize_turn_response_items(
+            turn_result.get("response_items", [])
+        )
+        if turn_result.get("language_adapted"):
+            response_items = final_response_items
+        else:
+            response_items = self._merge_response_items(
+                turn.get("response_items"),
+                final_response_items,
+            )
+        response_text = str(turn_result.get("turn_response_text") or "").strip()
+        if not response_text and response_items:
+            response_text = str(response_items[-1].get("response_text") or "").strip()
+        turn["response"] = response_text
+        turn["response_items"] = response_items
+        turn["content"] = str(turn_result.get("message") or turn.get("content") or "")
+        turn["updated_at"] = _now_display()
+        turn["finished_at"] = _now_display()
+        turn["visited_nodes"] = list(turn_result.get("visited_nodes", []) or [])
+        turn["step_trace"] = list(turn_result.get("step_trace", []) or [])[-24:]
+        turn["status"] = "completed"
+        turn["live_node"] = ""
+        turn["turn_response_type"] = str(turn_result.get("turn_response_type") or "")
+        turn["output_language"] = str(turn_result.get("output_language") or "")
+        turn["saw_plan_node"] = bool(turn_result.get("saw_plan_node"))
+        turn["saw_navigation_activity"] = bool(
+            turn_result.get("saw_navigation_activity")
+        )
+        self.turn_history = self.turn_history[-80:]
+        self.state_cache = turn_result.get("state", {}) or self.state_cache
+        self.controller_arrival_turn_id = None
+        self.latest_error = None
+        self.updated_at = _now_display()
+
+    def _apply_controller_arrival_update_locked(self, update: dict[str, Any]) -> None:
+        """Create/update the visible background controller turn while it is running."""
+
+        if update.get("thread_id") != self.thread_id:
+            return
+        update = self._adapt_controller_turn_result_language(update)
+
+        turn_id = self.controller_arrival_turn_id
+        turn = self._find_turn_locked(turn_id) if turn_id is not None else None
+        if turn is None:
+            self.turn_counter += 1
+            turn_id = self.turn_counter
+            self.controller_arrival_turn_id = turn_id
+            self.turn_history.append(
+                {
+                    "turn_id": turn_id,
+                    "role": "system",
+                    "role_label": "Controller Arrival",
+                    "source": "controller-watchdog",
+                    "content": str(update.get("message") or ""),
+                    "response": "",
+                    "response_items": [],
+                    "created_at": _now_display(),
+                    "updated_at": _now_display(),
+                    "visited_nodes": [],
+                    "step_trace": [],
+                    "status": "running",
+                    "live_node": "queued",
+                }
+            )
+            self.turn_history = self.turn_history[-80:]
+
+        self._apply_stream_update_locked(turn_id, update)
+
+    def _handle_background_controller_arrival_turn(
+        self,
+        turn_result: dict[str, Any],
+    ) -> None:
+        """Receive physical arrivals dispatched outside a web-submitted turn."""
+
+        if not turn_result.get("dispatched"):
+            return
+        with self.lock:
+            if turn_result.get("controller_arrival_update"):
+                self._apply_controller_arrival_update_locked(turn_result)
+            else:
+                self._append_completed_controller_arrival_turn_locked(turn_result)
+
+    def _fail_turn_locked(self, turn_id: int, error_text: str) -> None:
+        """Mark one pending turn as failed and surface the error to the UI."""
+
+        turn = self._find_turn_locked(turn_id)
+        if turn is not None:
+            turn["status"] = "failed"
+            turn["error"] = error_text
+            turn["updated_at"] = _now_display()
+            turn["finished_at"] = _now_display()
+        self.processing_turn_id = None
+        self.latest_error = error_text
+        self.updated_at = _now_display()
+
+    def _run_turn_worker(
+        self,
+        turn_id: int,
+        message: str,
+        role: str,
+        source: str,
+        input_language: str | None = None,
+        output_language: str | None = None,
+        image_data_url: str | None = None,
+    ) -> None:
+        """Process one message turn off-thread while publishing live state updates."""
+
+        del source
+        try:
+            agent_source_message = self._compose_agent_message_with_image(
+                message,
+                image_data_url=image_data_url,
+            )
+            original_input_language = normalize_language(
+                input_language,
+                fallback=detect_language(message),
+            )
+            requested_output_language = str(
+                output_language or self.io_cfg.get("output_language", "auto")
+            )
+            agent_message = prepare_user_message_for_agent(
+                agent_source_message,
+                input_language=str(input_language or self.io_cfg.get("input_language", "auto")),
+                output_language=requested_output_language,
+                translate_boundary=bool(self.io_cfg.get("translate_boundary", True)),
+            )
+            turn_result = self.agent.run_message_turn(
+                agent_message,
+                self.thread_id,
+                role,
+                on_update=lambda update: self._handle_turn_update(turn_id, update),
+            )
+            turn_result["original_message"] = message
+            turn_result["agent_message"] = agent_message
+            if image_data_url:
+                turn_result["image_attached"] = True
+            turn_result = adapt_turn_result_language(
+                turn_result,
+                output_language=requested_output_language,
+                original_input_language=original_input_language,
+            )
+            with self.lock:
+                self._finalize_turn_locked(turn_id, turn_result)
+        except Exception as exc:
+            with self.lock:
+                self._fail_turn_locked(turn_id, str(exc))
+
+    def _compose_agent_message_with_image(
+        self,
+        message: str,
+        *,
+        image_data_url: str | None = None,
+    ) -> str:
+        """Convert an optional attached image into text and combine it with input."""
+
+        clean_message = str(message or "").strip()
+        if not image_data_url:
+            return clean_message
+
+        image = image_from_data_url(image_data_url)
+        image_description = describe_image_for_navigation(image)
+        parts = []
+        if clean_message:
+            parts.append(f"User text request:\n{clean_message}")
+        else:
+            parts.append("User text request:\nUse the attached target image as the navigation/query reference.")
+        parts.append(
+            "Attached image search description:\n"
+            f"{image_description}"
+        )
+        parts.append(
+            "Instruction: combine the user text with the attached image description. "
+            "If this is a navigation request, quickly find the closest matching candidate keyframe; "
+            "do not require a perfect detail-by-detail match."
+        )
+        return "\n\n".join(parts)
+
+    def _handle_turn_update(self, turn_id: int, update: dict[str, Any]) -> None:
+        """Receive one streamed node update from AsyncAgent and cache it for polling."""
+
+        with self.lock:
+            self._apply_stream_update_locked(turn_id, update)
+
+    def _build_state_view(self, state: dict[str, Any]) -> dict[str, Any]:
+        """Build the aggregated state view consumed by the browser dashboard."""
+
+        tasks = self._build_task_view(state)
+        progress = get_task_progress_context(
+            state.get("tasks", {}) or {},
+            current_task_id=state.get("current_task_id"),
+            current_plan_id=state.get("current_plan_id"),
+        )
+        current_task_label = None
+        if progress is not None:
+            current_task_label = (
+                f"Task #{progress['task_id']} · step {progress['position']}/{progress['total']}"
+            )
+        elif state.get("current_task_id") is not None:
+            current_task_label = f"Task #{state['current_task_id']}"
+
+        if progress is not None:
+            current_task_label = (
+                f"Task #{progress['task_id']} | step {progress['position']}/{progress['total']}"
+            )
+
+        next_action = state.get("next_action", {}) or {}
+        input_window = self._build_input_window_view(state)
+        plan_graph = self._build_plan_graph_view(state)
+        return {
+            "current_plan_id": state.get("current_plan_id"),
+            "current_task_id": state.get("current_task_id"),
+            "current_task_label": current_task_label,
+            "next_action": next_action,
+            "next_action_type": next_action.get("type", "idle"),
+            "processing": self.processing_turn_id is not None,
+            "processing_turn_id": self.processing_turn_id,
+            "input_window": input_window,
+            "agent_status": input_window["title"],
+            "agent_status_detail": input_window["detail"],
+            "user_facing_response": state.get("user_facing_response"),
+            "turn_response_items": state.get("turn_response_items", []),
+            "visible_task_count": len(tasks),
+            "tasks": tasks,
+            "plan_graph": plan_graph,
+            "events": self._build_event_view(state),
+        }
+
+    def _filter_user_turn_response_items(
+        self,
+        turn: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Keep user-facing answers focused on final replies, not every progress tick."""
+
+        response_items = normalize_turn_response_items(turn.get("response_items"))
+        if not response_items:
+            return []
+
+        return list(response_items)
+
+    def _build_route_completion_notice(
+        self,
+        turn: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Surface controller-arrival responses as a visible turn when the plan is done."""
+
+        state = turn.get("state")
+        if not isinstance(state, dict):
+            return None
+        if state.get("current_plan_id") or state.get("current_task_id"):
+            return None
+
+        response_items = normalize_turn_response_items(turn.get("response_items"))
+        if not response_items:
+            return None
+
+        headline = str(
+            response_items[-1].get("response_text") or ""
+        ).strip()
+        if not headline:
+            return None
+
+        return {
+            "turn_id": turn.get("turn_id"),
+            "role": "system",
+            "role_label": "System",
+            "source": "controller-watchdog",
+            "content": str(turn.get("content") or ""),
+            "response": headline,
+            "response_items": [dict(item) for item in response_items],
+            "created_at": turn.get("created_at"),
+            "updated_at": turn.get("updated_at"),
+            "finished_at": turn.get("finished_at"),
+            "visited_nodes": list(turn.get("visited_nodes", []) or []),
+            "step_trace": list(turn.get("step_trace", []) or [])[-24:],
+            "status": "completed",
+            "live_node": "",
+            "turn_response_type": str(turn.get("turn_response_type") or "result"),
+        }
+
+    def _build_conversation_history(self) -> list[dict[str, Any]]:
+        """Build the clean chat timeline shown in the browser conversation panel."""
+
+        conversation: list[dict[str, Any]] = []
+
+        for turn in self.turn_history[-80:]:
+            source = str(turn.get("source") or "")
+            role = str(turn.get("role") or "")
+
+            if source in {"controller", "controller-watchdog"}:
+                notice = self._build_route_completion_notice(turn)
+                if notice is not None:
+                    conversation.append(notice)
+                elif normalize_turn_response_items(turn.get("response_items")):
+                    visible_turn = dict(turn)
+                    visible_turn["role_label"] = "System"
+                    conversation.append(visible_turn)
+                continue
+
+            visible_turn = dict(turn)
+            if role == "user":
+                response_items = self._filter_user_turn_response_items(turn)
+                visible_turn["response_items"] = response_items
+                if response_items:
+                    visible_turn["response"] = str(
+                        response_items[-1].get("response_text") or ""
+                    )
+            conversation.append(visible_turn)
+
+        return conversation[-80:]
+
+    def _build_payload_locked(self, state_override: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Build one complete browser payload while the caller already holds the app lock."""
+
+        state = self._get_state_snapshot_locked(state_override=state_override)
+        console_entries = self._build_console_entries()
+        self.updated_at = _now_display()
+        return {
+            "thread_id": self.thread_id,
+            "updated_at": self.updated_at,
+            "latest_error": self.latest_error,
+            "turn_history": self.turn_history[-80:],
+            "conversation_history": self._build_conversation_history(),
+            "console_entries": console_entries,
+            "console_output": "\n\n".join(console_entries),
+            "state": self._build_state_view(state),
+        }
+
+    def get_payload(self) -> dict[str, Any]:
+        """Return the latest UI payload for polling requests."""
+
+        with self.lock:
+            return self._build_payload_locked()
+
+    def submit_message(
+        self,
+        message: str,
+        role: str,
+        *,
+        source: str = "manual",
+        input_language: str | None = None,
+        output_language: str | None = None,
+        image_data_url: str | None = None,
+    ) -> dict[str, Any]:
+        """Queue one user message for async processing and return immediately."""
+
+        clean_message = str(message or "").strip()
+        clean_role = "user"
+        if not clean_message:
+            return self.get_payload()
+
+        with self.lock:
+            if self.processing_turn_id is not None:
+                self.latest_error = "A turn is already in progress. Please wait for the live workflow to settle."
+                return self._build_payload_locked()
+
+            self.last_input_language = str(input_language or self.io_cfg.get("input_language", "auto"))
+            self.last_output_language = str(output_language or self.io_cfg.get("output_language", "auto"))
+            self.turn_counter += 1
+            turn_id = self.turn_counter
+            self.processing_turn_id = turn_id
+            self.turn_history.append(
+                {
+                    "turn_id": turn_id,
+                    "role": clean_role,
+                    "role_label": "User Instruction",
+                    "source": source,
+                    "content": clean_message,
+                    "image_attached": bool(image_data_url),
+                    "response": "",
+                    "response_items": [],
+                    "created_at": _now_display(),
+                    "updated_at": _now_display(),
+                    "visited_nodes": [],
+                    "step_trace": [],
+                    "status": "running",
+                    "live_node": "queued",
+                }
+            )
+            self.turn_history = self.turn_history[-80:]
+            self.latest_error = None
+            payload = self._build_payload_locked()
+
+        worker = threading.Thread(
+            target=self._run_turn_worker,
+            args=(turn_id, clean_message, clean_role, source, input_language, output_language, image_data_url),
+            name=f"async-agent-web-turn-{turn_id}",
+            daemon=True,
+        )
+        worker.start()
+        return payload
+
+    def current_image_payload(self) -> dict[str, Any]:
+        """Return the latest controller image as a data URL for the browser."""
+
+        image = current_controller_image(getattr(self.agent, "controller", None))
+        if image is None:
+            return {
+                "status": "blocked",
+                "error": "Current image is unavailable.",
+                "image_data_url": None,
+            }
+        return {
+            "status": "ok",
+            "image_data_url": image_to_data_url(image),
+        }
+
+    def describe_uploaded_image(
+        self,
+        image_data_url: str,
+        *,
+        submit: bool = False,
+        input_language: str | None = None,
+        output_language: str | None = None,
+    ) -> dict[str, Any]:
+        """Describe an uploaded/captured image and optionally send it to the agent."""
+
+        image = image_from_data_url(image_data_url)
+        description = describe_image_for_navigation(image)
+        payload: dict[str, Any] = {
+            "status": "ok",
+            "description": description,
+        }
+        if submit:
+            message = (
+                "This is a compact search description generated from a target image. "
+                "Quickly find the closest matching candidate keyframe in scene memory "
+                "and navigate there. Do not require a perfect detail-by-detail match; "
+                "if several candidates are close, choose the best one.\n"
+                f"{description}"
+            )
+            payload["agent_payload"] = self.submit_message(
+                message,
+                "user",
+                source="image-upload",
+                input_language=input_language,
+                output_language=output_language,
+            )
+        return payload
+
+    def clear_history(self) -> dict[str, Any]:
+        """Clear visible session history while keeping backend thread state intact."""
+
+        with self.lock:
+            preserved_turns: list[dict[str, Any]] = []
+            if self.processing_turn_id is not None:
+                active_turn = self._find_turn_locked(self.processing_turn_id)
+                if active_turn is not None:
+                    preserved_turns.append(active_turn)
+
+            self.turn_history = preserved_turns
+            self.latest_error = None
+            self.updated_at = _now_display()
+            return self._build_payload_locked()
+
+
+
+class AsyncAgentWebHandler(BaseHTTPRequestHandler):
+    """HTTP handler bound to one AsyncAgentWebApp instance."""
+
+    app: AsyncAgentWebApp
+
+    def log_message(self, format: str, *args: Any) -> None:
+        """Silence default HTTP access logs because the UI renders its own activity view."""
+
+        return
+
+    def _send_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
+        """Write one JSON response with UTF-8 encoding."""
+
+        encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def _send_html(self, html: str) -> None:
+        """Write the embedded application shell as the root HTML response."""
+
+        encoded = html.encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def _read_json_body(self) -> dict[str, Any]:
+        """Decode the request body as JSON when the client sends one."""
+
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length)
+        if not raw:
+            return {}
+        return json.loads(raw.decode("utf-8"))
+
+    def do_GET(self) -> None:
+        """Serve either the app shell or the latest state snapshot."""
+
+        parsed = urlparse(self.path)
+        if parsed.path == "/":
+            self._send_html(APP_HTML)
+            return
+        if parsed.path == "/api/state":
+            self._send_json(self.app.get_payload())
+            return
+        if parsed.path == "/api/current-image":
+            self._send_json(self.app.current_image_payload())
+            return
+        self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
+
+    def do_POST(self) -> None:
+        """Handle message submission and history-clear requests."""
+
+        parsed = urlparse(self.path)
+        try:
+            if parsed.path == "/api/message":
+                payload = self._read_json_body()
+                message = payload.get("message", "")
+                role = payload.get("role", "user")
+                self._send_json(
+                    self.app.submit_message(
+                        message,
+                        role,
+                        input_language=payload.get("input_language"),
+                        output_language=payload.get("output_language"),
+                        image_data_url=payload.get("image_data_url"),
+                    )
+                )
+                return
+            if parsed.path == "/api/upload-image":
+                payload = self._read_json_body()
+                self._send_json(
+                    self.app.describe_uploaded_image(
+                        payload.get("image_data_url", ""),
+                        submit=bool(payload.get("submit", False)),
+                        input_language=payload.get("input_language"),
+                        output_language=payload.get("output_language"),
+                    )
+                )
+                return
+            if parsed.path == "/api/clear":
+                self._send_json(self.app.clear_history())
+                return
+            self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
+        except Exception as exc:
+            self.app.latest_error = str(exc)
+            self._send_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+
+def _load_scene_memory(dataset_dir: Path) -> SceneMemory:
+    """Load the scene-memory dataset required by the local demo."""
+
+    return SceneMemory(dataset_dir)
+
+
+class WebDemoController:
+    """Small controller for the web UI when ROS2/Nav2 is not embedded in-process."""
+
+    def __init__(
+        self,
+        *,
+        dry_run: bool = True,
+        scene_memory: SceneMemory | None = None,
+        current_image_path: Path | None = None,
+    ):
+        self._dry_run = bool(dry_run)
+        self._status = "idle"
+        self._latest_msg = ""
+        self._path: list[list[float]] = []
+        self._scene_memory = scene_memory
+        self._current_image_path = current_image_path
+
+    def update_path(self, new_path: list[list[float]]) -> None:
+        self._path = list(new_path or [])
+        self._status = "dry_run_dispatched" if self._dry_run else "dispatched"
+        if self._path:
+            goal = self._path[-1]
+            self._latest_msg = f"Arrived at demo goal x={goal[0]:.2f}, y={goal[1]:.2f}"
+        else:
+            self._latest_msg = "Demo navigation received an empty path."
+
+    def update_status(self, status: str) -> None:
+        self._status = str(status or "idle")
+
+    def update_latest_msg(self, msg: str) -> None:
+        self._latest_msg = str(msg or "")
+
+    def get_current_state(self) -> dict[str, Any]:
+        return {
+            "position": [0.0, 0.0, 0.0],
+            "orientation": [0.0, 0.0, 0.0, 1.0],
+            "status": self._status,
+        }
+
+    def get_current_image(self) -> Any:
+        try:
+            from PIL import Image
+
+            image_path = self._current_image_path or self._nearest_keyframe_image_path()
+            if image_path is None:
+                return None
+            return Image.open(image_path).convert("RGB")
+        except Exception:
+            return None
+
+    def check_for_new_messages(self) -> str:
+        message = self._latest_msg
+        self._latest_msg = ""
+        return message
+
+    def get_status(self) -> str:
+        return self._status
+
+    def _nearest_keyframe_image_path(self) -> Path | None:
+        if self._scene_memory is None:
+            return None
+        try:
+            node_id = self._scene_memory.find_nearest_node([0.0, 0.0, 0.0])
+            node = self._scene_memory.keyframe_nodes[node_id]
+            return node.rgb_path or node.left_path
+        except Exception:
+            return None
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """Create the command-line parser for the AsyncAgent web demo."""
+
+    parser = argparse.ArgumentParser(
+        description="Run a minimal local web UI for AsyncAgent.",
+    )
+    parser.add_argument(
+        "--dataset",
+        default=str(DEFAULT_DATASET_DIR),
+        help="Path to the scene-memory dataset directory.",
+    )
+    parser.add_argument("--host", default="127.0.0.1", help="Host to bind the local web server.")
+    parser.add_argument("--port", type=int, default=8123, help="Port to bind the local web server.")
+    parser.add_argument(
+        "--controller-type",
+        default="demo",
+        choices=["demo"],
+        help="Controller backend used by navigation tools. The web demo uses a dry-run controller.",
+    )
+    parser.add_argument(
+        "--dry-run-navigation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use dry-run navigation in the local web demo.",
+    )
+    parser.add_argument(
+        "--current-image",
+        type=Path,
+        default=None,
+        help="Optional image path used by analyse_on_current_image in the local web demo.",
+    )
+    parser.add_argument(
+        "--background-workers",
+        type=int,
+        default=None,
+        help="Number of background workers for async planning. Defaults to runtime profile.",
+    )
+    parser.add_argument(
+        "--thread-id",
+        default="web_console",
+        help="LangGraph thread id used by the web session.",
+    )
+    parser.add_argument(
+        "--disable-navigation",
+        action="store_true",
+        help="Disable navigation-related tools and controller polling.",
+    )
+    parser.add_argument(
+        "--disable-logging",
+        action="store_true",
+        help="Disable conversation logging for the web session.",
+    )
+    return parser
+
+
+def main() -> None:
+    """Start the local web server and keep it running until shutdown."""
+
+    args = _build_arg_parser().parse_args()
+    dataset_dir = normalize_runtime_path(args.dataset)
+    scene_memory = _load_scene_memory(dataset_dir)
+    controller = None if args.disable_navigation else WebDemoController(
+        dry_run=args.dry_run_navigation,
+        scene_memory=scene_memory,
+        current_image_path=args.current_image,
+    )
+    agent = AsyncAgent(
+        scene_memory,
+        is_navigation_mode=not args.disable_navigation,
+        controller_type=args.controller_type,
+        controller=controller,
+        enable_logging=not args.disable_logging,
+        num_background_workers=args.background_workers,
+    )
+
+    app = AsyncAgentWebApp(agent, thread_id=args.thread_id)
+
+    handler = type("BoundAsyncAgentWebHandler", (AsyncAgentWebHandler,), {"app": app})
+    server = ThreadingHTTPServer((args.host, args.port), handler)
+
+    print(f"CarAgent web UI is ready at http://{args.host}:{args.port}")
+    print(f"Dataset: {dataset_dir}")
+    print(f"Thread ID: {args.thread_id}")
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()

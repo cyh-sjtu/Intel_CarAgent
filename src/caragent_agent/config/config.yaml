@@ -1,0 +1,60 @@
+# CarAgent agent defaults.
+
+active_profile: balanced
+
+llm_model: deepseek-chat
+llm_routing:
+  orchestrate: deepseek-chat
+  planner: deepseek-chat
+  executor: deepseek-chat
+  background: deepseek-chat
+
+vlm_model_analyse_images: qwen3-vl-plus
+llm_model_search_on_keyframe_nodes: qwen3-vl-plus
+
+scene_memory:
+  dataset_dir: /home/car/caragent_ws/keyframes/session_20260524_005910/selected
+  device: GPU
+  connect_directly_distance_threshold: 3.0
+
+navigation:
+  controller_type: nav2
+  action_name: navigate_to_pose
+  global_frame: map
+  base_frame: base_link
+  camera_topic: /stereo/left/image_raw
+  odom_topic: /odom
+  action_timeout_sec: 120
+  arrival_tolerance_m: 0.50
+  dry_run_navigation: false
+
+agent:
+  is_navigation_mode: true
+  use_multi_agents: true
+  num_background_workers: 2
+
+io:
+  input_language: auto
+  output_language: auto
+  translate_boundary: true
+
+paths:
+  workspace_root: /home/car/caragent_ws
+  keyframes_root: /home/car/caragent_ws/keyframes
+  models_root: /home/car/caragent_ws/models
+  default_dataset_dir: /home/car/caragent_ws/keyframes/session_20260524_005910/selected
+
+log_dir: /home/car/caragent_ws/logs/caragent_agent
+kf_image_format: png
+nodes_number_in_a_request: 8
+final_path_simplify_tol: 0.2
+search_tool_timeout_sec: 90
+search_lexical_fallback_top_k: 12
+near_mask_distance_threshold: 5.0
+far_mask_distance_threshold: 10.0
+
+runtime_profiles:
+  balanced:
+    background_workers_default: 2
+    max_foreground_llm_concurrency: 1
+    max_background_llm_concurrency: 2

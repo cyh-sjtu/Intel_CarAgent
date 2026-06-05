@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>caragent_agent</name>
+  <version>0.1.0</version>
+  <description>CarAgent LLM agent with scene memory and Nav2 integration</description>
+  <maintainer email="car@todo.todo">car</maintainer>
+  <license>MIT</license>
+
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>nav2_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>ament_index_python</depend>
+
+  <exec_depend>python3-langchain</exec_depend>
+  <exec_depend>python3-langchain-openai</exec_depend>
+  <exec_depend>python3-langchain-core</exec_depend>
+  <exec_depend>python3-langgraph</exec_depend>
+  <exec_depend>python3-networkx</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-pillow</exec_depend>
+  <exec_depend>python3-pyyaml</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
+  <exec_depend>python3-torch</exec_depend>
+  <exec_depend>python3-transformers</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
