@@ -14,6 +14,7 @@ from PIL import Image
 
 DEFAULT_MODEL_DIR = Path("/home/car/caragent_ws/models/depth_anything_v2_openvino")
 DEFAULT_OUTPUT_DIR = Path("/home/car/caragent_ws/perception_outputs/depth_anything")
+RESAMPLING = getattr(Image, "Resampling", Image)
 
 
 def normalize_depth(depth: np.ndarray) -> np.ndarray:
@@ -70,7 +71,7 @@ class DepthAnythingOpenVINO:
         depth = np.squeeze(outputs[self.output_port]).astype(np.float32)
         if depth.shape != (image.height, image.width):
             depth_img = Image.fromarray(depth)
-            depth_img = depth_img.resize((image.width, image.height), resample=Image.Resampling.BICUBIC)
+            depth_img = depth_img.resize((image.width, image.height), resample=RESAMPLING.BICUBIC)
             depth = np.asarray(depth_img, dtype=np.float32)
         return depth, elapsed_ms
 

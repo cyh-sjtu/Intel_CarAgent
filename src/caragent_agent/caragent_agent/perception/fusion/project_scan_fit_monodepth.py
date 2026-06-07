@@ -14,6 +14,9 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 
+RESAMPLING = getattr(Image, "Resampling", Image)
+
+
 LASER_X_M = 0.12
 LASER_Y_M = 0.0
 LASER_Z_M = 0.30
@@ -348,7 +351,7 @@ def load_optional_mask(segmentation_json: Path | None, image_size: tuple[int, in
     mask = np.asarray(Image.open(mask_path).convert("L"))
     w, h = image_size
     if mask.shape != (h, w):
-        mask = np.asarray(Image.fromarray(mask).resize((w, h), Image.Resampling.NEAREST))
+        mask = np.asarray(Image.fromarray(mask).resize((w, h), RESAMPLING.NEAREST))
     return mask > 0
 
 

@@ -40,7 +40,3 @@ llm_api.yaml
 *.swp
 *.swo
 .DS_Store
-
-# External nested repositories
-src/GroundingDINO_OpenVINO/
-src/sllidar_ros2-main.zip

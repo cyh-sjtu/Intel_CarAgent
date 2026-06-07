@@ -12,6 +12,9 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 
+RESAMPLING = getattr(Image, "Resampling", Image)
+
+
 def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -257,7 +260,7 @@ def main() -> int:
     mask_path = Path(seg["mask_path"]).resolve()
     mask_src = np.asarray(Image.open(mask_path).convert("L")) > 0
     if mask_src.shape != (h, w):
-        mask_src = np.asarray(Image.fromarray(mask_src.astype(np.uint8) * 255).resize((w, h), Image.Resampling.NEAREST)) > 0
+        mask_src = np.asarray(Image.fromarray(mask_src.astype(np.uint8) * 255).resize((w, h), RESAMPLING.NEAREST)) > 0
     mask = cv2.remap(
         (mask_src.astype(np.uint8) * 255),
         calib["map_lx"],

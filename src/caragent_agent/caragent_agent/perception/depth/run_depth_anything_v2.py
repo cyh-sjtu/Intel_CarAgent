@@ -17,6 +17,7 @@ from PIL import Image
 
 
 DEFAULT_MODEL_ID = "depth-anything/Depth-Anything-V2-Small-hf"
+RESAMPLING = getattr(Image, "Resampling", Image)
 
 
 def _normalize_depth(depth: np.ndarray) -> np.ndarray:
@@ -85,7 +86,7 @@ def run_depth(image_path: Path, model_id: str, device: str) -> tuple[np.ndarray,
     depth = np.squeeze(depth).astype(np.float32)
     if depth.shape != (image.height, image.width):
         depth_img = Image.fromarray(depth)
-        depth_img = depth_img.resize((image.width, image.height), resample=Image.Resampling.BICUBIC)
+        depth_img = depth_img.resize((image.width, image.height), resample=RESAMPLING.BICUBIC)
         depth = np.array(depth_img, dtype=np.float32)
 
     metadata = {

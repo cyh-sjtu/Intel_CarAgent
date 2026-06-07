@@ -16,7 +16,7 @@ import numpy as np
 from PIL import Image
 
 
-DEFAULT_MODEL_ID = "IDEA-Research/grounding-dino-tiny"
+DEFAULT_MODEL_ID = "/home/car/caragent_ws/models/grounding-dino-tiny"
 DEFAULT_IMAGE = Path("/home/car/caragent_ws/keyframes/session_20260524_005910/selected/left/000123.png")
 DEFAULT_MODELS_DIR = Path("/home/car/caragent_ws/models/grounding_dino_openvino")
 DEFAULT_OUTPUT_DIR = Path("/home/car/caragent_ws/perception_outputs/grounding_dino")

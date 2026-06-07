@@ -18,6 +18,9 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 
+RESAMPLING = getattr(Image, "Resampling", Image)
+
+
 # From caragent_description/urdf/caragent.urdf
 LASER_X_M = 0.12
 LASER_Y_M = 0.0
@@ -303,7 +306,7 @@ def depth_stats(depth_path: Path, mask: np.ndarray) -> dict[str, Any]:
     depth = np.load(depth_path)
     if depth.shape != mask.shape:
         depth_img = Image.fromarray(depth.astype(np.float32))
-        depth_img = depth_img.resize((mask.shape[1], mask.shape[0]), resample=Image.Resampling.BICUBIC)
+        depth_img = depth_img.resize((mask.shape[1], mask.shape[0]), resample=RESAMPLING.BICUBIC)
         depth = np.array(depth_img, dtype=np.float32)
     values = depth[mask]
     return {

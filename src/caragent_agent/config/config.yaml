@@ -2,6 +2,9 @@
 
 active_profile: balanced
 
+profiles:
+  balanced: {}
+
 llm_model: deepseek-chat
 llm_routing:
   orchestrate: deepseek-chat
@@ -16,6 +19,7 @@ llm_model_search_on_keyframe_nodes: qwen3.6-flash
 scene_memory:
   dataset_dir: /home/car/caragent_ws/keyframes/session_20260524_005910/selected
   device: GPU
+  use_openvino_clip_text: true
   connect_directly_distance_threshold: 3.0
 
 navigation:

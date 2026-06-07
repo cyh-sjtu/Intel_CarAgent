@@ -7,6 +7,9 @@
 active_profile: balanced
 runtime_profile: balanced
 
+profiles:
+  balanced: {}
+
 llm_model: deepseek-chat
 llm_routing:
   orchestrate: deepseek-chat
@@ -28,6 +31,7 @@ llm_fallback_models:
 scene_memory:
   dataset_dir: /home/car/caragent_ws/keyframes/session_20260524_005910/selected
   device: cpu
+  use_openvino_clip_text: true
   connect_directly_distance_threshold: 3.0
 
 navigation:

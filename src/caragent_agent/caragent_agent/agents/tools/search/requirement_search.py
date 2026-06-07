@@ -3,7 +3,6 @@ import concurrent.futures
 import re
 from typing import List, Dict
 import torch
-import clip
 import numpy as np
 
 from caragent_agent.agents.tools.base.tool_base import ToolBase
@@ -18,6 +17,19 @@ NODES_NUMBER_IN_A_REQUEST = int(config.get("nodes_number_in_a_request", 8))
 CLIP_FILTER_TOP_K = 20
 SEARCH_TOOL_TIMEOUT_SEC = float(config.get("search_tool_timeout_sec", 45))
 LEXICAL_FALLBACK_TOP_K = int(config.get("search_lexical_fallback_top_k", 12))
+
+
+def _load_clip_module():
+    try:
+        import clip
+
+        return clip
+    except Exception as exc:
+        raise RuntimeError(
+            "OpenAI CLIP package is unavailable for torch fallback. "
+            "Use scene_memory.use_openvino_clip_text=true with text_encoder.xml, "
+            "or install OpenAI CLIP if torch fallback is required."
+        ) from exc
 
 
 def _as_feature_tensor(feature) -> torch.Tensor | None:
@@ -159,6 +171,7 @@ class RequirementSearchTool(ToolBase):
             if getattr(scene, 'clip_model', None) is None or getattr(scene, 'device', None) is None:
                 return scene.keyframe_nodes
 
+            clip = _load_clip_module()
             device = scene.device
             model = scene.clip_model
             clip_lock = (
