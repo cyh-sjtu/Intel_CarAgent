@@ -1,6 +1,11 @@
 # CarAgent agent defaults.
+#
+# Machine-specific overrides belong in local_config.yaml (git-ignored).
+# Select a profile via active_profile in local_config.yaml, or set the
+# CARAGENT_PROFILE environment variable.
 
 active_profile: balanced
+runtime_profile: balanced
 
 llm_model: deepseek-chat
 llm_routing:
@@ -9,13 +14,20 @@ llm_routing:
   executor: deepseek-chat
   background: deepseek-chat
 
-vlm_model_analyse_images: qwen3-vl-plus
+agent_core_llm_model: deepseek-chat
+agent_background_llm_model: deepseek-chat
 vlm_model_get_semantic: qwen3-vl-plus
+vlm_model_analyse_images: qwen3-vl-plus
 llm_model_search_on_keyframe_nodes: qwen3.6-flash
+llm_request_timeout_sec: 25
+llm_max_retries: 1
+llm_enable_text_fallback: true
+llm_fallback_models:
+  qwen: [deepseek-chat]
 
 scene_memory:
   dataset_dir: /home/car/caragent_ws/keyframes/session_20260524_005910/selected
-  device: GPU
+  device: cpu
   connect_directly_distance_threshold: 3.0
 
 navigation:

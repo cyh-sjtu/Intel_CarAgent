@@ -49,24 +49,22 @@ plan_system: |
   - `task_type: "decision"` only when the runtime must choose between branches.
   - `task_type` is the only task classification field.
 
-  Navigation rules:
-  - One navigation task = exactly one immediate destination. Never merge multiple
-    destinations into one task.
-  - A navigation_action must include one target:
-    {"type":"keyframe","keyframe_id":5},
-    {"type":"position","position":[x,y,z]}, or
-    {"type":"task_output","task_id":1,"field":"destination"}.
-  - If the destination is already a concrete numeric frame/keyframe id or
-    explicit coordinate position, create navigation_action directly.
-  - Named places, exhibit names, room/showroom names, artwork titles,
-    landmarks, and object descriptions are semantic destinations even when they
-    sound specific. They require an llm_action resolver before navigation unless
-    the user explicitly gives a numeric keyframe/frame id or coordinates.
-  - If the destination is semantic, historical, referential, or requires search
-    ("red lantern picture", "that place", "the first destination", "the last
-    tour"), create an llm_action resolver task first, then a navigation_action
-    with target {"type":"task_output","task_id":<resolver>,"field":"destination"}.
-  - Resolver tasks should produce a structured `destination` when possible.
+  Navigation rules — read carefully, this is the most common failure point:
+  - FORBIDDEN: A navigation_action MUST always split a semantic destination into
+    resolver + navigation. Never output a single task like "Navigate to X" where
+    X is any place name, room, exhibit, landmark, or object description.
+  - A navigation_action target must be EXACTLY one of these three structured types:
+    1. {"type":"keyframe","keyframe_id":<integer>}
+    2. {"type":"position","position":[x,y,z]}
+    3. {"type":"task_output","task_id":<resolver>,"field":"destination"}
+    A bare text string / place name is NEVER a valid target.
+  - Pattern: every semantic destination requires TWO tasks:
+    Task N:   llm_action        "Resolve the <destination>"
+    Task N+1: navigation_action  target: {"type":"task_output","task_id":N,"field":"destination"}, depends_on:[N]
+  - Exception: if the user gives an explicit numeric keyframe ID or [x,y,z]
+    coordinate, you may create a navigation_action directly with that concrete target.
+  - Self-check before output: scan every navigation_action. Does its target match
+    one of the three types above? If not, delete it and insert a resolver+nav pair.
   - When the user describes route continuity or spatial relation between stops
     ("from there", "across the hall", "near that place", "next to the previous
     room"), keep that relation in the route order, but do not put it into the
@@ -125,6 +123,10 @@ plan_system: |
   - Use `depends_on` only for execution-context dependencies, not for sequence
     edges. Sequence is represented by `next_task_id`; branches by `branches`.
   - Do not create disconnected tasks.
+  - Common failure: "Navigate to the elevator entrance" as a single
+    navigation_action with no resolver. This is WRONG. Correct:
+    Task 1: llm_action "Resolve the elevator entrance destination" -> next_task_id: 2
+    Task 2: navigation_action target: {"type":"task_output","task_id":1,"field":"destination"}, depends_on:[1]
 
   Output schema:
   {
@@ -138,7 +140,7 @@ plan_system: |
       {
         "task_id": 2,
         "task_type": "navigation_action",
-        "description": "Navigate to the black and white warning sign destination resolved by task 1",
+        "description": "Navigate to destination resolved by task 1 (target: black and white warning sign)",
         "target": {"type": "task_output", "task_id": 1, "field": "destination"},
         "depends_on": [1],
         "next_task_id": 3
@@ -321,3 +323,4 @@ is_require_planning_prompt: |
     "requires_planning": false,
     "task_type": "llm_action"
   }}
+

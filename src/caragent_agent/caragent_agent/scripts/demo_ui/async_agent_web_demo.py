@@ -1827,13 +1827,17 @@ APP_HTML = """<!doctype html>
       }
     }
 
-    function showImagePreview(dataUrl, text) {
-      selectedImageDataUrl = dataUrl || "";
-      if (selectedImageDataUrl) {
-        imagePreviewImgEl.src = selectedImageDataUrl;
+    function showImagePreview(dataUrl, text, attach) {
+      const attachToMessage = attach === true;
+      if (attachToMessage) {
+        selectedImageDataUrl = dataUrl || "";
+      }
+      const previewUrl = dataUrl || selectedImageDataUrl || "";
+      if (previewUrl) {
+        imagePreviewImgEl.src = previewUrl;
       }
       imagePreviewTextEl.textContent = text || "";
-      imagePreviewEl.style.display = selectedImageDataUrl || text ? "flex" : "none";
+      imagePreviewEl.style.display = previewUrl || text ? "flex" : "none";
     }
 
     function readSelectedImageAsDataUrl() {
@@ -1856,7 +1860,7 @@ APP_HTML = """<!doctype html>
         if (!payload.image_data_url) {
           throw new Error(payload.error || "Current image is unavailable");
         }
-        showImagePreview(payload.image_data_url, "Captured current robot camera frame.");
+        showImagePreview(payload.image_data_url, "Captured current robot camera frame.", false);
       } catch (error) {
         renderError(error.message || String(error));
       } finally {
@@ -1869,9 +1873,9 @@ APP_HTML = """<!doctype html>
       try {
         const dataUrl = selectedImageDataUrl || await readSelectedImageAsDataUrl();
         if (!dataUrl) {
-          throw new Error("Choose an image first, or capture the current camera frame.");
+          throw new Error("Choose an image file first, or capture the current camera frame for preview.");
         }
-        showImagePreview(dataUrl, "Describing image for navigation search...");
+        showImagePreview(dataUrl, "Describing image for navigation search...", false);
         const payload = await request("/api/upload-image", {
           method: "POST",
           body: JSON.stringify({
@@ -1882,7 +1886,7 @@ APP_HTML = """<!doctype html>
           }),
         });
         const description = payload.description || "";
-        showImagePreview(dataUrl, description);
+        showImagePreview(dataUrl, description, false);
         const prefix = outputLanguageEl.value === "zh" || inputLanguageEl.value === "zh"
           ? "\u8fd9\u662f\u4e00\u5f20\u76ee\u6807\u56fe\u7247\u751f\u6210\u7684\u7d27\u51d1\u68c0\u7d22\u63cf\u8ff0\u3002\u8bf7\u5728\u573a\u666f\u8bb0\u5fc6\u91cc\u5feb\u901f\u627e\u5230\u6700\u63a5\u8fd1\u7684\u5019\u9009\u5173\u952e\u5e27\u5e76\u5bfc\u822a\u8fc7\u53bb\uff1b\u4e0d\u8981\u8ffd\u6c42\u5b8c\u7f8e\u9010\u9879\u5339\u914d\uff0c\u5982\u679c\u591a\u4e2a\u5019\u9009\u5dee\u4e0d\u591a\u5c31\u9009\u6700\u597d\u7684\u4e00\u4e2a\uff1a"
           : "This is a compact search description generated from a target image. Quickly find the closest matching candidate keyframe in scene memory and navigate there; do not require a perfect detail-by-detail match, and if several candidates are close, choose the best one:";
@@ -1950,7 +1954,7 @@ APP_HTML = """<!doctype html>
       try {
         const dataUrl = await readSelectedImageAsDataUrl();
         if (dataUrl) {
-          showImagePreview(dataUrl, "Image attached. Add text if needed, then click Send. Describe Image is optional for preview/debug.");
+          showImagePreview(dataUrl, "Image attached. Type a message and click Send, or use Describe Image to search by this image.", true);
           const latestState = window.__carAgentLatestState || {
             input_window: { locked: false, mode: "ready" },
             processing: false,

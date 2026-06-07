@@ -209,7 +209,8 @@ class KeywordSearchTool(ToolBase):
         """Use CLIP model to pre-filter nodes based on similarity."""
         try:
             scene = self.scene_memory
-            if getattr(scene, "clip_text_encoder", None) is not None:
+            _use_ov = bool(config.get("scene_memory", {}).get("use_openvino_clip_text", False))
+            if _use_ov and getattr(scene, "clip_text_encoder", None) is not None:
                 text_features = scene.clip_text_encoder.encode_text(query_text)
                 candidates = []
                 features_list = []
@@ -223,6 +224,7 @@ class KeywordSearchTool(ToolBase):
                     if feature is not None:
                         candidates.append(kf_id)
                         features_list.append(feature)
+                filtered_nodes = {}
                 if candidates:
                     image_features = np.stack(features_list).astype(np.float32)
                     image_norms = np.linalg.norm(image_features, axis=1, keepdims=True)
@@ -230,7 +232,33 @@ class KeywordSearchTool(ToolBase):
                     similarity = image_features @ text_features.reshape(-1, 1)
                     k = min(top_k, len(candidates))
                     indices = np.argsort(-similarity.reshape(-1))[:k]
-                    return {candidates[int(idx)]: scene.keyframe_nodes[candidates[int(idx)]] for idx in indices}
+                    for idx in indices:
+                        kf_id = candidates[int(idx)]
+                        filtered_nodes[kf_id] = scene.keyframe_nodes[kf_id]
+
+                # Additional Frequency-based Filter (same as torch path below)
+                freq_scores = []
+                query_words = query_text.lower().split()
+                stop_words = {'a', 'an', 'the', 'in', 'on', 'at', 'with', 'and', 'or', 'of', 'to', 'for', 'is', 'are', 'photo', 'containing'}
+                query_words = [w for w in query_words if w not in stop_words]
+                if query_words:
+                    for kf_id, node in scene.keyframe_nodes.items():
+                        if kf_id in filtered_nodes:
+                            continue
+                        score = 0
+                        if hasattr(node, 'semantic') and node.semantic:
+                            node_text = node.semantic.lower()
+                            for word in query_words:
+                                score += node_text.count(word)
+                        if score > 0:
+                            freq_scores.append((score, kf_id))
+                    freq_scores.sort(key=lambda x: x[0], reverse=True)
+                    freq_k = min(top_k // 2, len(freq_scores))
+                    for i in range(freq_k):
+                        kf_id = freq_scores[i][1]
+                        filtered_nodes[kf_id] = scene.keyframe_nodes[kf_id]
+
+                return filtered_nodes
 
             if getattr(scene, 'clip_model', None) is None or getattr(scene, 'device', None) is None:
                 return scene.keyframe_nodes

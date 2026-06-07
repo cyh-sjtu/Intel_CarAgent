@@ -62,22 +62,26 @@ class SceneMemory:
                 self.device = load_device
             except Exception:
                 self.clip_text_encoder = None
-        if self.clip_text_encoder is None and load_device == "cuda":
+        # Always load torch CLIP as a reliable fallback (OpenVINO text encoder may
+        # produce degenerate embeddings on some hardware / export configurations).
+        torch_device = load_device
+        if torch_device.upper() in {"AUTO", "GPU", "NPU"}:
+            torch_device = "cpu"  # torch CLIP on DK-2500 runs on CPU
+        if torch_device == "cuda":
             try:
                 import torch
                 if not torch.cuda.is_available():
-                    load_device = "cpu"
+                    torch_device = "cpu"
             except Exception:
-                load_device = "cpu"
+                torch_device = "cpu"
 
         try:
             import clip
 
-            if self.clip_text_encoder is None:
-                self.clip_model, self.clip_preprocess = clip.load(
-                    "ViT-B/32", device=load_device
-                )
-                self.device = load_device
+            self.clip_model, self.clip_preprocess = clip.load(
+                "ViT-B/32", device=torch_device
+            )
+            self.device = torch_device  # torch path always uses this device
         except Exception:
             self.clip_model = None
             self.clip_preprocess = None

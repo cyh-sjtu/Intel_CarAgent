@@ -71,7 +71,7 @@ class UnifiedLLMClient:
         # development can use a subset of backends without startup failures.
         qwen_models = [
             "qwen-vl-max",
-            "qwen-vl-plus",
+            "qwen3-vl-plus",
             "qwen-turbo",
             "qwen-max",
             "qwen3-vl-plus",
@@ -126,7 +126,7 @@ class UnifiedLLMClient:
         """Resolve Qwen alias to actual model id."""
         mapping = {
             "qwen-vl-max": "qwen-vl-max-latest",
-            "qwen-vl-plus": "qwen-vl-plus-latest", 
+            "qwen3-vl-plus": "qwen3-vl-plus", 
             "qwen-turbo": "qwen-turbo",
             "qwen-max": "qwen-max",
             "qwen-plus": "qwen-plus",

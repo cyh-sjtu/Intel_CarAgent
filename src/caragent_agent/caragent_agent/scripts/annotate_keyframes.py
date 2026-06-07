@@ -88,7 +88,7 @@ async def _retry_single_annotation(
 def annotate(
     dataset_dir: Path,
     *,
-    model: str = "qwen-vl-plus",
+    model: str = "qwen3-vl-plus",
     batch_size: int = 5,
     force: bool = False,
     compute_clip: bool = True,
@@ -125,18 +125,19 @@ def annotate(
     clip_text_encoder = None
     clip_lock = None
     if compute_clip:
-        clip_text_encoder, clip_device = _try_load_openvino_clip_text_encoder(
-            str(config.get("scene_memory", {}).get("device", "GPU"))
-        )
-        if clip_text_encoder is not None:
-            print(f"OpenVINO CLIP text encoder loaded on {clip_device} for semantic text embedding.")
-        else:
-            clip_model, clip_preprocess, clip_device = _try_load_torch_clip()
+        clip_model, clip_preprocess, clip_device = _try_load_torch_clip()
         if clip_model is not None:
             clip_lock = threading.Lock()
             print(f"CLIP model loaded on {clip_device} for text embedding.")
-        elif clip_text_encoder is None:
-            print("CLIP model unavailable, skipping semantic_clip_encoding.")
+        else:
+            clip_text_encoder, clip_device_ov = _try_load_openvino_clip_text_encoder(
+                str(config.get("scene_memory", {}).get("device", "GPU"))
+            )
+            if clip_text_encoder is not None:
+                clip_device = clip_device_ov
+                print(f"OpenVINO CLIP text encoder loaded on {clip_device} for semantic text embedding (torch CLIP unavailable).")
+            else:
+                print("CLIP model unavailable, skipping semantic_clip_encoding.")
 
     client = UnifiedLLMClient()
     annotated = 0
@@ -249,7 +250,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    model = args.model or config.get("vlm_model_get_semantic", "qwen-vl-plus")
+    model = args.model or config.get("vlm_model_get_semantic", "qwen3-vl-plus")
     ids = None
     if args.ids:
         ids = [int(x.strip()) for x in args.ids.split(",") if x.strip()]
