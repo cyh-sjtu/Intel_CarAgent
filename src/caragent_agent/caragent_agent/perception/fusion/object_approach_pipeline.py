@@ -815,7 +815,7 @@ Rules:
             absolute_depth_model_dir=DEFAULT_WORKSPACE / "models" / "depth_anything_v2_metric_indoor_small_openvino",
             absolute_depth_device="GPU",
             sam_device="GPU",
-            sam_encoder_device="GPU",
+            sam_encoder_device="NPU",
             sam_decoder_device="CPU",
             sam_encoder_xml=DEFAULT_SAM_ENCODER_XML,
             sam_decoder_xml=DEFAULT_SAM_DECODER_XML,

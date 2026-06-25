@@ -26,7 +26,7 @@ llm_request_timeout_sec:
 
 scene_memory:
   dataset_dir: /home/car/caragent_ws/keyframes/session_20260617_233059/selected
-  device: GPU
+  device: NPU
   use_openvino_clip_text: true
   connect_directly_distance_threshold: 3.0
 

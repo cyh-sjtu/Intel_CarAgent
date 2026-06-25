@@ -37,7 +37,7 @@ llm_fallback_models:
 
 scene_memory:
   dataset_dir: /home/car/caragent_ws/keyframes/session_20260617_233059/selected
-  device: cpu
+  device: NPU
   use_openvino_clip_text: true
   connect_directly_distance_threshold: 3.0
 

@@ -92,6 +92,17 @@ class OpenVINOClipImageEncoder:
         Core = _load_openvino_core()
         self.core = Core()
         self.model = self.core.read_model(str(model_path))
+        # NPU compiler requires static input shapes. Inputs are already produced
+        # at a fixed size by _preprocess, so reshape the IR to static on NPU only.
+        # CPU/GPU paths are left untouched.
+        if "NPU" in self.device.upper():
+            try:
+                in0 = self.model.input(0)
+                self.model.reshape({in0.get_any_name(): [1, 3, self.input_size, self.input_size]})
+            except Exception as exc:  # pragma: no cover - device/IR specific
+                raise RuntimeError(
+                    f"Failed to reshape CLIP image IR to static shape for NPU: {exc}"
+                ) from exc
         self.compiled_model = self.core.compile_model(self.model, self.device)
         self.input_layer = self.compiled_model.input(0)
         self.output_layers = [self.compiled_model.output(index) for index in range(len(self.compiled_model.outputs))]
@@ -171,6 +182,17 @@ class OpenVINOClipTextEncoder:
         Core = _load_openvino_core()
         self.core = Core()
         self.model = self.core.read_model(str(model_path))
+        # NPU compiler requires static input shapes. encode_text always tokenizes
+        # with padding="max_length", max_length=77, so every input is [1, 77].
+        # Reshape the IR to static on NPU only; CPU/GPU paths are left untouched.
+        if "NPU" in self.device.upper():
+            try:
+                static = {inp.get_any_name(): [1, 77] for inp in self.model.inputs}
+                self.model.reshape(static)
+            except Exception as exc:  # pragma: no cover - device/IR specific
+                raise RuntimeError(
+                    f"Failed to reshape CLIP text IR to static shape for NPU: {exc}"
+                ) from exc
         self.compiled_model = self.core.compile_model(self.model, self.device)
         self.output_layers = [self.compiled_model.output(index) for index in range(len(self.compiled_model.outputs))]
 
