@@ -81,6 +81,15 @@ def extract_selected_position_from_raw_output(raw_output: Optional[str]) -> Opti
                 return position
             continue
 
+        if tool_name == "go_to_position":
+            result_data = _extract_structured_result_data(tool_result)
+            if not isinstance(result_data, dict):
+                continue
+            position = _extract_position_triplet(result_data.get("target_position"))
+            if position is not None:
+                return position
+            continue
+
         if tool_name != "get_keyframe_nodes_info" or selected_keyframe_id is None:
             continue
 

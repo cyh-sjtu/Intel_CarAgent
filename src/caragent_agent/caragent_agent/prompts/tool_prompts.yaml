@@ -33,19 +33,26 @@ llm_search_keywords_on_kf_request_message_system_or: |
   4. After analyzing all the keyframe nodes, return the list of IDs of keyframe nodes that meet the criteria, in the format '<answer>[ID1, ID2, ID3...]</answer>'.
 
 llm_search_requirement_on_kf_request_message_system: | 
-  You need to return a list of keyframe node IDs that requirement based on the given keyframe node dictionary and requirement string. You will receive <keyframe node dictionary>{{KEYFRAME_NODE_DICTIONARY}}</keyframe node dictionary> and <requirement string>{{REQUIREMENT}}</requirement string>.
+  You need to return a list of keyframe node IDs that satisfy a navigation/search requirement based on the given keyframe node dictionary and requirement string. You will receive <keyframe node dictionary>{{KEYFRAME_NODE_DICTIONARY}}</keyframe node dictionary> and <requirement string>{{REQUIREMENT}}</requirement string>.
   
   First, carefully read the following keyframe node dictionary: <keyframe node dictionary>{{KEYFRAME_NODE_DICTIONARY}}</keyframe node dictionary>. Here, the keys of the dictionary are the IDs of the keyframe nodes, and the values are the semantics of the keyframe nodes.
   
   Next, review the following requirement: <requirement string>{{REQUIREMENT}}</requirement string>.
+
+  Important matching policy:
+  - The keyframe map is a finite set of robot viewpoints. A good match does not need to reproduce every detail, crop, viewpoint, object count, or transient object in the user's image or wording.
+  - For image-to-place matching, prefer stable scene layout and landmarks. Do not reject a candidate just because some minor visual details differ.
+  - For object-target navigation, the main criterion is whether the requested target object is present and useful as a staging viewpoint: closer, larger, clearer, more complete, more centered, and less occluded is better.
+  - If several keyframes satisfy the same target, return all plausible IDs in best-first order rather than only a perfect match.
+  - Be permissive about synonyms and paraphrases in the keyframe semantics.
   
   Please follow these steps for analysis:
   
   1. Iterate through each keyframe node in the keyframe node dictionary.
   
-  2. For each keyframe node, determine whether its semantics meet the requirement.
+  2. For each keyframe node, determine whether its semantics meet the core requirement. Ignore nonessential mismatches unless they change the target place or target object.
   
-  3. If the semantics of the keyframe node meet the requirement, add its ID to the list of IDs of keyframe nodes that meet the criteria.
+  3. If the semantics of the keyframe node meet the requirement, add its ID to the list of IDs of keyframe nodes that meet the criteria. Put stronger viewpoints earlier when possible.
   
   4. After analyzing all the keyframe nodes, return the list of IDs of keyframe nodes that meet the criteria, in the format '<answer>[ID1, ID2, ID3...]</answer>'.
 

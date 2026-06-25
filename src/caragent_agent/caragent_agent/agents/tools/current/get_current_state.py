@@ -1,4 +1,37 @@
+from datetime import datetime
+from typing import Any
+
 from caragent_agent.agents.tools.base.tool_base import ToolBase
+
+
+def _compact_current_state(raw_state: dict[str, Any]) -> dict[str, Any]:
+    """Return the LLM-facing state view without maps/costmaps/raw grids."""
+
+    omitted_count = sum(
+        1
+        for key in ("occupancy_grid", "map", "costmap", "grid", "scan", "raw_scan")
+        if key in raw_state
+    )
+    compact = {
+        "position": raw_state.get("position"),
+        "orientation": raw_state.get("orientation"),
+        "status": raw_state.get("status"),
+        "source": raw_state.get("source"),
+        "timestamp": raw_state.get("timestamp")
+        or datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+    }
+    if raw_state.get("error"):
+        compact["error"] = str(raw_state.get("error"))
+    if raw_state.get("tf_error"):
+        compact["tf_error"] = str(raw_state.get("tf_error"))
+    if omitted_count:
+        compact["large_state_fields_omitted"] = True
+        compact["omitted_large_field_count"] = omitted_count
+        compact["full_state_note"] = (
+            "Large mapping/perception fields are internal-only and are not included "
+            "in the LLM-facing tool result."
+        )
+    return {key: value for key, value in compact.items() if value is not None}
 
 class Get_Current_State_Tool(ToolBase):
     def __init__(self, controller):
@@ -53,14 +86,15 @@ class Get_Current_State_Tool(ToolBase):
                 provenance={"source_type": "controller"},
             )
 
-        position = normalized_state.get("position")
-        orientation = normalized_state.get("orientation")
-        status = str(normalized_state.get("status") or "").strip()
+        compact_state = _compact_current_state(normalized_state)
+        position = compact_state.get("position")
+        orientation = compact_state.get("orientation")
+        status = str(compact_state.get("status") or "").strip()
 
         if position is None and orientation is None and not status:
             return self.partial(
                 "Controller returned an empty current-state payload.",
-                data=normalized_state,
+                data=compact_state,
                 error={
                     "code": "empty_state_payload",
                     "message": "No position, orientation, or status was available.",
@@ -70,6 +104,6 @@ class Get_Current_State_Tool(ToolBase):
 
         return self.ok(
             "Retrieved the current controller state.",
-            data=normalized_state,
+            data=compact_state,
             provenance={"source_type": "controller"},
         )

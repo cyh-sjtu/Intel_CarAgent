@@ -5,19 +5,27 @@ active_profile: balanced
 profiles:
   balanced: {}
 
-llm_model: deepseek-chat
+llm_model: qwen3.6-flash
 llm_routing:
-  orchestrate: deepseek-chat
-  planner: deepseek-chat
-  executor: deepseek-chat
-  background: deepseek-chat
+  orchestrate: qwen3.6-flash
+  planner: qwen3.6-flash
+  executor: qwen3.6-flash
+  background: qwen3.6-flash
+  translation: qwen-turbo
 
-vlm_model_analyse_images: qwen3-vl-plus
-vlm_model_get_semantic: qwen3-vl-plus
+vlm_model_analyse_images: qwen3-vl-flash
+vlm_model_get_semantic: qwen3-vl-flash
 llm_model_search_on_keyframe_nodes: qwen3.6-flash
+llm_request_timeout_sec:
+  default: 25
+  qwen-turbo: 8
+  qwen: 50
+  qwen3-vl-plus: 70
+  qwen-vl-max: 70
+  qwen3-vl-flash: 60
 
 scene_memory:
-  dataset_dir: /home/car/caragent_ws/keyframes/session_20260524_005910/selected
+  dataset_dir: /home/car/caragent_ws/keyframes/session_20260617_233059/selected
   device: GPU
   use_openvino_clip_text: true
   connect_directly_distance_threshold: 3.0
@@ -28,30 +36,109 @@ navigation:
   global_frame: map
   base_frame: base_link
   camera_topic: /stereo/left/image_raw
+  right_image_topic: /stereo/right/image_raw
   odom_topic: /odom
+  scan_topic: /scan
+  map_topic: /global_costmap/costmap
   action_timeout_sec: 120
-  arrival_tolerance_m: 0.50
+  arrival_tolerance_m: 0.25
   dry_run_navigation: false
+  # Workflow simulation mode keeps Agent/planner/executor/background logic real,
+  # but does not send Nav2 actions or cmd_vel. It waits, then updates a virtual
+  # robot pose and emits the normal arrival event for workflow testing.
+  simulation_mode: false
+  simulation_navigation_delay_sec: 30.0
+  simulation_navigation_delay_per_meter_sec: 0.0
+  simulation_initial_position: [0.0, 0.0, 0.0]
+  simulation_initial_yaw_deg: 0.0
+  # Simulation-only: allow object approach to use its conservative direct goal
+  # when no costmap exists. Real robot mode still requires the costmap path.
+  simulation_allow_direct_object_approach_without_costmap: true
+  enable_rotation_takeover: true
+  rotation_policy: left_only
+  pre_align_enabled: true
+  final_align_enabled: true
+  yaw_tolerance_deg: 4.0
+  settle_time_sec: 0.7
+  fast_omega: 1.45
+  mid_omega: 0.95
+  slow_omega: 0.40
+  rotation_timeout_sec: 45.0
+  rotation_loop_rate_hz: 20.0
+  right_turn_shortcut_deg: 90.0
+  # Guard the handoff from initial localization/pre-align into Nav2 motion.
+  # Before pre-align it only requires fresh scan/odom and a valid map->base_link
+  # transform. After pre-align it waits briefly for pose stability before Nav2.
+  localization_handoff_gate_enabled: true
+  localization_handoff_settle_sec: 1.0
+  localization_handoff_timeout_sec: 2.0
+  localization_handoff_max_translation_m: 0.12
+  localization_handoff_max_yaw_deg: 8.0
+  localization_handoff_sensor_max_age_sec: 1.5
 
 agent:
   is_navigation_mode: true
   use_multi_agents: true
   num_background_workers: 2
+  # Fixed by system configuration, not exposed as an Agent tool argument.
+  # Supported values: stereo, stereo_primary_mono_guard, mono_relative_lidar.
+  object_approach_depth_backend: stereo
+  object_approach_preload_on_init: true
+  object_approach_preload_async: true
+  object_preanalysis_wait_timeout_sec: 25.0
+  object_preanalysis_wait_poll_sec: 0.5
+  object_preanalysis_wait_for_record_sec: 3.0
+  object_approach_budgeted_live_after_arrival_enabled: false
+  object_approach_budgeted_live_after_arrival_max_attempts: 1
+  target_resolution_enabled: true
+  target_resolution_dry_run: false
+  capture_view_on_navigation_arrival: true
+  arrival_capture_image_format: jpg
 
 io:
-  input_language: auto
-  output_language: auto
+  input_language: zh
+  output_language: zh
   translate_boundary: true
+  # Keep boundary translation deterministic: choose zh/en explicitly.
+  # input_language controls whether user text is translated for planning/search.
+  # output_language controls the UI/ROS response language.
+  translate_input: true
+  translate_output: true
+  translation_model: qwen-turbo
 
 paths:
   workspace_root: /home/car/caragent_ws
   keyframes_root: /home/car/caragent_ws/keyframes
   models_root: /home/car/caragent_ws/models
-  default_dataset_dir: /home/car/caragent_ws/keyframes/session_20260524_005910/selected
+  default_dataset_dir: /home/car/caragent_ws/keyframes/session_20260617_233059/selected
 
 log_dir: /home/car/caragent_ws/logs/caragent_agent
 kf_image_format: png
-nodes_number_in_a_request: 8
+nodes_number_in_a_request: 16
+keyframe_search_clip_top_k: 24
+keyframe_search_backend: local_hybrid
+keyframe_search_hybrid_top_k: 16
+keyframe_search_chunk_match_enabled: true
+keyframe_search_chunk_clip_top_k: 32
+keyframe_search_chunk_max_chars: 260
+keyframe_search_chunk_limit_per_keyframe: 10
+keyframe_search_vlm_rerank_enabled: true
+keyframe_search_vlm_rerank_top_k: 6
+keyframe_search_vlm_rerank_timeout_sec: 45
+keyframe_search_hybrid_weights:
+  chunk_clip: 0.30
+  full_clip: 0.15
+  lexical: 0.20
+  coverage: 0.25
+  visibility: 0.10
+
+attached_image_direct_hybrid_top_k: 5
+attached_image_direct_hybrid_use_clip_chunks: false
+attached_image_direct_hybrid_vlm_rerank_enabled: true
+attached_image_direct_hybrid_vlm_timeout_sec: 45
+attached_image_direct_hybrid_weights:
+  dinov2_image_to_image: 1.0
+  clip_image_to_semantic_chunk: 0.0
 final_path_simplify_tol: 0.2
 search_tool_timeout_sec: 90
 search_lexical_fallback_top_k: 12

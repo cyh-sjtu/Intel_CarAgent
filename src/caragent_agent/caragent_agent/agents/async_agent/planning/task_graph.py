@@ -249,6 +249,94 @@ def target_branch_label(
     return f"{fallback_prefix}_{target_task_id}"
 
 
+def _coerce_branch_target_id(raw_target: Any) -> Optional[int]:
+    """Normalize branch targets to integer task ids.
+
+    Planner output occasionally wraps branch targets as
+    {"next_task_id": 5}.  Runtime graph code expects branches to be
+    label -> int, so unwrap that structural variant here instead of letting a
+    dict flow into graph traversal.
+    """
+
+    if isinstance(raw_target, dict):
+        raw_target = raw_target.get("next_task_id") or raw_target.get("task_id")
+    try:
+        return int(raw_target)
+    except Exception:
+        return None
+
+
+def normalize_task_branches(tasks: dict[int, TaskItem]) -> None:
+    """Ensure every task's branches map labels to valid integer task ids."""
+
+    for task_id, task in tasks.items():
+        raw_branches = task.get("branches")
+        if not isinstance(raw_branches, dict):
+            if raw_branches is not None:
+                task["branches"] = None
+            continue
+        valid_branches: dict[str, int] = {}
+        for raw_label, raw_target in raw_branches.items():
+            target_id = _coerce_branch_target_id(raw_target)
+            if target_id is None or target_id not in tasks or target_id == task_id:
+                continue
+            valid_branches[str(raw_label).strip() or f"branch_{target_id}"] = target_id
+        task["branches"] = valid_branches or None
+
+
+def repair_missing_decision_branches(tasks: dict[int, TaskItem]) -> None:
+    """Infer missing decision branch entries from explicit downstream deps.
+
+    The planner prompt requires decision tasks to provide `branches`, but LLM
+    output can omit that field while still encoding branch roots via
+    `depends_on: [decision_task_id]`.  Repair only that structural omission:
+    no keyword matching, no semantic branch choice.
+    """
+
+    for task_id, task in tasks.items():
+        if task.get("task_type") != "decision":
+            continue
+
+        raw_branches = task.get("branches")
+        valid_branches: dict[str, int] = {}
+        if isinstance(raw_branches, dict):
+            for raw_label, raw_target in raw_branches.items():
+                target_id = _coerce_branch_target_id(raw_target)
+                if target_id is None:
+                    continue
+                if target_id in tasks and target_id != task_id:
+                    valid_branches[str(raw_label).strip() or f"branch_{target_id}"] = target_id
+        if valid_branches:
+            task["branches"] = valid_branches
+            continue
+
+        inferred_targets: list[int] = []
+        for candidate_id, candidate in tasks.items():
+            if candidate_id == task_id:
+                continue
+            try:
+                dependencies = {int(value) for value in candidate.get("depends_on", []) or []}
+            except Exception:
+                dependencies = set()
+            if task_id in dependencies:
+                inferred_targets.append(candidate_id)
+
+        inferred_branches: dict[str, int] = {}
+        used_labels: set[str] = set()
+        for index, target_id in enumerate(sorted(set(inferred_targets)), start=1):
+            label = target_branch_label(
+                target_id,
+                tasks,
+                fallback_prefix=f"branch_{index}",
+            )
+            inferred_branches[make_unique_branch_label(label, used_labels)] = target_id
+
+        if inferred_branches:
+            task["branches"] = inferred_branches
+            if task.get("default_branch") not in inferred_branches:
+                task["default_branch"] = next(iter(inferred_branches))
+
+
 def parse_planned_tasks_from_response(
     plan_text: str,
     *,
@@ -287,11 +375,35 @@ def parse_planned_tasks_from_response(
             "created_at": created_at,
             "updated_at": created_at,
         }
+        if isinstance(task_info.get("outputs"), list):
+            parsed_tasks[task_id]["outputs"] = [
+                str(value).strip()
+                for value in task_info["outputs"]
+                if str(value).strip()
+            ]
+        if isinstance(task_info.get("inputs_from"), dict):
+            parsed_tasks[task_id]["inputs_from"] = dict(task_info["inputs_from"])
         if isinstance(task_info.get("target"), dict):
             parsed_tasks[task_id]["target"] = dict(task_info["target"])
+        if isinstance(task_info.get("image_refs"), list):
+            parsed_tasks[task_id]["image_refs"] = [
+                str(value).strip()
+                for value in task_info["image_refs"]
+                if str(value).strip()
+            ]
+        for optional_key in (
+            "scene_context",
+            "selection_policy",
+        ):
+            optional_value = task_info.get(optional_key)
+            if optional_value is not None and str(optional_value).strip():
+                parsed_tasks[task_id][optional_key] = str(optional_value).strip()
 
     if first_task_id not in parsed_tasks:
         first_task_id = min(parsed_tasks) if parsed_tasks else None
+
+    normalize_task_branches(parsed_tasks)
+    repair_missing_decision_branches(parsed_tasks)
 
     return parsed_tasks, first_task_id
 
@@ -341,6 +453,18 @@ def remap_plan_task_ids(
                 if source_task_id in task_id_map:
                     remapped_target["task_id"] = task_id_map[source_task_id]
             remapped_task["target"] = remapped_target
+        if isinstance(task.get("image_refs"), list):
+            remapped_task["image_refs"] = list(task.get("image_refs") or [])
+        if isinstance(task.get("outputs"), list):
+            remapped_task["outputs"] = list(task.get("outputs") or [])
+        if isinstance(task.get("inputs_from"), dict):
+            remapped_task["inputs_from"] = dict(task.get("inputs_from") or {})
+        for optional_key in (
+            "scene_context",
+            "selection_policy",
+        ):
+            if task.get(optional_key) is not None:
+                remapped_task[optional_key] = str(task.get(optional_key) or "")
         remapped_tasks[new_task_id] = remapped_task
 
     source_first_task_id = first_task_id if first_task_id in task_id_map else None
@@ -442,6 +566,7 @@ __all__ = [
     "normalize_text_for_matching",
     "parse_planned_tasks_from_response",
     "recompute_dependencies_for_all_tasks",
+    "repair_missing_decision_branches",
     "remap_plan_task_ids",
     "slugify_branch_label",
     "target_branch_label",

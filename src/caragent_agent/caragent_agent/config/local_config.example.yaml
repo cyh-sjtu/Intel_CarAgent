@@ -65,6 +65,16 @@ profiles:
     # llm_qwen_enable_thinking_by_role:
     #   executor: false
 
+    # Optional workflow simulation mode for Agent/debug runs on the dev board.
+    # This keeps planner/executor/background logic real, but simulates navigation
+    # arrival after a delay without sending Nav2 goals or cmd_vel.
+    # navigation:
+    #   simulation_mode: true
+    #   simulation_navigation_delay_sec: 30.0
+    #   simulation_navigation_delay_per_meter_sec: 0.0
+    #   simulation_initial_position: [0.0, 0.0, 0.0]
+    #   simulation_initial_yaw_deg: 0.0
+
     # Optional local API keys. Prefer environment variables when possible:
     #   DASHSCOPE_API_KEY
     #   DEEPSEEK_API_KEY

@@ -216,20 +216,37 @@ plane (~0.30 m height). The two modalities complement each other:
 
 `live_scan_monodepth_validation.py` is the primary tool for accuracy
 benchmarking. It subscribes to ROS2 topics (`/stereo/left/image_raw`,
-`/stereo/right/image_raw`, `/scan`) and runs the full pipeline on demand:
+`/stereo/right/image_raw`, `/scan`) and runs one selected localization mode on
+demand:
 
 ```bash
 python3 -m caragent_agent.perception.fusion.live_scan_monodepth_validation \
   --target "door" \
   --truth-distance-m 2.00 \
+  --localization-mode mono_relative_lidar \
   --grounding-device GPU \
   --depth-device GPU \
+  --absolute-depth-device GPU \
   --sam-device GPU \
   --sam-decoder-device CPU
 ```
 
+Three modes are available:
+
+| Mode | CLI value | Main estimate |
+|------|-----------|---------------|
+| Stereo | `stereo` | SGBM depth inside the rectified SAM mask |
+| Mono relative + LiDAR | `mono_relative_lidar` | Relative Depth Anything V2 fitted to projected LiDAR metric anchors |
+| Mono absolute | `mono_absolute` | Depth Anything V2 Metric Indoor Small output directly in meters |
+
+The UI starts in the CLI-selected mode and cycles modes with `m`. Press `r` to
+run the current mode. This keeps repeated tape-measure testing fast: object
+detection and SAM still run for every sample, but the expensive depth backend is
+only the one being evaluated. `--enable-stereo-preview` can be used to run
+stereo as an extra side output while another mode is selected.
+
 On pressing `r`:
-1. Capture synchronized-ish left image, right image, and LaserScan.
+1. Capture the currently required inputs for the selected mode.
 2. Run GroundingDINO → EfficientSAM → Depth Anything V2 → scale fit → stereo SGBM.
 3. Log one row to `validation_results.csv` and `validation_results.jsonl`.
 
@@ -241,6 +258,16 @@ Key CSV columns:
 
 The UI shows four panels: live camera, top-down LiDAR view, last segmentation
 overlay, and metric depth + stereo visualization.
+
+Current implementation note:
+
+- `localization_mode` records which backend produced the main recommendation.
+- `recommended_depth_m`, `recommended_error_m` are always the selected mode's result.
+- `mono_p10_m`, `mono_error_m` are filled by `mono_relative_lidar`.
+- `absolute_p10_m`, `absolute_error_m` are filled by `mono_absolute`.
+- `stereo_p10_m`, `stereo_error_m`, `stereo_status` are filled by `stereo`.
+- `selected_fit`, `fit_mae_m`, `fit_p90_m`, `edge_rejected_samples` are LiDAR
+  scale-fit diagnostics for `mono_relative_lidar`.
 
 ## Object-Level Depth Recommendation
 

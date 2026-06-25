@@ -17,6 +17,9 @@ def generate_launch_description():
     rtbufsize = LaunchConfiguration("rtbufsize")
     calib_file = LaunchConfiguration("calib_file")
     show_image = LaunchConfiguration("show_image")
+    display_max_width = LaunchConfiguration("display_max_width")
+    display_max_height = LaunchConfiguration("display_max_height")
+    display_scale = LaunchConfiguration("display_scale")
     publish_raw = LaunchConfiguration("publish_raw")
     publish_left = LaunchConfiguration("publish_left")
     publish_right = LaunchConfiguration("publish_right")
@@ -41,6 +44,9 @@ def generate_launch_description():
                 "rtbufsize": rtbufsize,
                 "calib_file": calib_file,
                 "show_image": ParameterValue(show_image, value_type=bool),
+                "display_max_width": ParameterValue(display_max_width, value_type=int),
+                "display_max_height": ParameterValue(display_max_height, value_type=int),
+                "display_scale": ParameterValue(display_scale, value_type=float),
                 "publish_raw": ParameterValue(publish_raw, value_type=bool),
                 "publish_left": ParameterValue(publish_left, value_type=bool),
                 "publish_right": ParameterValue(publish_right, value_type=bool),
@@ -69,12 +75,12 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "width",
-                default_value="1280",
+                default_value="3840",
                 description="Side-by-side stereo frame width.",
             ),
             DeclareLaunchArgument(
                 "height",
-                default_value="480",
+                default_value="1200",
                 description="Side-by-side stereo frame height.",
             ),
             DeclareLaunchArgument(
@@ -84,12 +90,12 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "left_width",
-                default_value="640",
+                default_value="1920",
                 description="Left image width in the side-by-side frame.",
             ),
             DeclareLaunchArgument(
                 "right_width",
-                default_value="640",
+                default_value="1920",
                 description="Right image width in the side-by-side frame.",
             ),
             DeclareLaunchArgument(
@@ -106,6 +112,21 @@ def generate_launch_description():
                 "show_image",
                 default_value="true",
                 description="Show OpenCV preview window.",
+            ),
+            DeclareLaunchArgument(
+                "display_max_width",
+                default_value="1600",
+                description="Maximum preview window/image width. 0 disables width limit.",
+            ),
+            DeclareLaunchArgument(
+                "display_max_height",
+                default_value="900",
+                description="Maximum preview window/image height. 0 disables height limit.",
+            ),
+            DeclareLaunchArgument(
+                "display_scale",
+                default_value="0.0",
+                description="Fixed preview scale. 0.0 means auto-fit to display_max_width/height.",
             ),
             DeclareLaunchArgument(
                 "publish_raw",

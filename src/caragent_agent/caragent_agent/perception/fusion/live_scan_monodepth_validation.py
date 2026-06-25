@@ -35,17 +35,30 @@ from caragent_agent.perception.grounding.run_grounding_dino_openvino import draw
 from caragent_agent.perception.sam.efficient_sam_openvino import EfficientSAMOpenVINO
 from caragent_agent.perception.sam.run_efficientsam_openvino import choose_detection, save_overlay
 from caragent_agent.perception.depth.run_depth_anything_openvino import DepthAnythingOpenVINO, save_depth_outputs
+from caragent_agent.perception.fusion.stereo_mono_anchor_fusion import (
+    compute_stereo_mono_guard,
+    stereo_base_depth_summary,
+    write_guard_payload,
+)
 
 
 DEFAULT_WORKSPACE = Path(os.environ.get("CARAGENT_WS", Path.home() / "caragent_ws"))
 DEFAULT_OUTPUT_DIR = DEFAULT_WORKSPACE / "perception_outputs" / "scan_monodepth_validation"
-DEFAULT_CALIB = DEFAULT_WORKSPACE / "calibration" / "stereo_old" / "stereo_calibration.npz"
+DEFAULT_CALIB = DEFAULT_WORKSPACE / "calibration" / "stereo_current" / "stereo_calibration.npz"
 DEFAULT_EXTR = DEFAULT_WORKSPACE / "calibration" / "lidar_camera" / "lidar_camera_extrinsics_calibrated.json"
 DEFAULT_GROUNDING_MODEL_DIR = DEFAULT_WORKSPACE / "models" / "grounding_dino_openvino"
 DEFAULT_GROUNDING_MODEL_ID = DEFAULT_WORKSPACE / "models" / "grounding-dino-tiny"
 DEFAULT_DEPTH_MODEL_DIR = DEFAULT_WORKSPACE / "models" / "depth_anything_v2_openvino"
+DEFAULT_ABSOLUTE_DEPTH_MODEL_DIR = DEFAULT_WORKSPACE / "models" / "depth_anything_v2_metric_indoor_small_openvino"
 DEFAULT_SAM_ENCODER_XML = DEFAULT_WORKSPACE / "models" / "efficient_sam_openvino" / "efficient_sam_vitt_encoder.xml"
 DEFAULT_SAM_DECODER_XML = DEFAULT_WORKSPACE / "models" / "efficient_sam_openvino" / "efficient_sam_vitt_decoder.xml"
+LOCALIZATION_MODE_CHOICES = ("stereo", "stereo_primary_mono_guard", "mono_relative_lidar", "mono_absolute")
+LOCALIZATION_MODE_LABELS = {
+    "stereo": "stereo",
+    "stereo_primary_mono_guard": "stereo primary + mono guard",
+    "mono_relative_lidar": "mono relative + lidar",
+    "mono_absolute": "mono absolute",
+}
 
 
 @dataclass
@@ -337,6 +350,7 @@ def append_csv(path: Path, row: dict[str, Any]) -> None:
         "target_text",
         "label_query",
         "truth_distance_m",
+        "localization_mode",
         "recommended_depth_m",
         "recommended_error_m",
         "mono_recommended_depth_m",
@@ -351,9 +365,29 @@ def append_csv(path: Path, row: dict[str, Any]) -> None:
         "stereo_p10_m",
         "stereo_median_m",
         "stereo_p90_m",
+        "stereo_base_median_m",
+        "stereo_base_range_xy_m",
+        "stereo_recommended_source",
         "stereo_valid_ratio",
         "stereo_valid_pixels",
         "stereo_status",
+        "mono_guard_recommended_depth_m",
+        "mono_guard_error_m",
+        "mono_guard_selected_source",
+        "mono_guard_reason",
+        "mono_guard_fused_median_m",
+        "mono_guard_delta_m",
+        "mono_guard_anchor_count",
+        "mono_guard_fit_rmse_m",
+        "mono_guard_status",
+        "absolute_recommended_depth_m",
+        "absolute_error_m",
+        "absolute_p05_m",
+        "absolute_p10_m",
+        "absolute_median_m",
+        "absolute_p90_m",
+        "absolute_valid_ratio",
+        "absolute_status",
         "selected_fit",
         "fit_mae_m",
         "fit_p90_m",
@@ -384,6 +418,73 @@ def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
+def load_mask_from_segmentation(segmentation_json: Path, image_size: tuple[int, int]) -> tuple[np.ndarray, dict[str, Any]]:
+    seg = json.loads(segmentation_json.read_text(encoding="utf-8"))
+    mask_path = Path(seg["mask_path"]).resolve()
+    mask = np.asarray(PILImage.open(mask_path).convert("L"))
+    width, height = image_size
+    if mask.shape != (height, width):
+        resampling = getattr(PILImage, "Resampling", PILImage)
+        mask = np.asarray(PILImage.fromarray(mask).resize((width, height), resampling.NEAREST))
+    return mask > 0, seg
+
+
+def robust_depth_stats(depth_m: np.ndarray, mask: np.ndarray) -> dict[str, float]:
+    values = depth_m[mask]
+    values = values[np.isfinite(values) & (values > 0)]
+    if len(values) == 0:
+        return {}
+    return {
+        "count": int(len(values)),
+        "min": float(np.min(values)),
+        "p05": float(np.percentile(values, 5)),
+        "p10": float(np.percentile(values, 10)),
+        "p25": float(np.percentile(values, 25)),
+        "median": float(np.median(values)),
+        "p75": float(np.percentile(values, 75)),
+        "p90": float(np.percentile(values, 90)),
+        "p95": float(np.percentile(values, 95)),
+        "max": float(np.max(values)),
+        "mean": float(np.mean(values)),
+    }
+
+
+def metric_object_depth_payload(
+    depth_m: np.ndarray,
+    segmentation_json: Path,
+    image_size: tuple[int, int],
+    model_dir: Path,
+    device: str,
+    elapsed_ms: float,
+    output_dir: Path,
+    sample_id: str,
+) -> dict[str, Any]:
+    mask, seg = load_mask_from_segmentation(segmentation_json, image_size)
+    stats = robust_depth_stats(depth_m.astype(np.float32), mask)
+    depth_values = depth_m[mask]
+    valid_values = depth_values[np.isfinite(depth_values) & (depth_values > 0)]
+    payload = {
+        "backend": "depth_anything_v2_metric_openvino",
+        "mode": "mono_absolute",
+        "model_dir": str(model_dir),
+        "device": device,
+        "elapsed_ms": float(elapsed_ms),
+        "segmentation_json": str(segmentation_json),
+        "source_detection": seg.get("source_detection"),
+        "image_size": [int(image_size[0]), int(image_size[1])],
+        "mask": {
+            "area_px": int(np.count_nonzero(mask)),
+            "valid_depth_pixels": int(len(valid_values)),
+            "valid_ratio": float(len(valid_values) / max(1, np.count_nonzero(mask))),
+        },
+        "object_mask_metric_depth_m": stats,
+    }
+    json_path = output_dir / f"{sample_id}_mono_absolute_object_depth.json"
+    json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    payload["json_path"] = str(json_path)
+    return payload
+
+
 class PipelineRunner:
     def __init__(self, args: argparse.Namespace, status_cb) -> None:
         self.args = args
@@ -393,17 +494,20 @@ class PipelineRunner:
         self.command_logs_dir = self.output_dir / "command_logs"
         self.fit_output_dir = self.output_dir / "scan_monodepth_fit"
         self.stereo_output_dir = self.output_dir / "stereo_object_depth"
+        self.absolute_output_dir = self.output_dir / "mono_absolute_depth"
         self.summary_csv = self.output_dir / "validation_results.csv"
         self.summary_jsonl = self.output_dir / "validation_results.jsonl"
-        for path in [self.samples_dir, self.command_logs_dir, self.fit_output_dir, self.stereo_output_dir]:
+        for path in [self.samples_dir, self.command_logs_dir, self.fit_output_dir, self.stereo_output_dir, self.absolute_output_dir]:
             path.mkdir(parents=True, exist_ok=True)
 
-        self.set_status("Loading GroundingDINO OpenVINO model...")
-        self.grounding_model = GroundingDINOOpenVINO(
-            model_dir=args.grounding_model_dir,
-            model_id=str(args.grounding_model_id),
-            device=args.grounding_device,
-        )
+        self.grounding_model = None
+        if not bool(getattr(args, "skip_grounding_model", False)):
+            self.set_status("Loading GroundingDINO OpenVINO model...")
+            self.grounding_model = GroundingDINOOpenVINO(
+                model_dir=args.grounding_model_dir,
+                model_id=str(args.grounding_model_id),
+                device=args.grounding_device,
+            )
         self.set_status("Loading EfficientSAM OpenVINO model...")
         self.sam_model = EfficientSAMOpenVINO(
             encoder_xml=args.sam_encoder_xml,
@@ -412,27 +516,47 @@ class PipelineRunner:
             encoder_device=args.sam_encoder_device or args.sam_device,
             decoder_device=args.sam_decoder_device or "CPU",
         )
-        self.set_status("Loading Depth Anything OpenVINO model...")
-        self.depth_model = DepthAnythingOpenVINO(
-            model_dir=args.depth_model_dir,
-            device=args.depth_device,
-        )
+        self.depth_model: DepthAnythingOpenVINO | None = None
+        self.absolute_depth_model = None
         self.set_status("All models loaded.")
 
     def set_status(self, text: str) -> None:
         self.status_cb(text)
         print(text, flush=True)
 
+    def get_relative_depth_model(self) -> DepthAnythingOpenVINO:
+        if self.depth_model is None:
+            self.set_status("Loading relative Depth Anything OpenVINO model...")
+            self.depth_model = DepthAnythingOpenVINO(
+                model_dir=self.args.depth_model_dir,
+                device=self.args.depth_device,
+            )
+        return self.depth_model
+
+    def get_absolute_depth_model(self) -> DepthAnythingOpenVINO:
+        if not self.args.absolute_depth_model_dir.exists():
+            raise RuntimeError(f"Metric depth model not available: {self.args.absolute_depth_model_dir}")
+        if self.absolute_depth_model is None:
+            self.set_status("Loading metric Depth Anything OpenVINO model...")
+            self.absolute_depth_model = DepthAnythingOpenVINO(
+                model_dir=self.args.absolute_depth_model_dir,
+                device=self.args.absolute_depth_device,
+            )
+        return self.absolute_depth_model
+
     def run_sample(
         self,
         image_bgr: np.ndarray,
         right_image_bgr: np.ndarray | None,
-        scan_msg: LaserScan,
+        scan_msg: LaserScan | None,
         snapshot_meta: dict[str, float | str],
         target_text: str,
         label_query: str,
         truth_distance_m: float | None,
+        localization_mode: str,
     ) -> dict[str, Any]:
+        if localization_mode not in LOCALIZATION_MODE_CHOICES:
+            raise ValueError(f"Unsupported localization mode: {localization_mode}")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         sample_id = f"live_{timestamp}"
         image_path = self.samples_dir / f"{sample_id}.png"
@@ -441,7 +565,8 @@ class PipelineRunner:
         cv2.imwrite(str(image_path), image_bgr)
         if right_image_bgr is not None:
             cv2.imwrite(str(right_image_path), right_image_bgr)
-        save_scan_npz(scan_msg, scan_path)
+        if scan_msg is not None:
+            save_scan_npz(scan_msg, scan_path)
 
         record: dict[str, Any] = {
             "sample_id": sample_id,
@@ -449,11 +574,12 @@ class PipelineRunner:
             "target_text": target_text,
             "label_query": label_query,
             "truth_distance_m": truth_distance_m,
+            "localization_mode": localization_mode,
             "status": "running",
             "sample_dir": str(self.samples_dir),
             "image": str(image_path),
             "right_image": str(right_image_path) if right_image_bgr is not None else None,
-            "scan": str(scan_path),
+            "scan": str(scan_path) if scan_msg is not None else None,
             "snapshot": snapshot_meta,
         }
 
@@ -467,27 +593,110 @@ class PipelineRunner:
             grounding_payload = json.loads(grounding_json.read_text(encoding="utf-8"))
             self._run_sam(sample_id, grounding_json, label_query or target_text)
             segmentation_json = self._segmentation_json_path(sample_id)
-            self._run_depth(sample_id, image_path)
-            depth_npy = self.output_dir / f"{sample_id}_depth.npy"
-            self._run_fit(sample_id, image_path, scan_path, depth_npy, segmentation_json)
-            fit_json = self.fit_output_dir / f"{sample_id}_scan_monodepth_fit.json"
-            fit_payload = json.loads(fit_json.read_text(encoding="utf-8"))
             seg_payload = json.loads(segmentation_json.read_text(encoding="utf-8"))
+            fit_payload: dict[str, Any] = {}
+            absolute_payload: dict[str, Any] = {}
             stereo_payload = None
             stereo_status = "skipped"
+            absolute_status = "skipped"
             stereo_error_text = None
-            if right_image_bgr is not None and self.args.enable_stereo:
+            mono_guard_payload: dict[str, Any] = {}
+            mono_guard_status = "skipped"
+            mono_guard_json: Path | None = None
+
+            if localization_mode == "mono_relative_lidar":
+                if scan_msg is None:
+                    raise RuntimeError("mono_relative_lidar mode requires LaserScan.")
+                self._run_depth(
+                    sample_id,
+                    image_path,
+                    self.get_relative_depth_model(),
+                    self.args.depth_model_dir,
+                    self.args.depth_device,
+                )
+                depth_npy = self.output_dir / f"{sample_id}_depth.npy"
+                self._run_fit(sample_id, image_path, scan_path, depth_npy, segmentation_json)
+                fit_json = self.fit_output_dir / f"{sample_id}_scan_monodepth_fit.json"
+                fit_payload = json.loads(fit_json.read_text(encoding="utf-8"))
+            elif localization_mode == "mono_absolute":
+                depth, elapsed_ms, metadata = self._run_depth(
+                    sample_id,
+                    image_path,
+                    self.get_absolute_depth_model(),
+                    self.args.absolute_depth_model_dir,
+                    self.args.absolute_depth_device,
+                    output_dir=self.absolute_output_dir,
+                    output_suffix="absolute_depth",
+                )
+                absolute_payload = metric_object_depth_payload(
+                    depth,
+                    segmentation_json,
+                    (int(metadata["image_size"][0]), int(metadata["image_size"][1])),
+                    self.args.absolute_depth_model_dir,
+                    self.args.absolute_depth_device,
+                    elapsed_ms,
+                    self.absolute_output_dir,
+                    sample_id,
+                )
+                absolute_status = "ok"
+            elif localization_mode == "stereo":
+                if right_image_bgr is None:
+                    stereo_status = "missing_right_image"
+                else:
+                    try:
+                        self._run_stereo(sample_id, image_path, right_image_path, segmentation_json)
+                        stereo_json = self._stereo_json_path(sample_id)
+                        stereo_payload = json.loads(stereo_json.read_text(encoding="utf-8"))
+                        stereo_status = "ok"
+                    except Exception as exc:
+                        stereo_status = "failed"
+                        stereo_error_text = str(exc)
+                        print(f"[{sample_id}] stereo failed: {exc}", flush=True)
+            elif localization_mode == "stereo_primary_mono_guard":
+                if right_image_bgr is None:
+                    stereo_status = "missing_right_image"
+                    mono_guard_status = "missing_right_image"
+                else:
+                    try:
+                        self._run_stereo(sample_id, image_path, right_image_path, segmentation_json)
+                        stereo_json = self._stereo_json_path(sample_id)
+                        stereo_payload = json.loads(stereo_json.read_text(encoding="utf-8"))
+                        stereo_status = "ok"
+                        depth, _, _ = self._run_depth(
+                            sample_id,
+                            image_path,
+                            self.get_relative_depth_model(),
+                            self.args.depth_model_dir,
+                            self.args.depth_device,
+                        )
+                        depth_npy = self.output_dir / f"{sample_id}_depth.npy"
+                        mono_guard_payload = compute_stereo_mono_guard(
+                            stereo_payload=stereo_payload,
+                            mono_depth=depth,
+                            mono_depth_source=depth_npy,
+                        )
+                        mono_guard_json = self.output_dir / f"{sample_id}_stereo_mono_guard.json"
+                        write_guard_payload(mono_guard_json, mono_guard_payload)
+                        mono_guard_status = str(mono_guard_payload.get("status") or "unknown")
+                    except Exception as exc:
+                        mono_guard_status = "failed"
+                        stereo_error_text = str(exc)
+                        print(f"[{sample_id}] stereo+mono guard failed: {exc}", flush=True)
+
+            if (
+                localization_mode not in {"stereo", "stereo_primary_mono_guard"}
+                and right_image_bgr is not None
+                and self.args.enable_stereo_preview
+            ):
                 try:
                     self._run_stereo(sample_id, image_path, right_image_path, segmentation_json)
                     stereo_json = self._stereo_json_path(sample_id)
                     stereo_payload = json.loads(stereo_json.read_text(encoding="utf-8"))
-                    stereo_status = "ok"
+                    stereo_status = "preview_ok"
                 except Exception as exc:
-                    stereo_status = "failed"
+                    stereo_status = "preview_failed"
                     stereo_error_text = str(exc)
                     print(f"[{sample_id}] stereo failed: {exc}", flush=True)
-            elif self.args.enable_stereo:
-                stereo_status = "missing_right_image"
 
             stats = fit_payload.get("object_mask_metric_depth_m") or {}
             selected_fit = fit_payload.get("selected_fit") or {}
@@ -499,25 +708,72 @@ class PipelineRunner:
             if mono_recommended is not None and truth_distance_m is not None:
                 mono_error = float(mono_recommended) - float(truth_distance_m)
 
+            absolute_stats = absolute_payload.get("object_mask_metric_depth_m") or {}
+            absolute_mask = absolute_payload.get("mask") or {}
+            absolute_recommended = first_float(absolute_stats, ["p10", "p05", "median"])
+            absolute_error = None
+            if absolute_recommended is not None and truth_distance_m is not None:
+                absolute_error = float(absolute_recommended) - float(truth_distance_m)
+
             stereo_stats = {}
+            stereo_base_stats = {}
             stereo_mask = {}
+            stereo_summary: dict[str, Any] = {}
             if stereo_payload is not None:
-                stereo_stats = (
-                    (stereo_payload.get("object_camera_project") or {})
-                    .get("stats", {})
-                    .get("x_forward_m", {})
-                )
+                stereo_summary = stereo_base_depth_summary(stereo_payload)
+                stereo_stats = stereo_summary.get("camera_x_stats") or {}
+                stereo_base_stats = stereo_summary.get("base_x_stats") or {}
                 stereo_mask = stereo_payload.get("mask") or {}
-            stereo_recommended = first_float(stereo_stats, ["p10", "p05", "median"])
+            stereo_recommended = stereo_summary.get("recommended_depth_m")
+            if stereo_recommended is None:
+                stereo_recommended = first_float(stereo_base_stats, ["median"]) or first_float(stereo_stats, ["median"])
             stereo_error = None
             if stereo_recommended is not None and truth_distance_m is not None:
                 stereo_error = float(stereo_recommended) - float(truth_distance_m)
 
+            mono_guard_recommended = None
+            mono_guard_error = None
+            mono_guard_selected_source = None
+            mono_guard_reason = None
+            mono_guard_fused_median = None
+            mono_guard_delta = None
+            mono_guard_anchor_count = None
+            mono_guard_fit_rmse = None
+            if mono_guard_payload:
+                mono_guard_recommended = mono_guard_payload.get("selected_depth_m")
+                mono_guard_selected_source = mono_guard_payload.get("selected_source")
+                mono_guard_reason = mono_guard_payload.get("reason")
+                mono_guard_delta = mono_guard_payload.get("correction_delta_m")
+                mono_guard_anchor_count = mono_guard_payload.get("anchor_count")
+                mono_guard_fit_rmse = (mono_guard_payload.get("fit") or {}).get("rmse_keep")
+                mono_guard_fused_median = first_float(mono_guard_payload.get("fused_base_x_m") or {}, ["median"])
+                if mono_guard_recommended is None:
+                    mono_guard_recommended = stereo_recommended
+                    mono_guard_selected_source = "stereo_fallback"
+                    mono_guard_reason = mono_guard_payload.get("reason") or mono_guard_status
+            if mono_guard_recommended is not None and truth_distance_m is not None:
+                mono_guard_error = float(mono_guard_recommended) - float(truth_distance_m)
+
+            recommended = None
+            recommended_error = None
+            if localization_mode == "stereo":
+                recommended = stereo_recommended
+                recommended_error = stereo_error
+            elif localization_mode == "stereo_primary_mono_guard":
+                recommended = mono_guard_recommended if mono_guard_recommended is not None else stereo_recommended
+                recommended_error = mono_guard_error if mono_guard_recommended is not None else stereo_error
+            elif localization_mode == "mono_relative_lidar":
+                recommended = mono_recommended
+                recommended_error = mono_error
+            elif localization_mode == "mono_absolute":
+                recommended = absolute_recommended
+                recommended_error = absolute_error
+
             record.update(
                 {
                     "status": "ok",
-                    "recommended_depth_m": mono_recommended,
-                    "recommended_error_m": mono_error,
+                    "recommended_depth_m": recommended,
+                    "recommended_error_m": recommended_error,
                     "mono_recommended_depth_m": mono_recommended,
                     "mono_error_m": mono_error,
                     "mono_p05_m": first_float(stats, ["p05"]),
@@ -530,9 +786,29 @@ class PipelineRunner:
                     "stereo_p10_m": first_float(stereo_stats, ["p10"]),
                     "stereo_median_m": first_float(stereo_stats, ["median"]),
                     "stereo_p90_m": first_float(stereo_stats, ["p90", "p95"]),
+                    "stereo_base_median_m": first_float(stereo_base_stats, ["median"]),
+                    "stereo_base_range_xy_m": stereo_summary.get("base_range_xy_m"),
+                    "stereo_recommended_source": stereo_summary.get("recommended_source"),
                     "stereo_valid_ratio": stereo_mask.get("valid_ratio"),
                     "stereo_valid_pixels": stereo_mask.get("valid_stereo_pixels"),
                     "stereo_status": stereo_status,
+                    "mono_guard_recommended_depth_m": mono_guard_recommended,
+                    "mono_guard_error_m": mono_guard_error,
+                    "mono_guard_selected_source": mono_guard_selected_source,
+                    "mono_guard_reason": mono_guard_reason,
+                    "mono_guard_fused_median_m": mono_guard_fused_median,
+                    "mono_guard_delta_m": mono_guard_delta,
+                    "mono_guard_anchor_count": mono_guard_anchor_count,
+                    "mono_guard_fit_rmse_m": mono_guard_fit_rmse,
+                    "mono_guard_status": mono_guard_status,
+                    "absolute_recommended_depth_m": absolute_recommended,
+                    "absolute_error_m": absolute_error,
+                    "absolute_p05_m": first_float(absolute_stats, ["p05"]),
+                    "absolute_p10_m": first_float(absolute_stats, ["p10"]),
+                    "absolute_median_m": first_float(absolute_stats, ["median"]),
+                    "absolute_p90_m": first_float(absolute_stats, ["p90", "p95"]),
+                    "absolute_valid_ratio": absolute_mask.get("valid_ratio"),
+                    "absolute_status": absolute_status,
                     "selected_fit": selected_fit.get("mode"),
                     "fit_mae_m": selected_fit.get("mae_m"),
                     "fit_p90_m": selected_fit.get("p90_abs_error_m"),
@@ -550,11 +826,18 @@ class PipelineRunner:
                     "grounding_json": str(grounding_json),
                     "grounding_overlay": grounding_payload.get("overlay_path"),
                     "segmentation_json": str(segmentation_json),
-                    "fit_json": str(fit_json),
+                    "fit_json": str(self.fit_output_dir / f"{sample_id}_scan_monodepth_fit.json") if fit_payload else None,
                     "segmentation_overlay": seg_payload.get("overlay_path"),
-                    "metric_depth_color": (fit_payload.get("outputs") or {}).get("metric_depth_color"),
+                    "metric_depth_color": (fit_payload.get("outputs") or {}).get("metric_depth_color")
+                    or (
+                        str(self.output_dir / f"{sample_id}_depth_color.png")
+                        if mono_guard_payload
+                        else None
+                    ),
                     "projection_overlay": (fit_payload.get("outputs") or {}).get("projection"),
                     "fit_plot": (fit_payload.get("outputs") or {}).get("fit_plot"),
+                    "absolute_depth_json": absolute_payload.get("json_path"),
+                    "absolute_depth_color": str(self.absolute_output_dir / f"{sample_id}_absolute_depth_depth_color.png") if absolute_payload else None,
                 }
             )
             if stereo_payload is not None:
@@ -566,6 +849,8 @@ class PipelineRunner:
                         "stereo_disparity": stereo_payload.get("disparity_path"),
                     }
                 )
+            if mono_guard_json is not None:
+                record["mono_guard_json"] = str(mono_guard_json)
             if stereo_error_text is not None:
                 record["stereo_error"] = stereo_error_text
             self.set_status(result_summary(record))
@@ -581,6 +866,8 @@ class PipelineRunner:
 
     def _run_grounding(self, sample_id: str, image_path: Path, prompt: str) -> None:
         self.set_status(f"[{sample_id}] grounding...")
+        if self.grounding_model is None:
+            raise RuntimeError("GroundingDINO model was not loaded for this PipelineRunner.")
         t0 = time.perf_counter()
         payload = self.grounding_model.detect(image_path=image_path, text_prompt=prompt)
         elapsed = time.perf_counter() - t0
@@ -631,14 +918,23 @@ class PipelineRunner:
             return ov_path
         raise FileNotFoundError(f"segmentation json not found for {sample_id}")
 
-    def _run_depth(self, sample_id: str, image_path: Path) -> None:
-        self.set_status(f"[{sample_id}] depth...")
+    def _run_depth(
+        self,
+        sample_id: str,
+        image_path: Path,
+        model: DepthAnythingOpenVINO,
+        model_dir: Path,
+        device: str,
+        output_dir: Path | None = None,
+        output_suffix: str = "depth",
+    ) -> tuple[np.ndarray, float, dict[str, Any]]:
+        self.set_status(f"[{sample_id}] {output_suffix}...")
         image = PILImage.open(image_path).convert("RGB")
-        depth, elapsed_ms = self.depth_model.predict(image)
+        depth, elapsed_ms = model.predict(image)
         metadata = {
             "backend": "openvino",
-            "device": self.args.depth_device,
-            "model_dir": str(self.args.depth_model_dir),
+            "device": device,
+            "model_dir": str(model_dir),
             "image": str(image_path),
             "image_size": [image.width, image.height],
             "depth_shape": list(depth.shape),
@@ -647,14 +943,16 @@ class PipelineRunner:
             "depth_mean": float(np.nanmean(depth)),
             "elapsed_ms": elapsed_ms,
         }
-        save_depth_outputs(depth, metadata, self.output_dir, sample_id)
-        log_path = self.command_logs_dir / f"{sample_id}_depth.log"
+        stem = sample_id if output_suffix == "depth" else f"{sample_id}_{output_suffix}"
+        save_depth_outputs(depth, metadata, output_dir or self.output_dir, stem)
+        log_path = self.command_logs_dir / f"{sample_id}_{output_suffix}.log"
         log_path.write_text(
             f"COMMAND: in-process depth_model.predict()\n"
             f"ELAPSED_MS: {elapsed_ms:.1f}\n"
             f"depth_shape: {depth.shape}\n",
             encoding="utf-8",
         )
+        return depth, elapsed_ms, metadata
 
     def _run_fit(
         self,
@@ -778,26 +1076,34 @@ def first_float(data: dict[str, Any], keys: list[str]) -> float | None:
 
 
 def result_summary(record: dict[str, Any]) -> str:
-    rec = record.get("mono_recommended_depth_m", record.get("recommended_depth_m"))
+    mode = str(record.get("localization_mode") or "")
+    mode_label = LOCALIZATION_MODE_LABELS.get(mode, mode or "mode")
+    rec = record.get("recommended_depth_m")
     truth = record.get("truth_distance_m")
-    err = record.get("mono_error_m", record.get("recommended_error_m"))
+    err = record.get("recommended_error_m")
     fit = record.get("selected_fit")
-    p05 = record.get("mono_p05_m")
-    p10 = record.get("mono_p10_m")
-    med = record.get("mono_median_m")
     stereo = record.get("stereo_recommended_depth_m")
     stereo_status = record.get("stereo_status")
     if rec is None:
-        return f"[{record.get('sample_id')}] ok, but no valid mask depth stats"
-    if truth is None or err is None:
-        return (
-            f"[{record.get('sample_id')}] mono median={fmt_m(med)} stereo={fmt_m(stereo)} "
-            f"stereo_status={stereo_status} fit={fit}"
+        return f"[{record.get('sample_id')}] {mode_label} ok, but no valid mask depth stats"
+    extras = ""
+    if mode == "mono_relative_lidar":
+        extras = f" fit={fit}"
+    elif mode == "stereo":
+        extras = f" stereo_status={stereo_status} source={record.get('stereo_recommended_source')}"
+    elif mode == "stereo_primary_mono_guard":
+        extras = (
+            f" stereo_status={stereo_status}"
+            f" guard={record.get('mono_guard_selected_source') or record.get('mono_guard_status')}"
+            f" reason={record.get('mono_guard_reason')}"
         )
+    elif mode == "mono_absolute":
+        extras = f" valid={record.get('absolute_valid_ratio')}"
+    if truth is None or err is None:
+        return f"[{record.get('sample_id')}] {mode_label} recommended={fmt_m(rec)}{extras}"
     return (
-        f"[{record.get('sample_id')}] mono median={fmt_m(med)} err={err:+.3f}m "
-        f"stereo={fmt_m(stereo)} truth={truth:.3f}m "
-        f"stereo_status={stereo_status} fit={fit}"
+        f"[{record.get('sample_id')}] {mode_label} recommended={fmt_m(rec)} "
+        f"err={err:+.3f}m truth={truth:.3f}m{extras}"
     )
 
 
@@ -838,12 +1144,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grounding-device", default="GPU")
     parser.add_argument("--depth-model-dir", default=DEFAULT_DEPTH_MODEL_DIR, type=Path)
     parser.add_argument("--depth-device", default="GPU")
+    parser.add_argument("--absolute-depth-model-dir", default=DEFAULT_ABSOLUTE_DEPTH_MODEL_DIR, type=Path)
+    parser.add_argument("--absolute-depth-device", default="GPU")
+    parser.add_argument(
+        "--localization-mode",
+        default="mono_relative_lidar",
+        choices=LOCALIZATION_MODE_CHOICES,
+        help="Object depth backend. Press m in the UI to cycle modes.",
+    )
     parser.add_argument("--sam-device", default="GPU", help="OpenVINO SAM device (used when per-stage override is empty).")
     parser.add_argument("--sam-encoder-device", default="", help="Override SAM encoder device (default: --sam-device).")
     parser.add_argument("--sam-decoder-device", default="CPU", help="Override SAM decoder device (default: CPU to avoid NaN on GPU).")
     parser.add_argument("--sam-encoder-xml", default=DEFAULT_SAM_ENCODER_XML, type=Path)
     parser.add_argument("--sam-decoder-xml", default=DEFAULT_SAM_DECODER_XML, type=Path)
-    parser.add_argument("--enable-stereo", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--enable-stereo-preview",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Also run stereo as a preview when the selected mode is not stereo.",
+    )
     parser.add_argument("--stereo-num-disparities", default=96, type=int)
     parser.add_argument("--stereo-block-size", default=5, type=int)
     parser.add_argument("--stereo-min-depth", default=0.15, type=float)
@@ -873,12 +1192,14 @@ def main() -> int:
     if isinstance(args.grounding_model_id, Path):
         args.grounding_model_id = args.grounding_model_id.resolve()
     args.depth_model_dir = args.depth_model_dir.resolve()
+    args.absolute_depth_model_dir = args.absolute_depth_model_dir.resolve()
     args.sam_encoder_xml = args.sam_encoder_xml.resolve()
     args.sam_decoder_xml = args.sam_decoder_xml.resolve()
 
     target_text = args.target.strip()
     label_query = args.label_query.strip()
     truth_distance_m = args.truth_distance_m
+    localization_mode = args.localization_mode
     if not target_text and sys.stdin.isatty():
         target_text = input("Target description, e.g. door/elevator door/pillar: ").strip()
     if not label_query:
@@ -907,7 +1228,7 @@ def main() -> int:
     latest = LatestMessages()
     lock = threading.Lock()
     status_lock = threading.Lock()
-    status_text = "Ready. Press r to run, t target, d distance, l label, q quit."
+    status_text = "Ready. Press r to run, m mode, t target, d distance, l label, q quit."
     last_record: dict[str, Any] | None = None
     worker: threading.Thread | None = None
 
@@ -940,11 +1261,13 @@ def main() -> int:
         if image_bgr is None:
             set_status("No camera image yet.")
             return
-        if scan_msg is None:
+        if localization_mode == "mono_relative_lidar" and scan_msg is None:
             set_status("No LaserScan yet.")
             return
-        ages = [image_age, scan_age]
-        if args.enable_stereo:
+        ages = [image_age]
+        if localization_mode == "mono_relative_lidar":
+            ages.append(scan_age)
+        if localization_mode in {"stereo", "stereo_primary_mono_guard"} or args.enable_stereo_preview:
             ages.append(right_age)
         if max(ages) > args.max_age_sec:
             set_status(f"Stale input: left={image_age:.1f}s right={right_age:.1f}s scan={scan_age:.1f}s")
@@ -960,6 +1283,7 @@ def main() -> int:
                 target_text=target_text,
                 label_query=label_query,
                 truth_distance_m=truth_distance_m,
+                localization_mode=localization_mode,
             )
             last_record = result
 
@@ -998,7 +1322,8 @@ def main() -> int:
                 worker = None
 
             # Window 1: clean camera + scan (minimal status bar)
-            status_bar = f"target={target_text or 'n/a'} | {'RUNNING' if busy else 'idle'} | r=run q=quit"
+            mode_label = LOCALIZATION_MODE_LABELS[localization_mode]
+            status_bar = f"mode={mode_label} | target={target_text or 'n/a'} | {'RUNNING' if busy else 'idle'} | m=mode r=run q=quit"
             camera_panel_img = draw_camera_panel(image, args.panel_width, args.panel_height, [status_bar])
             scan_panel_img = draw_scan_panel(scan, laser_pose, args.panel_width, args.panel_height)
             live_canvas = np.hstack([camera_panel_img, scan_panel_img])
@@ -1007,13 +1332,22 @@ def main() -> int:
             if last_record:
                 rw, rh = 400, 300
                 grid_images: list[np.ndarray] = []
+                mono_depth_panel = last_record.get("metric_depth_color")
+                projection_panel = last_record.get("projection_overlay")
+                fit_panel = last_record.get("fit_plot")
+                absolute_panel = last_record.get("absolute_depth_color")
+                stereo_panel = last_record.get("stereo_overlay") or last_record.get("stereo_depth_color")
+                if last_record.get("localization_mode") == "mono_absolute":
+                    mono_depth_panel = absolute_panel
+                    projection_panel = None
+                    fit_panel = None
                 grid_labels = [
                     ("GroundingDINO", last_record.get("grounding_overlay")),
                     ("SAM segmentation", last_record.get("segmentation_overlay")),
-                    ("Mono depth", last_record.get("metric_depth_color")),
-                    ("Point cloud proj", last_record.get("projection_overlay")),
-                    ("Fit curve", last_record.get("fit_plot")),
-                    ("Stereo depth", last_record.get("stereo_overlay") or last_record.get("stereo_depth_color")),
+                    ("Selected depth", mono_depth_panel),
+                    ("LiDAR projection", projection_panel),
+                    ("Fit curve", fit_panel),
+                    ("Stereo depth", stereo_panel),
                 ]
                 for label, path in grid_labels:
                     panel = safe_read_image(path, rw, rh, [f"No {label.lower()}"])
@@ -1041,6 +1375,13 @@ def main() -> int:
                     set_status("Inference is already running.")
                 else:
                     launch_worker()
+            elif key == ord("m"):
+                if busy:
+                    set_status("Cannot switch mode while inference is running.")
+                else:
+                    idx = LOCALIZATION_MODE_CHOICES.index(localization_mode)
+                    localization_mode = LOCALIZATION_MODE_CHOICES[(idx + 1) % len(LOCALIZATION_MODE_CHOICES)]
+                    set_status(f"localization mode: {LOCALIZATION_MODE_LABELS[localization_mode]}")
             elif key == ord("t") and sys.stdin.isatty():
                 new_target = input("Target description: ").strip()
                 if new_target:

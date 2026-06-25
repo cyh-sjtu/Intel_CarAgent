@@ -26,6 +26,7 @@ from rclpy.node import Node
 WORKSPACE = Path(os.environ.get("CARAGENT_WORKSPACE", "~/caragent_ws")).expanduser()
 MAPS_DIR = WORKSPACE / "maps"
 KEYFRAMES_DIR = WORKSPACE / "keyframes"
+OBJECT_DEPTH_DATASETS_DIR = WORKSPACE / "perception_datasets" / "object_depth"
 MODELS_DIR = WORKSPACE / "models"
 CALIB_DIR = WORKSPACE / "calibration"
 RESULT_ROOTS = [
@@ -38,8 +39,15 @@ RESULT_ROOTS = [
 AGENT_WEB_PORT = int(os.environ.get("CARAGENT_AGENT_WEB_PORT", "8123"))
 CLIP_MODEL = MODELS_DIR / "clip-vit-base-patch32" / "image_encoder.xml"
 DINO_MODEL = MODELS_DIR / "dinov2"
-DEFAULT_STEREO_CALIB = CALIB_DIR / "stereo_old" / "stereo_calibration.npz"
+DEFAULT_STEREO_CALIB = CALIB_DIR / "stereo_current" / "stereo_calibration.npz"
 DEFAULT_EXTRINSICS = CALIB_DIR / "lidar_camera" / "lidar_camera_extrinsics_calibrated.json"
+DEFAULT_CAMERA_RESOLUTION = "3840x1200"
+CAMERA_RESOLUTIONS = {
+    "3840x1200": (3840, 1200, 1920, 1920, 30.0),
+    "3840x1080": (3840, 1080, 1920, 1920, 30.0),
+    "2560x720": (2560, 720, 1280, 1280, 30.0),
+    "1280x480": (1280, 480, 640, 640, 30.0),
+}
 
 
 def _now_hms() -> str:
@@ -60,6 +68,41 @@ def _expand_path(value: str | Path | None, default: Path) -> Path:
 def _safe_name(value: str) -> str:
     value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
     return value.strip("_") or _now_stamp()
+
+
+def _camera_resolution_values(body: dict[str, Any]) -> tuple[int, int, int, int, float]:
+    selected = str(body.get("camera_resolution") or DEFAULT_CAMERA_RESOLUTION).strip()
+    if selected in CAMERA_RESOLUTIONS:
+        return CAMERA_RESOLUTIONS[selected]
+    match = re.fullmatch(r"(\d+)x(\d+)", selected)
+    if match:
+        width = int(match.group(1))
+        height = int(match.group(2))
+        left_width = width // 2
+        return width, height, left_width, width - left_width, 30.0
+    return CAMERA_RESOLUTIONS[DEFAULT_CAMERA_RESOLUTION]
+
+
+def _camera_launch_args(body: dict[str, Any]) -> list[str]:
+    width, height, left_width, right_width, fps = _camera_resolution_values(body)
+    return [
+        f"camera_width:={width}",
+        f"camera_height:={height}",
+        f"camera_left_width:={left_width}",
+        f"camera_right_width:={right_width}",
+        f"camera_fps:={fps:g}",
+    ]
+
+
+def _stereo_camera_launch_args(body: dict[str, Any]) -> list[str]:
+    width, height, left_width, right_width, fps = _camera_resolution_values(body)
+    return [
+        f"width:={width}",
+        f"height:={height}",
+        f"left_width:={left_width}",
+        f"right_width:={right_width}",
+        f"fps:={fps:g}",
+    ]
 
 
 def _scan_ports() -> dict[str, list[str]]:
@@ -143,6 +186,69 @@ def _keyframe_sessions() -> list[dict[str, Any]]:
             }
         )
     return sessions
+
+
+def _object_depth_datasets() -> list[dict[str, Any]]:
+    OBJECT_DEPTH_DATASETS_DIR.mkdir(parents=True, exist_ok=True)
+    datasets = []
+    for dataset in sorted(OBJECT_DEPTH_DATASETS_DIR.glob("*"), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True):
+        if not dataset.is_dir():
+            continue
+        manifest = dataset / "manifest.jsonl"
+        sample_count = 0
+        targets: set[str] = set()
+        if manifest.exists():
+            for line in manifest.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                sample_count += 1
+                try:
+                    data = json.loads(line)
+                    target = str(data.get("target") or "").strip()
+                    if target:
+                        targets.add(target)
+                except Exception:
+                    continue
+        eval_dir = dataset / "evaluations"
+        summaries = []
+        if eval_dir.exists():
+            for path in eval_dir.rglob("summary.csv"):
+                summaries.append(str(path))
+        datasets.append(
+            {
+                "name": dataset.name,
+                "path": str(dataset),
+                "manifest": str(manifest) if manifest.exists() else "",
+                "sample_count": sample_count,
+                "targets": sorted(targets),
+                "summaries": summaries,
+                "mtime": dataset.stat().st_mtime,
+            }
+        )
+    return datasets
+
+
+def _keyframe_images(dataset: str | Path | None) -> list[dict[str, Any]]:
+    dataset_path = _expand_path(dataset, KEYFRAMES_DIR / "")
+    if dataset_path.name != "selected" and (dataset_path / "selected").exists():
+        dataset_path = dataset_path / "selected"
+    left_dir = dataset_path / "left"
+    if not left_dir.exists():
+        return []
+    images = []
+    for path in sorted(
+        list(left_dir.glob("*.png"))
+        + list(left_dir.glob("*.jpg"))
+        + list(left_dir.glob("*.jpeg"))
+    ):
+        images.append(
+            {
+                "name": path.name,
+                "path": str(path),
+                "mtime": path.stat().st_mtime,
+            }
+        )
+    return images
 
 
 def _recent_results(limit: int = 80) -> list[dict[str, Any]]:
@@ -338,6 +444,11 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             return _json_response(self, {"maps": _map_entries()})
         if path == "/api/keyframes":
             return _json_response(self, {"sessions": _keyframe_sessions()})
+        if path == "/api/keyframe_images":
+            dataset = query.get("dataset", [""])[0]
+            return _json_response(self, {"images": _keyframe_images(unquote(dataset))})
+        if path == "/api/object_depth_datasets":
+            return _json_response(self, {"datasets": _object_depth_datasets()})
         if path == "/api/results":
             return _json_response(self, {"results": _recent_results()})
         if path == "/api/logs":
@@ -362,6 +473,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             "/api/keyframes/annotate": self.node.api_annotate_keyframes,
             "/api/keyframes/nodes": self.node.api_keyframe_nodes,
             "/api/live_config": self.node.api_live_config,
+            "/api/object_depth_dataset/config": self.node.api_object_depth_dataset_config,
             "/api/slam/initial_pose": self.node.api_slam_initial_pose,
             "/api/slam/clear_changes": self.node.api_slam_clear_changes,
             "/api/slam/auto_clear": self.node.api_slam_auto_clear,
@@ -522,14 +634,35 @@ class DashboardNode(Node):
         self.add_global_log(f"Live config updated: target={cfg['target']}")
         return {"ok": True, "config": cfg, "path": str(config_path)}
 
+    def api_object_depth_dataset_config(self, body: dict[str, Any]) -> dict[str, Any]:
+        dataset_name = _safe_name(str(body.get("dataset_name") or f"object_depth_{_now_stamp()}"))
+        dataset_dir = OBJECT_DEPTH_DATASETS_DIR / dataset_name
+        dataset_dir.mkdir(parents=True, exist_ok=True)
+        cfg = {
+            "target": str(body.get("target") or "chair").strip(),
+            "label_query": str(body.get("label_query") or body.get("target") or "chair").strip(),
+            "truth_distance_m": body.get("truth_distance_m"),
+            "note": str(body.get("note") or "").strip(),
+        }
+        config_path = dataset_dir / "live_config.json"
+        config_path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+        self.add_global_log(f"Object-depth dataset config updated: {dataset_name} target={cfg['target']}")
+        return {"ok": True, "dataset_dir": str(dataset_dir), "path": str(config_path), "config": cfg}
+
     def api_process_start(self, body: dict[str, Any]) -> dict[str, Any]:
         kind = str(body.get("kind") or "").strip()
         if kind == "slam":
             self._slam_map_base = str(body.get("map_base") or "")
+        if kind == "object_approach_live" and kind in self._processes and self._processes[kind].is_running():
+            self._stop_process(kind)
+            self.add_global_log("Restarted object_approach_live with current UI parameters.")
         # Auto-start sensor dependencies for tools that need them
         deps_map = {
             "object_pipeline": ["lidar_test", "camera_test"],
+            "object_approach_live": ["camera_test", "navigation"],
+            "object_depth_collect": ["lidar_test", "camera_test"],
             "lidar_camera_collect": ["lidar_test", "camera_test"],
+            "lidar_camera_calib_run": ["lidar_test", "camera_test"],
             "agent": ["camera_test"],
         }
         # Agent also needs navigation stack when map_base is set
@@ -551,6 +684,7 @@ class DashboardNode(Node):
         # Stop auto-started dependencies as well
         stop_deps = {
             "object_pipeline": ["lidar_test", "camera_test"],
+            "object_depth_collect": ["lidar_test", "camera_test"],
             "lidar_camera_collect": ["lidar_test", "camera_test"],
         }
         result = self._stop_process(kind)
@@ -579,17 +713,30 @@ class DashboardNode(Node):
                 "mode:=slam", f"laser_port:={laser}", f"stm32_port:={stm32}",
                 f"camera_device:={camera}", "enable_camera:=false", "use_rviz:=true",
             ]
+            args.extend(_camera_launch_args(body))
             if map_base:
                 args.append(f"map_file_name:={map_base}")
             return _shell_join(args)
         if kind == "navigation":
             map_base = str(body.get("map_base") or (self.get_status().get("latest_map") or {}).get("base_path") or "")
             enable_cmd = "true" if bool(body.get("enable_cmd_vel")) else "false"
+            enable_left_only = "true" if bool(body.get("enable_left_only_goal_proxy")) else "false"
+            max_linear = str(body.get("max_linear_mps") or "0.40").strip() or "0.40"
+            max_angular = "1.25" if bool(body.get("enable_left_only_goal_proxy")) else "1.00"
+            pre_align_strategy = str(body.get("pre_align_strategy") or "direct_bearing").strip()
+            if pre_align_strategy not in {"direct_bearing", "path_heading"}:
+                pre_align_strategy = "direct_bearing"
+            path_heading_lookahead = str(body.get("path_heading_lookahead_m") or "0.70").strip() or "0.70"
             args = [
                 "ros2", "launch", "caragent_bringup", "caragent_full.launch.py",
                 "mode:=navigation", f"laser_port:={laser}", f"stm32_port:={stm32}",
-                f"map_file_name:={map_base}", "use_rviz:=true", f"enable_cmd_vel:={enable_cmd}",
+                f"camera_device:={camera}", f"map_file_name:={map_base}", "use_rviz:=true", f"enable_cmd_vel:={enable_cmd}",
+                f"enable_left_only_goal_proxy:={enable_left_only}", f"max_linear_mps:={max_linear}", f"max_angular_radps:={max_angular}",
             ]
+            if bool(body.get("enable_left_only_goal_proxy")):
+                args.append(f"pre_align_strategy:={pre_align_strategy}")
+                args.append(f"path_heading_lookahead_m:={path_heading_lookahead}")
+            args.extend(_camera_launch_args(body))
             yaml_path = str(body.get("map_yaml") or "")
             if yaml_path:
                 args.append(f"map_yaml_file:={yaml_path}")
@@ -597,12 +744,14 @@ class DashboardNode(Node):
         if kind == "keyframe_record":
             session = _safe_name(str(body.get("session_name") or f"session_{_now_stamp()}"))
             map_base = str(body.get("map_base") or (self.get_status().get("latest_map") or {}).get("base_path") or "")
-            return _shell_join([
+            args = [
                 "ros2", "launch", "caragent_memory", "caragent_keyframe_collect.launch.py",
                 f"session_name:={session}", f"laser_port:={laser}", f"stm32_port:={stm32}",
                 f"camera_device:={camera}", f"map_file_name:={map_base}", "use_rviz:=true",
                 "camera_show_image:=true",
-            ])
+            ]
+            args.extend(_camera_launch_args(body))
+            return _shell_join(args)
         if kind == "agent":
             config_file = str(body.get("config_file") or WORKSPACE / "src" / "caragent_agent" / "config" / "config.yaml")
             dataset_dir = str(body.get("dataset_dir") or "")
@@ -628,26 +777,182 @@ class DashboardNode(Node):
                 "ros2", "launch", "caragent_vision", "huibo_stereo_camera.launch.py",
                 f"device:={camera}", "show_image:=true", "publish_raw:=true", "publish_left:=true", "publish_right:=true",
                 f"calib_file:={body.get('calib_file') or DEFAULT_STEREO_CALIB}",
+                *_stereo_camera_launch_args(body),
             ])
         if kind == "object_pipeline":
             target = str(body.get("target") or "chair")
             label = str(body.get("label_query") or target)
             truth = str(body.get("truth_distance_m") or "")
+            localization_mode = str(body.get("localization_mode") or "stereo").strip()
+            if localization_mode not in {"stereo", "stereo_primary_mono_guard", "mono_relative_lidar", "mono_absolute"}:
+                localization_mode = "stereo"
             output_dir = str(body.get("output_dir") or WORKSPACE / "perception_outputs" / "scan_monodepth_validation")
             args = [
                 "python3", "-m", "caragent_agent.perception.fusion.live_scan_monodepth_validation",
                 "--target", target, "--label-query", label, "--output-dir", output_dir,
+                "--localization-mode", localization_mode,
                 "--depth-device", "GPU", "--sam-device", "GPU",
             ]
             if truth:
                 args.extend(["--truth-distance-m", truth])
             return _shell_join(args)
+        if kind == "object_approach_live":
+            target = str(body.get("target") or "chair").strip() or "chair"
+            depth_backend = str(body.get("depth_backend") or "stereo_primary_mono_guard").strip()
+            if depth_backend not in {"auto", "stereo", "stereo_primary_mono_guard", "mono_relative_lidar"}:
+                depth_backend = "stereo_primary_mono_guard"
+            stop_distance = str(body.get("stop_distance_m") or "0.80").strip() or "0.80"
+            output_root = str(body.get("output_root") or WORKSPACE / "perception_outputs" / "object_approach_live")
+            left_topic = str(body.get("left_topic") or "/stereo/left/image_raw")
+            right_topic = str(body.get("right_topic") or "/stereo/right/image_raw")
+            scan_topic = str(body.get("scan_topic") or "/scan")
+            map_topic = str(body.get("map_topic") or "/global_costmap/costmap")
+            goal_topic = str(body.get("goal_topic") or "/caragent/object_approach_goal")
+            map_frame = str(body.get("map_frame") or "map")
+            base_frame = str(body.get("base_frame") or "base_link")
+            timeout_sec = str(body.get("timeout_sec") or "20.0").strip() or "20.0"
+            args = [
+                "ros2", "run", "caragent_agent", "object_approach_live_test",
+                "--target", target,
+                "--depth-backend", depth_backend,
+                "--stop-distance", stop_distance,
+                "--output-root", output_root,
+                "--left-topic", left_topic,
+                "--right-topic", right_topic,
+                "--scan-topic", scan_topic,
+                "--map-topic", map_topic,
+                "--goal-topic", goal_topic,
+                "--map-frame", map_frame,
+                "--base-frame", base_frame,
+                "--timeout-sec", timeout_sec,
+            ]
+            for field, flag in [
+                ("grounding_query", "--grounding-query"),
+                ("vlm_query", "--vlm-query"),
+                ("sam_query", "--sam-query"),
+            ]:
+                value = str(body.get(field) or "").strip()
+                if value:
+                    args.extend([flag, value])
+            return _shell_join(args)
+        if kind == "object_depth_collect":
+            dataset_name = _safe_name(str(body.get("dataset_name") or f"object_depth_{_now_stamp()}"))
+            target = str(body.get("target") or "chair")
+            label = str(body.get("label_query") or target)
+            truth = str(body.get("truth_distance_m") or "")
+            note = str(body.get("note") or "")
+            args = [
+                "python3", "-m", "caragent_agent.perception.fusion.collect_object_depth_dataset",
+                "--dataset-root", str(OBJECT_DEPTH_DATASETS_DIR),
+                "--dataset-name", dataset_name,
+                "--target", target,
+                "--label-query", label,
+                "--note", note,
+                "--grounding-device", "GPU",
+                "--sam-device", "GPU",
+                "--sam-decoder-device", "CPU",
+            ]
+            if truth:
+                args.extend(["--truth-distance-m", truth])
+            return _shell_join(args)
+        if kind == "object_depth_eval":
+            dataset_name = _safe_name(str(body.get("dataset_name") or ""))
+            dataset_dir = str(body.get("dataset_dir") or (OBJECT_DEPTH_DATASETS_DIR / dataset_name))
+            run_name = _safe_name(str(body.get("run_name") or "baseline"))
+            modes = str(body.get("modes") or "stereo,mono_relative_lidar")
+            args = [
+                "python3", "-m", "caragent_agent.perception.fusion.evaluate_object_depth_dataset",
+                "--dataset-dir", dataset_dir,
+                "--run-name", run_name,
+                "--modes", modes,
+                "--grounding-device", "GPU",
+                "--depth-device", "GPU",
+                "--absolute-depth-device", "GPU",
+                "--learned-stereo-device", "GPU",
+                "--sam-device", "GPU",
+                "--sam-decoder-device", "CPU",
+            ]
+            if bool(body.get("force")):
+                args.append("--force")
+            return _shell_join(args)
+        if kind == "vlm_box_select":
+            image = str(body.get("image") or "")
+            query = str(body.get("query") or "").strip()
+            grounding_query = str(body.get("grounding_query") or query).strip()
+            if not image:
+                raise ValueError("image is required for vlm_box_select")
+            if not query:
+                raise ValueError("query is required for vlm_box_select")
+            output_dir = str(body.get("output_dir") or WORKSPACE / "perception_outputs" / "vlm_box_select")
+            box_threshold = str(body.get("box_threshold") or "0.25")
+            text_threshold = str(body.get("text_threshold") or "0.20")
+            max_candidates = str(body.get("max_candidates") or "8")
+            vlm_model = str(body.get("vlm_model") or "qwen3-vl-plus")
+            grounding_device = str(body.get("grounding_device") or "GPU")
+            return _shell_join([
+                "python3", "-m", "caragent_agent.perception.grounding.vlm_select_box",
+                "--image", image,
+                "--query", query,
+                "--grounding-query", grounding_query,
+                "--output-dir", output_dir,
+                "--grounding-device", grounding_device,
+                "--box-threshold", box_threshold,
+                "--text-threshold", text_threshold,
+                "--max-candidates", max_candidates,
+                "--vlm-model", vlm_model,
+            ])
         if kind == "stereo_calib_capture":
             out = str(body.get("output_dir") or CALIB_DIR / "stereo_new" / f"capture_{_now_stamp()}")
-            return _shell_join(["ros2", "run", "caragent_vision", "capture_stereo_calibration", "--device", camera, "--output-dir", out])
+            width, height, left_width, right_width, fps = _camera_resolution_values(body)
+            args = [
+                "ros2", "run", "caragent_vision", "capture_stereo_calibration",
+                "--device", camera,
+                "--output-dir", out,
+                "--width", str(width),
+                "--height", str(height),
+                "--left-width", str(left_width),
+                "--right-width", str(right_width),
+                "--fps", f"{fps:g}",
+            ]
+            cols = str(body.get("cols") or "").strip()
+            rows = str(body.get("rows") or "").strip()
+            if cols and rows:
+                args.extend(["--cols", cols, "--rows", rows, "--require-corners"])
+            return _shell_join(args)
+        if kind == "stereo_calib_run":
+            image_dir = str(body.get("image_dir") or "")
+            if not image_dir:
+                raise ValueError("image_dir is required for stereo_calib_run")
+            output = str(body.get("output") or Path(image_dir) / "stereo_calibration.npz")
+            cols = str(body.get("cols") or "").strip()
+            rows = str(body.get("rows") or "").strip()
+            square_size = str(body.get("square_size_m") or "").strip()
+            if not cols or not rows or not square_size:
+                raise ValueError("cols, rows, and square_size_m are required for stereo_calib_run")
+            return _shell_join([
+                "ros2", "run", "caragent_vision", "calibrate_stereo_camera",
+                "--image-dir", image_dir,
+                "--output", output,
+                "--cols", cols,
+                "--rows", rows,
+                "--square-size", square_size,
+                "--save-overlays",
+            ])
         if kind == "lidar_camera_collect":
             out = str(body.get("output_jsonl") or CALIB_DIR / "lidar_camera" / f"correspondences_{_now_stamp()}.jsonl")
             return _shell_join(["ros2", "run", "caragent_vision", "live_lidar_camera_correspondences", "--ros-args", "-p", f"output_jsonl:={out}"])
+        if kind == "lidar_camera_calib_run":
+            samples_jsonl = str(body.get("samples_jsonl") or "").strip()
+            if not samples_jsonl:
+                raise ValueError("samples_jsonl is required for lidar_camera_calib_run")
+            output_json = str(body.get("output_json") or DEFAULT_EXTRINSICS)
+            calib_file = str(body.get("calib_file") or DEFAULT_STEREO_CALIB)
+            return _shell_join([
+                "ros2", "run", "caragent_vision", "calibrate_lidar_camera_extrinsics",
+                "--samples-jsonl", samples_jsonl,
+                "--calib-file", calib_file,
+                "--output-json", output_json,
+            ])
         raise ValueError(f"Unsupported process kind: {kind}")
 
     def api_slam_initial_pose(self, body: dict[str, Any]) -> dict[str, Any]:

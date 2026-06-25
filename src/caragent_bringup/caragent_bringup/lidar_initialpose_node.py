@@ -87,9 +87,19 @@ class PoseScore:
     unknown_ratio_sum: float
 
 
+@dataclass(frozen=True)
+class ConfidenceGateResult:
+    ok: bool
+    reasons: tuple[str, ...]
+
+
 def _normalize_angle(angle_rad: float) -> float:
     """Normalize an angle to [-pi, pi)."""
     return (angle_rad + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def _angle_distance(a_rad: float, b_rad: float) -> float:
+    return abs(_normalize_angle(a_rad - b_rad))
 
 
 def _yaw_to_quat(yaw_rad: float) -> Quaternion:
@@ -537,11 +547,22 @@ class LidarInitialposeNode(Node):
         self.declare_parameter("max_range_clear_reward", 0.05)
         self.declare_parameter("min_score", 0.25)
 
+        # Publication confidence gates.  min_score still filters unusable
+        # candidates, while these gates decide whether a best candidate is
+        # trustworthy enough to inject into the localization backend.
+        self.declare_parameter("enable_confidence_gate", True)
+        self.declare_parameter("min_publish_score", 0.55)
+        self.declare_parameter("min_hit_ratio", 0.62)
+        self.declare_parameter("max_miss_ratio", 0.25)
+        self.declare_parameter("max_blocked_ratio", 0.15)
+
         # Ambiguity / confidence checks.
         self.declare_parameter("check_score_margin", True)
         self.declare_parameter("reject_ambiguous_pose", False)
         self.declare_parameter("min_score_margin", 0.06)
         self.declare_parameter("min_score_ratio", 1.12)
+        self.declare_parameter("distinct_peak_xy_m", 0.75)
+        self.declare_parameter("distinct_peak_yaw_deg", 20.0)
         self.declare_parameter("ambiguous_cov_xy", 0.80)
         self.declare_parameter("ambiguous_cov_yaw", 0.60)
 
@@ -1163,6 +1184,8 @@ class LidarInitialposeNode(Node):
         elapsed = time.monotonic() - t0
         best = top_scores[0]
         second = top_scores[1] if len(top_scores) > 1 else None
+        distinct_second = self._find_distinct_second_peak(top_scores, best)
+        self._log_top_candidates(top_scores)
 
         self.get_logger().info(
             f"[ParticleFilter] Done in {elapsed:.2f}s. "
@@ -1187,6 +1210,20 @@ class LidarInitialposeNode(Node):
                 f"margin={margin:.3f}, ratio={ratio:.2f}"
             )
 
+        if distinct_second is not None and distinct_second is not second:
+            distinct_margin = best.score - distinct_second.score
+            distinct_ratio = (
+                best.score / max(distinct_second.score, 1e-6)
+                if distinct_second.score > 0.0
+                else float("inf")
+            )
+            self.get_logger().info(
+                f"[ParticleFilter] Distinct second peak={distinct_second.score:.3f} "
+                f"at ({distinct_second.x:.3f},{distinct_second.y:.3f},"
+                f"{math.degrees(distinct_second.yaw):.1f}deg), "
+                f"margin={distinct_margin:.3f}, ratio={distinct_ratio:.2f}"
+            )
+
         min_score = (
             self.get_parameter("min_score")
             .get_parameter_value()
@@ -1200,7 +1237,15 @@ class LidarInitialposeNode(Node):
             )
             return None
 
-        self._check_ambiguity(best, second)
+        gate = self._check_publish_confidence(best)
+        if not gate.ok:
+            self.get_logger().warn(
+                "[ParticleFilter] Best pose rejected by confidence gate: "
+                + "; ".join(gate.reasons)
+            )
+            return None
+
+        self._check_ambiguity(best, distinct_second)
 
         if self._last_pose_ambiguous:
             reject_ambiguous = (
@@ -1215,6 +1260,119 @@ class LidarInitialposeNode(Node):
                 return None
 
         return best
+
+    def _log_top_candidates(self, top_scores: list[PoseScore]) -> None:
+        """Log a compact snapshot of the strongest candidates."""
+
+        parts: list[str] = []
+        for index, item in enumerate(top_scores[:5], start=1):
+            hit_ratio = item.hits / max(1, item.valid_beams)
+            miss_ratio = item.misses / max(1, item.valid_beams)
+            parts.append(
+                "#{idx} score={score:.3f} pose=({x:.2f},{y:.2f},{yaw:.1f}) "
+                "hit={hit:.2f} miss={miss:.2f} block={blocked}".format(
+                    idx=index,
+                    score=item.score,
+                    x=item.x,
+                    y=item.y,
+                    yaw=math.degrees(item.yaw),
+                    hit=hit_ratio,
+                    miss=miss_ratio,
+                    blocked=item.blocked,
+                )
+            )
+        if parts:
+            self.get_logger().info("[ParticleFilter] Top candidates: " + " | ".join(parts))
+
+    def _find_distinct_second_peak(
+        self,
+        top_scores: list[PoseScore],
+        best: PoseScore,
+    ) -> Optional[PoseScore]:
+        """Return the first candidate that is not just the best pose's local cluster."""
+
+        xy_threshold = max(
+            0.0,
+            self.get_parameter("distinct_peak_xy_m")
+            .get_parameter_value()
+            .double_value,
+        )
+        yaw_threshold = math.radians(
+            max(
+                0.0,
+                self.get_parameter("distinct_peak_yaw_deg")
+                .get_parameter_value()
+                .double_value,
+            )
+        )
+
+        for item in top_scores[1:]:
+            distance = math.hypot(item.x - best.x, item.y - best.y)
+            yaw_distance = _angle_distance(item.yaw, best.yaw)
+            if distance >= xy_threshold or yaw_distance >= yaw_threshold:
+                return item
+
+        return None
+
+    def _check_publish_confidence(self, best: PoseScore) -> ConfidenceGateResult:
+        """Decide whether a candidate is good enough to publish to /initialpose."""
+
+        enabled = (
+            self.get_parameter("enable_confidence_gate")
+            .get_parameter_value()
+            .bool_value
+        )
+        if not enabled:
+            return ConfidenceGateResult(True, ())
+
+        reasons: list[str] = []
+        valid = max(1, best.valid_beams)
+        hit_ratio = best.hits / valid
+        miss_ratio = best.misses / valid
+        blocked_ratio = best.blocked / valid
+
+        min_publish_score = (
+            self.get_parameter("min_publish_score")
+            .get_parameter_value()
+            .double_value
+        )
+        min_hit_ratio = (
+            self.get_parameter("min_hit_ratio")
+            .get_parameter_value()
+            .double_value
+        )
+        max_miss_ratio = (
+            self.get_parameter("max_miss_ratio")
+            .get_parameter_value()
+            .double_value
+        )
+        max_blocked_ratio = (
+            self.get_parameter("max_blocked_ratio")
+            .get_parameter_value()
+            .double_value
+        )
+
+        if best.score < min_publish_score:
+            reasons.append(
+                f"score {best.score:.3f} < min_publish_score {min_publish_score:.3f}"
+            )
+        if hit_ratio < min_hit_ratio:
+            reasons.append(
+                f"hit_ratio {hit_ratio:.3f} < min_hit_ratio {min_hit_ratio:.3f}"
+            )
+        if miss_ratio > max_miss_ratio:
+            reasons.append(
+                f"miss_ratio {miss_ratio:.3f} > max_miss_ratio {max_miss_ratio:.3f}"
+            )
+        if blocked_ratio > max_blocked_ratio:
+            reasons.append(
+                f"blocked_ratio {blocked_ratio:.3f} > max_blocked_ratio {max_blocked_ratio:.3f}"
+            )
+
+        if reasons:
+            return ConfidenceGateResult(False, tuple(reasons))
+
+        return ConfidenceGateResult(True, ())
 
     def _check_ambiguity(
         self,

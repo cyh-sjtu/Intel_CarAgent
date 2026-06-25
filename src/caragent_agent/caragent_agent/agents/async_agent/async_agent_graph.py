@@ -20,7 +20,6 @@ from caragent_agent.agents.async_agent.async_agent_node import (
     create_orchestrate_node,
     create_plan_node,
     create_route_after_orchestrate,
-    route_after_execute,
     create_bg_router
 )
 from caragent_agent.agents.async_agent.runtime.control import build_runtime_control
@@ -185,13 +184,9 @@ def create_async_agent(
             },
         )
 
-    workflow.add_conditional_edges(
-        "execute",
-        route_after_execute,
-        {
-            "orchestrate": "orchestrate",
-        },
-    )
+    workflow.add_edge("execute", "orchestrate")
+    for node_name, _ in background_nodes:
+        workflow.add_edge("execute", node_name)
 
     return workflow.compile(
         checkpointer=checkpointer,

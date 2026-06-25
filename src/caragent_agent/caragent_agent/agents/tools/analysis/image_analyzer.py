@@ -13,8 +13,15 @@ class ImageAnalyzerTool(ToolBase):
         super().__init__(
             name="analyse_on_each_kf_images", 
             description="""
-                Analyzes keyframe images using vision-language models to answer questions.
-                
+                Analyzes selected keyframe images using vision-language models to answer questions.
+                 
+                This is supplemental visual evidence, not the default next step
+                after keyframe search. Prefer keyframe semantics, positions, and
+                compact candidate evidence first. Use this tool only when those
+                metadata fields cannot distinguish a small set of plausible
+                candidates, or when the active task explicitly requires visual
+                inspection of stored keyframe images.
+
                 Processes multiple keyframe images in parallel through batch requests to a VLM 
                 (Vision-Language Model) endpoint. Returns structured answers for each analyzed frame.
 
@@ -203,6 +210,13 @@ class CurrentImageAnalyzerTool(ToolBase):
                     },
                     provenance={"source_type": "controller"},
                 )
+            image_metadata = {}
+            try:
+                get_metadata = getattr(self.controller, "get_current_image_metadata", None)
+                if callable(get_metadata):
+                    image_metadata = get_metadata() or {}
+            except Exception:
+                image_metadata = {}
 
             request_metadata = {}
             request_metadata["request_id"] = 0
@@ -217,12 +231,17 @@ class CurrentImageAnalyzerTool(ToolBase):
             for req_id, response in results.items():
 
                 return self.ok(
-                    "Analyzed the current live image.",
+                    (
+                        "Analyzed the current image."
+                        if image_metadata.get("source_type") != "simulated_keyframe_view"
+                        else "Analyzed a simulated current image from historical keyframe memory."
+                    ),
                     data={
                         "question": question,
                         "answer": extract_answer_tags(response[req_id]),
+                        "image_source": image_metadata,
                     },
-                    provenance={"source_type": "live_view"},
+                    provenance=image_metadata or {"source_type": "live_view"},
                 )
         except Exception as e:
             print("question", question)

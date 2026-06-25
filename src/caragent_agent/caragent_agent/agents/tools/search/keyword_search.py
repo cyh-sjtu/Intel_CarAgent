@@ -14,7 +14,7 @@ from caragent_agent.agents.async_agent.runtime.resource_scheduler import (
 )
 
 NODES_NUMBER_IN_A_REQUEST = int(config.get("nodes_number_in_a_request", 8))
-CLIP_FILTER_TOP_K = 20
+CLIP_FILTER_TOP_K = int(config.get("keyframe_search_clip_top_k", 16))
 SEARCH_TOOL_TIMEOUT_SEC = float(config.get("search_tool_timeout_sec", 45))
 LEXICAL_FALLBACK_TOP_K = int(config.get("search_lexical_fallback_top_k", 12))
 

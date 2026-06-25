@@ -78,6 +78,22 @@ Selection output is written to `<dataset>/selected`, including
 `selected_manifest.jsonl`, `rejected_manifest.jsonl`, `review.html`,
 `embeddings/`, and `constructed_memory/keyframe_nodes/`.
 
+## Semantic Chunk Index Postprocess
+
+After keyframe semantic annotation is complete, precompute the semantic chunk
+index used by the Agent keyframe search tool:
+
+```bash
+ros2 run caragent_agent build_keyframe_chunk_index \
+  --dataset ~/caragent_ws/keyframes/lab_001/selected \
+  --force
+```
+
+This writes `constructed_memory/semantic_chunk_index_records.json` and
+`constructed_memory/semantic_chunk_index_matrix.npy`. Runtime keyframe search
+loads these files directly, avoiding first-query chunk-index construction during
+live robot interaction.
+
 ## v1 Rules
 
 - Online candidates: first frame, then `>=1.5s` and either `>=0.65m` movement or

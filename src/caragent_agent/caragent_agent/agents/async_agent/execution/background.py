@@ -13,6 +13,9 @@ from caragent_agent.agents.async_agent.execution.context import (
     truncate_context_text,
 )
 from caragent_agent.agents.async_agent.execution.support import stringify_tool_content
+from caragent_agent.agents.async_agent.execution.tool_call_budget import (
+    execute_tool_budget_context,
+)
 
 from caragent_agent.agents.async_agent.runtime.control import (
     get_background_claim_lock,
@@ -29,12 +32,19 @@ from caragent_agent.agents.async_agent.runtime.types import (
     NavigationGroundingStage,
     TaskItem,
 )
+from caragent_agent.agents.async_agent.runtime.legacy_task_metadata import (
+    has_legacy_grounding_metadata,
+    legacy_object_kind,
+    legacy_staging_kind,
+    legacy_upstream_task_id,
+)
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.tools import BaseTool
 from langgraph.graph import END
 from caragent_agent.agents.async_agent.execution.tool_results import (
     dedupe_ints as _dedupe_ints,
+    extract_structured_tool_result as _extract_structured_tool_result,
     extract_keyframe_ids_from_payload as _extract_keyframe_ids_from_payload,
     merge_candidate_keyframes as _merge_candidate_keyframes,
     parse_json_like_payload as _parse_json_like_payload,
@@ -288,6 +298,11 @@ def select_background_target_task(
     eligible_task_ids: list[int] = []
     for t_id in path_task_ids:
         task = tasks[t_id]
+        if (
+            _task_is_semantic_object_grounding(task)
+            and _find_staging_keyframe_for_object_task(task, tasks) is None
+        ):
+            continue
         task_plan_id = task.get("plan_id")
         processing_key = task_processing_key(t_id, task_plan_id)
         if (
@@ -424,6 +439,48 @@ def _looks_like_raw_tool_call_text(text: Any) -> bool:
     )
 
 
+def _json_from_text(text: Any) -> dict[str, Any] | None:
+    clean = str(text or "").strip()
+    if not clean:
+        return None
+    fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", clean, re.DOTALL | re.IGNORECASE)
+    candidates = [fenced.group(1).strip()] if fenced else []
+    candidates.append(clean)
+    for candidate in candidates:
+        start_index = candidate.find("{")
+        while start_index >= 0:
+            depth = 0
+            in_string = False
+            escape = False
+            for index in range(start_index, len(candidate)):
+                char = candidate[index]
+                if escape:
+                    escape = False
+                    continue
+                if char == "\\":
+                    escape = True
+                    continue
+                if char == '"':
+                    in_string = not in_string
+                    continue
+                if in_string:
+                    continue
+                if char == "{":
+                    depth += 1
+                elif char == "}":
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            parsed = json.loads(candidate[start_index : index + 1])
+                        except Exception:
+                            break
+                        if isinstance(parsed, dict):
+                            return parsed
+                        break
+            start_index = candidate.find("{", start_index + 1)
+    return None
+
+
 def _append_background_note(
     existing_items: Sequence[str],
     candidate_text: Any,
@@ -522,7 +579,39 @@ def _extract_recommended_keyframe_from_text(
 
     normalized_text = re.sub(r"[*_`]", "", compact_text)
     normalized_text = normalized_text.replace("\u2013", "-").replace("\u2014", "-")
+
+    parsed = _json_from_text(normalized_text)
+    if isinstance(parsed, dict):
+        destination = parsed.get("destination")
+        if isinstance(destination, dict) and destination.get("type") == "keyframe":
+            try:
+                keyframe_id = int(destination.get("keyframe_id"))
+                reason = truncate_context_text(
+                    parsed.get("recommendation_reason")
+                    or parsed.get("reason")
+                    or "Structured background destination JSON.",
+                    limit=180,
+                )
+                return keyframe_id, reason, 0.96
+            except Exception:
+                pass
+        for key in ("recommended_keyframe_id", "keyframe_id"):
+            if parsed.get(key) is None:
+                continue
+            try:
+                keyframe_id = int(parsed.get(key))
+                reason = truncate_context_text(
+                    parsed.get("recommendation_reason")
+                    or parsed.get("reason")
+                    or f"Structured background recommendation field `{key}`.",
+                    limit=180,
+                )
+                return keyframe_id, reason, 0.94
+            except Exception:
+                continue
+
     recommendation_patterns = (
+        r"(?:recommended\s+keyframe|recommended\s+destination|recommendation)\s*[:#-]?\s*(?:\s|\n|.){0,120}?(?:KF|keyframe)\s*#?\s*(\d+)",
         r"(?:best|strongest|top|primary|clearest|clear winner|most definitive|recommended|recommendation)[^\n.]{0,140}?(?:candidate)?[^\n.]{0,80}?(?:KF|keyframe)\s*#?\s*(\d+)",
         r"(?:KF|keyframe)\s*#?\s*(\d+)[^\n.]{0,160}?(?:best candidate|strongest candidate|top candidate|primary candidate|best|strongest|top|primary|recommended|most direct|direct match|exact match|clearest|most definitive|definitive match)",
         r"(?:navigate toward|navigate to|go to)[^\n.]{0,140}?(?:KF|keyframe)\s*#?\s*(\d+)",
@@ -565,13 +654,6 @@ def _extract_recommendation_from_background_output(
             [recommended_keyframe_id],
             merged_candidates,
         )
-    elif merged_candidates:
-        recommended_keyframe_id = int(merged_candidates[0])
-        recommendation_reason = (
-            "Using the first ranked background candidate because no explicit "
-            "recommendation sentence was parsed."
-        )
-        recommendation_confidence = 0.72
     return (
         merged_candidates,
         recommended_keyframe_id,
@@ -598,6 +680,10 @@ def _build_background_result_record(
     candidate_keyframe_ids: Optional[Sequence[int]] = None,
     candidate_keyframes: Optional[Sequence[dict[str, Any]]] = None,
     recommended_keyframe_id: Optional[int] = None,
+    recommended_destination: Optional[dict[str, Any]] = None,
+    destination_type: Optional[str] = None,
+    object_preanalysis: Optional[dict[str, Any]] = None,
+    failure_reason: Optional[str] = None,
     recommendation_confidence: Optional[float] = None,
     recommendation_reason: Optional[str] = None,
     final_output: Optional[str] = None,
@@ -640,6 +726,16 @@ def _build_background_result_record(
             resolved_stage = _max_grounding_stage(resolved_stage, "target_decision")
         except Exception:
             pass
+    if isinstance(recommended_destination, dict):
+        record["recommended_destination"] = recommended_destination
+        record["destination_type"] = str(destination_type or recommended_destination.get("type") or "")
+        resolved_stage = _max_grounding_stage(resolved_stage, "target_decision")
+    elif destination_type:
+        record["destination_type"] = str(destination_type)
+    if isinstance(object_preanalysis, dict):
+        record["object_preanalysis"] = object_preanalysis
+    if failure_reason:
+        record["failure_reason"] = str(failure_reason)
     if recommendation_confidence is not None:
         try:
             record["recommendation_confidence"] = float(recommendation_confidence)
@@ -665,6 +761,109 @@ def _build_background_result_record(
         if status == "failed":
             record["completed_at"] = now_iso()
     return record
+
+
+def _record_waiting_object_preanalysis_if_needed(
+    *,
+    state: AsyncAgentState,
+    shared_background_results: dict,
+    shared_processing_tasks: set[str],
+    shared_runtime_control: Optional[dict[str, Any]],
+    worker_name: str,
+    run_memory: Optional[Any],
+    logger: Optional[Any],
+) -> None:
+    """Record that an object preanalysis is waiting for its staging keyframe."""
+
+    if run_memory is None or shared_runtime_control is None:
+        return
+
+    tasks = state.get("tasks", {})
+    current_plan_id = state.get("current_plan_id")
+    allow_speculative_branches = _speculative_branch_preanalysis_from_control(
+        shared_runtime_control
+    )
+    path_task_ids, _ = _selected_path_task_ids_for_background(
+        tasks,
+        state=state,
+        shared_runtime_control=shared_runtime_control,
+        allow_speculative_branches=allow_speculative_branches,
+    )
+    if not path_task_ids and allow_speculative_branches:
+        path_task_ids = sorted(tasks)
+
+    plan_order = collect_ordered_task_ids_for_plan(tasks, plan_id=current_plan_id)
+    plan_order_index = {task_id: index for index, task_id in enumerate(plan_order)}
+    path_task_ids = sorted(
+        dict.fromkeys(path_task_ids),
+        key=lambda task_id: plan_order_index.get(task_id, len(plan_order_index)),
+    )
+
+    recorded = shared_runtime_control.setdefault(
+        "background_waiting_object_preanalysis_keys",
+        set(),
+    )
+    if not hasattr(recorded, "__contains__") or not hasattr(recorded, "add"):
+        recorded = set(recorded if isinstance(recorded, (list, tuple, set)) else [])
+        shared_runtime_control["background_waiting_object_preanalysis_keys"] = recorded
+
+    for t_id in path_task_ids:
+        task = tasks.get(t_id)
+        if not isinstance(task, dict):
+            continue
+        task_plan_id = task.get("plan_id")
+        processing_key = task_processing_key(t_id, task_plan_id)
+        if (
+            task.get("type") != "action"
+            or task_plan_id != current_plan_id
+            or t_id in shared_background_results
+            or processing_key in shared_processing_tasks
+            or processing_key in recorded
+            or _foreground_has_claimed_task(t_id, state, shared_runtime_control)
+            or not should_preanalyze_future_task(task, tasks)
+            or not _task_is_semantic_object_grounding(task)
+            or _find_staging_keyframe_for_object_task(task, tasks) is not None
+        ):
+            continue
+
+        desc = str(task.get("description") or "")
+        record = _build_background_result_record(
+            task_id=int(t_id),
+            task_description=desc,
+            status="waiting",
+            started_at=now_iso(),
+            summary=(
+                "Semantic object background preanalysis is waiting for the staging "
+                "keyframe resolver/navigation result."
+            ),
+            grounding_stage="started",
+            target_text=desc,
+            evidence_source="background",
+            truth_mode="background_hypothesis",
+            failure_reason="waiting_for_staging_keyframe",
+            recommendation_reason=(
+                "Historical object preanalysis requires a resolved staging keyframe "
+                "before it can inspect stored stereo keyframe images."
+            ),
+        )
+        try:
+            run_memory.record_background_update(
+                task_id=int(t_id),
+                task_description=desc,
+                record=record,
+                worker_name=worker_name,
+            )
+            recorded.add(processing_key)
+            if logger:
+                logger.log_background(
+                    f"[{worker_name}] Object preanalysis for task {t_id} is waiting for staging keyframe."
+                )
+        except Exception as exc:
+            if logger:
+                logger.log_background(
+                    f"[{worker_name}] Failed to record waiting object preanalysis for task {t_id}: {exc}"
+                )
+        return
 
 
 def _extract_background_text_from_message(message: BaseMessage) -> Optional[str]:
@@ -709,7 +908,7 @@ def _tools_for_background_task(
     tasks: dict[int, TaskItem],
     tools: Sequence[BaseTool],
 ) -> list[BaseTool]:
-    """Return background-safe tools for destination resolver preanalysis."""
+    """Return background-safe tools for semantic target preanalysis."""
 
     if not should_preanalyze_future_task(task, tasks):
         return []
@@ -720,8 +919,9 @@ def _tools_for_background_task(
             "search_keywords_on_keyframe_nodes",
             "get_keyframe_nodes_info",
             "analyse_on_each_kf_images",
+            "preanalyze_object_on_keyframe",
         },
-        tags={"scene_memory_search"},
+        tags={"scene_memory_search", "object_preanalysis"},
     )
 
 
@@ -732,6 +932,8 @@ def _background_recommendation_is_actionable(
 
     if not isinstance(bg_result, dict):
         return False
+    if isinstance(bg_result.get("recommended_destination"), dict):
+        return str(bg_result.get("status") or "").strip().lower() == "completed"
     stage = _normalize_grounding_stage(bg_result.get("grounding_stage"))
     if (
         str(bg_result.get("status") or "").strip().lower() != "completed"
@@ -747,6 +949,349 @@ def _background_recommendation_is_actionable(
         return float(confidence) >= 0.7
     except Exception:
         return True
+
+
+def _task_metadata_marks_semantic_object(task: Optional[TaskItem]) -> bool:
+    """Return True when current-schema task metadata identifies semantic object grounding."""
+
+    target = (task or {}).get("target")
+    if (
+        isinstance(target, dict)
+        and str(target.get("type") or "").strip() == "semantic_object"
+    ):
+        source = str(target.get("target_source") or "").strip()
+        if source == "current_view":
+            return False
+        return True
+    return legacy_object_kind(task)
+
+
+def _legacy_description_marks_semantic_object(task: Optional[TaskItem]) -> bool:
+    """Return True only for older plans that lack semantic object metadata."""
+
+    target = (task or {}).get("target")
+    if isinstance(target, dict):
+        return False
+    if has_legacy_grounding_metadata(task):
+        return False
+    text = str((task or {}).get("description") or "").lower()
+    return (
+        "approach_object_in_current_view" in text
+        or "semantic object" in text
+        or "object level" in text
+        or "visible target" in text and "object" in text
+    )
+
+
+def _task_is_semantic_object_grounding(task: Optional[TaskItem]) -> bool:
+    if _task_metadata_marks_semantic_object(task):
+        return True
+    return _legacy_description_marks_semantic_object(task)
+
+
+def _latest_task_result_payload(task: Optional[TaskItem]) -> Any:
+    if not task:
+        return None
+    for result in reversed(list(task.get("result", []) or [])):
+        if isinstance(result, dict):
+            direct_payload: dict[str, Any] = {}
+            for key in ("destination", "target", "current_place_context"):
+                if result.get(key) not in (None, "", [], {}):
+                    direct_payload[key] = result.get(key)
+            if direct_payload:
+                return direct_payload
+        raw_output = result.get("raw_output")
+        if not raw_output:
+            continue
+        try:
+            trace = json.loads(raw_output)
+        except Exception:
+            trace = None
+        if isinstance(trace, dict):
+            final_text = str(trace.get("final_ai_content") or "")
+            parsed = _json_from_text(final_text)
+            if isinstance(parsed, dict):
+                return parsed
+            for tool_result in reversed(list(trace.get("tool_results", []) or [])):
+                structured = _extract_structured_tool_result(tool_result.get("content"))
+                if structured is None:
+                    continue
+                data = structured.get("data")
+                if data is not None:
+                    return data
+    return None
+
+
+def _extract_keyframe_destination(value: Any) -> Optional[int]:
+    if isinstance(value, dict):
+        if value.get("type") == "keyframe" and value.get("keyframe_id") is not None:
+            try:
+                return int(value.get("keyframe_id"))
+            except Exception:
+                return None
+        for direct_key in ("target_keyframe_id", "recommended_keyframe_id"):
+            if value.get(direct_key) is not None:
+                try:
+                    return int(value.get(direct_key))
+                except Exception:
+                    pass
+        for key in ("destination", "target", "data"):
+            found = _extract_keyframe_destination(value.get(key))
+            if found is not None:
+                return found
+        for nested in value.values():
+            if isinstance(nested, (dict, list, tuple)):
+                found = _extract_keyframe_destination(nested)
+                if found is not None:
+                    return found
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            found = _extract_keyframe_destination(item)
+            if found is not None:
+                return found
+    return None
+
+
+def _task_ids_from_inputs_from(value: Any) -> list[int]:
+    task_ids: list[int] = []
+
+    def add(raw_value: Any) -> None:
+        try:
+            task_id = int(raw_value)
+        except Exception:
+            return
+        if task_id not in task_ids:
+            task_ids.append(task_id)
+
+    def visit(item: Any) -> None:
+        if isinstance(item, dict):
+            if item.get("task_id") is not None:
+                add(item.get("task_id"))
+            for nested in item.values():
+                visit(nested)
+            return
+        if isinstance(item, (list, tuple, set)):
+            for nested in item:
+                visit(nested)
+            return
+        match = re.search(r"task\s*(\d+)", str(item or ""), flags=re.IGNORECASE)
+        if match:
+            add(match.group(1))
+
+    visit(value)
+    return task_ids
+
+
+def _find_staging_keyframe_for_object_task(
+    task: TaskItem,
+    tasks: dict[int, TaskItem],
+) -> Optional[int]:
+    target = task.get("target")
+    if isinstance(target, dict):
+        inputs_from = target.get("inputs_from")
+        for task_id in _task_ids_from_inputs_from(inputs_from):
+            source_task = tasks.get(task_id)
+            found = _extract_keyframe_destination(_latest_task_result_payload(source_task))
+            if found is not None:
+                return found
+    legacy_upstream_id = legacy_upstream_task_id(task)
+    if legacy_upstream_id is not None:
+        staging_task = tasks.get(legacy_upstream_id)
+        found = _extract_keyframe_destination(_latest_task_result_payload(staging_task))
+        if found is not None:
+            return found
+        target = staging_task.get("target") if isinstance(staging_task, dict) else None
+        if isinstance(target, dict):
+            found = _extract_keyframe_destination(target)
+            if found is not None:
+                return found
+    for dep_id in reversed(list(task.get("depends_on", []) or [])):
+        dep_task = tasks.get(dep_id)
+        if not isinstance(dep_task, dict):
+            continue
+        target = dep_task.get("target")
+        if dep_task.get("task_type") == "navigation_action" and isinstance(target, dict):
+            if target.get("type") == "keyframe":
+                try:
+                    return int(target.get("keyframe_id"))
+                except Exception:
+                    pass
+            if target.get("type") == "task_output":
+                try:
+                    source_task = tasks.get(int(target.get("task_id")))
+                except Exception:
+                    source_task = None
+                found = _extract_keyframe_destination(_latest_task_result_payload(source_task))
+                if found is not None:
+                    return found
+        found = _extract_keyframe_destination(_latest_task_result_payload(dep_task))
+        if found is not None:
+            return found
+    return None
+
+
+def _find_tool_by_name(tools: Sequence[BaseTool], name: str) -> Optional[BaseTool]:
+    for tool in tools:
+        if str(getattr(tool, "name", "") or "").strip() == name:
+            return tool
+    return None
+
+
+def _structured_tool_data(raw_result: Any) -> Any:
+    structured = _extract_structured_tool_result(raw_result)
+    if structured is not None:
+        return structured.get("data")
+    if isinstance(raw_result, dict) and "data" in raw_result:
+        return raw_result.get("data")
+    return raw_result
+
+
+def _structured_tool_status(raw_result: Any) -> str:
+    structured = _extract_structured_tool_result(raw_result)
+    if structured is not None:
+        return str(structured.get("status") or "").strip().lower()
+    if isinstance(raw_result, dict):
+        return str(raw_result.get("status") or "").strip().lower()
+    return ""
+
+
+def _structured_tool_error(raw_result: Any) -> str:
+    structured = _extract_structured_tool_result(raw_result)
+    payload = structured if structured is not None else raw_result if isinstance(raw_result, dict) else {}
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(error, dict):
+        return str(error.get("message") or error.get("code") or "").strip()
+    return str(error or "").strip()
+
+
+def _try_historical_object_preanalysis(
+    *,
+    state: AsyncAgentState,
+    task_copy: TaskItem,
+    tools: Sequence[BaseTool],
+    store: "BackgroundResultStore",
+    logger: Optional[Any],
+) -> bool:
+    """Run deterministic keyframe-image object preanalysis when staging is known."""
+
+    if not _task_is_semantic_object_grounding(task_copy):
+        return False
+    tasks = state.get("tasks", {})
+    staging_keyframe_id = _find_staging_keyframe_for_object_task(task_copy, tasks)
+    if staging_keyframe_id is None:
+        return False
+    tool = _find_tool_by_name(tools, "preanalyze_object_on_keyframe")
+    if tool is None:
+        return False
+    desc = str(task_copy.get("description") or "")
+    target = task_copy.get("target")
+    object_description = desc
+    stop_distance_m = 0.8
+    if isinstance(target, dict):
+        object_description = str(target.get("object_description") or desc).strip() or desc
+        if target.get("stop_distance_m") is not None:
+            try:
+                stop_distance_m = float(target.get("stop_distance_m"))
+            except Exception:
+                stop_distance_m = 0.8
+    if logger:
+        logger.log_background(
+            f"[{store.node_name} - Thread] Historical object preanalysis on keyframe {staging_keyframe_id} for task {store.task_id}"
+        )
+    started_at = store.started_at
+    store.store(
+        _build_background_result_record(
+            task_id=store.task_id,
+            task_description=desc,
+            status="running",
+            started_at=started_at,
+            summary=f"Historical object preanalysis started on keyframe {staging_keyframe_id}.",
+            grounding_stage="candidate_pack",
+            target_text=desc,
+            evidence_source="background",
+            truth_mode="background_hypothesis",
+            candidate_keyframe_ids=[staging_keyframe_id],
+        )
+    )
+    try:
+        raw_result = tool.invoke(
+            {
+                "keyframe_id": int(staging_keyframe_id),
+                "object_description": object_description,
+                "stop_distance_m": stop_distance_m,
+            }
+        )
+    except Exception as exc:
+        raw_result = {
+            "status": "error",
+            "summary": "Historical object preanalysis raised an exception.",
+            "data": None,
+            "error": {"message": str(exc)},
+            "provenance": {"source_type": "scene_memory"},
+        }
+    data = _structured_tool_data(raw_result)
+    status = _structured_tool_status(raw_result)
+    destination = data.get("destination") if isinstance(data, dict) else None
+    failure_reason = _structured_tool_error(raw_result)
+    if not failure_reason and isinstance(data, dict):
+        approach = data.get("approach") if isinstance(data.get("approach"), dict) else {}
+        failure_reason = str(approach.get("reason") or data.get("status") or "").strip()
+    if status == "ok" and isinstance(destination, dict):
+        if logger:
+            logger.log_background(
+                "[{node} - Thread] Historical object preanalysis completed for task {task_id}; destination={destination}".format(
+                    node=store.node_name,
+                    task_id=store.task_id,
+                    destination=destination,
+                )
+            )
+        store.store(
+            _build_background_result_record(
+                task_id=store.task_id,
+                task_description=desc,
+                status="completed",
+                started_at=started_at,
+                summary=f"Historical object preanalysis produced a position destination from keyframe {staging_keyframe_id}.",
+                grounding_stage="target_decision",
+                target_text=desc,
+                evidence_source="background",
+                truth_mode="background_hypothesis",
+                candidate_keyframe_ids=[staging_keyframe_id],
+                recommended_destination=destination,
+                destination_type=str(destination.get("type") or "position"),
+                object_preanalysis=data if isinstance(data, dict) else None,
+                recommendation_reason=f"Static semantic object preanalysis on historical keyframe {staging_keyframe_id}.",
+                final_output=f"Recommended semantic object destination from keyframe {staging_keyframe_id}.",
+            )
+        )
+        return True
+    if logger:
+        logger.log_background(
+            "[{node} - Thread] Historical object preanalysis failed for task {task_id}; keyframe={keyframe_id}; reason={reason}".format(
+                node=store.node_name,
+                task_id=store.task_id,
+                keyframe_id=staging_keyframe_id,
+                reason=failure_reason or "destination_unavailable",
+            )
+        )
+    store.store(
+        _build_background_result_record(
+            task_id=store.task_id,
+            task_description=desc,
+            status="failed",
+            started_at=started_at,
+            summary=f"Historical object preanalysis did not produce a destination from keyframe {staging_keyframe_id}.",
+            grounding_stage="candidate_pack",
+            target_text=desc,
+            evidence_source="background",
+            truth_mode="background_hypothesis",
+            candidate_keyframe_ids=[staging_keyframe_id],
+            object_preanalysis=data if isinstance(data, dict) else None,
+            failure_reason=failure_reason or "destination_unavailable",
+            error=failure_reason or "destination_unavailable",
+        )
+    )
+    return True
 
 
 class BackgroundResultStore:
@@ -847,6 +1392,21 @@ class BackgroundForegroundCoordinator:
             self.shared_runtime_control,
         )
 
+    def task_is_staging_keyframe_grounding(self) -> bool:
+        """Return True for background work that can feed later object preanalysis."""
+
+        task = self.state.get("tasks", {}).get(self.task_id)
+        if not isinstance(task, dict):
+            return False
+        target = task.get("target")
+        if (
+            task.get("task_type") == "navigation_action"
+            and isinstance(target, dict)
+            and str(target.get("type") or "").strip() == "semantic_keyframe"
+        ):
+            return True
+        return legacy_staging_kind(task)
+
     def should_yield(self, grounding_stage: Optional[str]) -> bool:
         """Return True when foreground owns unfinished grounding work."""
 
@@ -876,6 +1436,17 @@ class BackgroundForegroundCoordinator:
         """Persist partial work and stop when foreground has claimed the task."""
 
         if not self.should_yield(grounding_stage):
+            return
+        if (
+            self.task_is_staging_keyframe_grounding()
+            and (candidate_keyframe_ids or candidate_keyframes)
+            and recommended_keyframe_id is None
+        ):
+            if store.logger:
+                store.logger.log_background(
+                    f"[{store.node_name} - Thread] Continuing staging preanalysis for task {store.task_id}; "
+                    f"foreground has started, but candidate evidence is available and downstream tasks can reuse it."
+                )
             return
         if store.logger:
             store.logger.log_background(
@@ -973,13 +1544,13 @@ def _build_background_task_prompt(
     """Build the prompt used by the scene-memory background analyzer."""
 
     return (
-        "You are pre-analyzing a future destination-resolver task.\n\n"
+        "You are pre-analyzing a future semantic grounding task.\n\n"
         f"Task Description: {task_description}\n\n"
         f"{background_seed_context}"
-        "Resolve the destination as far as possible from navigation memory and stored scene data. "
+        "Prepare grounding evidence as far as possible from navigation memory and stored scene data. "
         "Remember: You cannot access current state or navigate. "
         "You do not know the robot's true live viewpoint, even if an earlier task navigated somewhere. "
-        "For destination resolver tasks, first reuse a matching navigation-memory anchor if one exists; otherwise use scene-memory search and metadata. "
+        "For reusable semantic destination signals, first reuse a matching navigation-memory anchor if one exists; otherwise use scene-memory search and metadata. "
         "If a concrete keyframe is identified, state it clearly as the recommended destination keyframe. "
         "If the task involves analyzing the current image or state, what is visible right now, or what is true 'at that time', you MUST return directly and DO NOT call any tools. "
         "For those real-time tasks, DO NOT answer the question itself, DO NOT say the result is confirmed, and DO NOT give a final yes/no judgment. "
@@ -992,7 +1563,12 @@ def _build_background_task_prompt(
         "- If one candidate is clearly best, state that explicitly.\n"
         "- If navigation memory provides a clear match, prefer it over repeated scene-memory search.\n"
         "- Do not return coordinates-only lists unless semantic descriptions are truly unavailable.\n"
-        "- For destination resolver tasks, provide a recommended keyframe when possible.\n"
+        "- For semantic keyframe grounding, provide a recommended keyframe when possible.\n"
+        "- If one keyframe is clearly best, include a compact recommendation payload if possible: "
+        "{\"recommended_keyframe_id\":<id>,\"recommendation_reason\":\"short reason\"}. "
+        "The payload must match your prose recommendation and is background evidence, not a movement command.\n"
+        "- If several candidates remain plausible and none is clearly best, do not invent a final destination; "
+        "return candidates and explain what foreground verification should compare.\n"
         "- For real-time observation tasks, begin with a short note that real-time verification is required."
     )
 
@@ -1025,6 +1601,17 @@ def run_background_analysis(
         logger.log_background(
             f"[{store.node_name} - Thread] Pre-analyzing task {store.task_id}: {desc[:80]}..."
         )
+
+    if _task_is_semantic_object_grounding(task_copy):
+        if _try_historical_object_preanalysis(
+            state=state,
+            task_copy=task_copy,
+            tools=background_tools,
+            store=store,
+            logger=logger,
+        ):
+            return
+        return
 
     agent_factory = react_agent_factory or create_react_agent
     background_agent = agent_factory(
@@ -1088,7 +1675,7 @@ def run_background_analysis(
         )
     )
 
-    with UnifiedLLMClient.request_priority("background"):
+    with UnifiedLLMClient.request_priority("background"), execute_tool_budget_context():
         if hasattr(background_agent, "stream"):
             for chunk in background_agent.stream(
                 {"messages": [HumanMessage(content=task_prompt)]},
@@ -1307,7 +1894,7 @@ def create_background_worker_node(
     node_name = f"bg_worker_{worker_id}"
 
     def background_worker_node(state: AsyncAgentState) -> AsyncAgentState:
-        """Launch one background thread for one available destination resolver."""
+        """Launch one background thread for one available semantic target."""
 
         if logger:
             logger.log_background(f"Worker {worker_id}: processing background tasks")
@@ -1322,7 +1909,29 @@ def create_background_worker_node(
             shared_runtime_control=shared_runtime_control,
         )
         if target_task is None:
+            _record_waiting_object_preanalysis_if_needed(
+                state=state,
+                shared_background_results=shared_background_results,
+                shared_processing_tasks=shared_processing_tasks,
+                shared_runtime_control=shared_runtime_control,
+                worker_name=node_name,
+                run_memory=run_memory,
+                logger=logger,
+            )
             return {}
+        if logger:
+            logger.log_background(
+                "Worker {worker_id}: claimed background task {task_id}; target_type={target_type}; outputs={outputs}".format(
+                    worker_id=worker_id,
+                    task_id=target_task.get("task_id"),
+                    target_type=(
+                        (target_task.get("target") or {}).get("type")
+                        if isinstance(target_task.get("target"), dict)
+                        else ""
+                    ),
+                    outputs=target_task.get("outputs"),
+                )
+            )
 
         active_generation = None
         if shared_runtime_control is not None:
@@ -1382,7 +1991,7 @@ def create_background_worker_node(
                 store.release_claim()
 
         def run_background_loop() -> None:
-            """Analyze at most one available resolver task for this scheduling pass."""
+            """Analyze at most one available semantic target for this scheduling pass."""
 
             if shared_runtime_control is not None:
                 if shared_runtime_control.get("active_plan_id") != current_plan_id:

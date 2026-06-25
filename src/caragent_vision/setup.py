@@ -31,6 +31,7 @@ setup(
             "capture_stereo_calibration = caragent_vision.capture_stereo_calibration:main",
             "calibrate_stereo_camera = caragent_vision.calibrate_stereo_camera:main",
             "live_lidar_camera_correspondences = caragent_vision.live_lidar_camera_correspondences:main",
+            "calibrate_lidar_camera_extrinsics = caragent_vision.calibrate_lidar_camera_extrinsics:main",
         ],
     },
 )

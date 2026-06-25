@@ -16,6 +16,7 @@ class PlanningRequirementDecision(TypedDict, total=False):
 
     requires_planning: bool
     task_type: str
+    reason: str
 
 
 def load_agent_prompts() -> Dict[str, Any]:
@@ -44,13 +45,14 @@ def _direct_llm_action_decision() -> PlanningRequirementDecision:
     return {
         "requires_planning": False,
         "task_type": "llm_action",
+        "reason": "lightweight_runtime_interaction",
     }
 
 
 def _planning_required_decision() -> PlanningRequirementDecision:
     """Return the canonical decision for requests that need planning."""
 
-    return {"requires_planning": True}
+    return {"requires_planning": True, "reason": "requires_task_plan"}
 
 
 def _rule_planning_decision(user_input: str) -> Optional[PlanningRequirementDecision]:
@@ -169,10 +171,11 @@ def _normalize_direct_task_metadata(
 ) -> PlanningRequirementDecision:
     """Keep model-provided direct-task metadata inside the supported contract."""
 
-    del raw
+    reason = str(raw.get("reason") or "").strip()
     return {
         "requires_planning": False,
         "task_type": "llm_action",
+        "reason": reason or "lightweight_runtime_interaction",
     }
 
 
@@ -190,7 +193,11 @@ def _parse_planning_requirement_response(content: str) -> PlanningRequirementDec
                 == "REQUIRES PLANNING"
             )
             if requires:
-                return _planning_required_decision()
+                reason = str(parsed.get("reason") or "").strip()
+                decision = _planning_required_decision()
+                if reason:
+                    decision["reason"] = reason
+                return decision
             return _normalize_direct_task_metadata(parsed)
     except Exception:
         pass

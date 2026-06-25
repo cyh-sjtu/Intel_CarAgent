@@ -24,11 +24,16 @@ from caragent_agent.agents.async_agent.execution.support import (
     normalize_turn_response_items,
 )
 from caragent_agent.agents.async_agent.orchestration.runtime import (
+    build_navigation_arrival_event,
     new_structured_id,
     now_iso,
     parse_navigation_arrival_position,
 )
 from caragent_agent.agents.async_agent.runtime.console import Colors
+from caragent_agent.agents.async_agent.execution.tool_call_budget import (
+    maybe_block_repeated_tool_call,
+    maybe_add_keyframe_match_budget_hint,
+)
 from caragent_agent.agents.async_agent.memory.run_memory import AsyncAgentRunMemory
 from caragent_agent.agents.async_agent.runtime.resource_scheduler import resolve_runtime_profile
 from caragent_agent.agents.base.base_agent_interface import BaseAgent, ToolOrchestrate
@@ -37,10 +42,18 @@ from caragent_agent.agents.tools.analysis.image_analyzer import (
     ImageAnalyzerTool,
     MultiImageAnalyzerTool,
 )
+from caragent_agent.agents.tools.analysis.attached_image_tools import (
+    AttachedImageAnalyzerTool,
+    AttachedImageKeyframeMatcherTool,
+    AttachedImageObjectResolverTool,
+    HistoricalKeyframeObjectPreanalysisTool,
+)
 from caragent_agent.agents.tools.current.get_current_state import Get_Current_State_Tool
+from caragent_agent.agents.tools.current.capture_current_view import CaptureCurrentViewTool
 from caragent_agent.agents.tools.info.get_nodes_info import GetKeyFrameNodesInfoTool
 from caragent_agent.agents.tools.memory import QueryMemoryTool
-from caragent_agent.agents.tools.navigation.navigator import NavigationTool
+from caragent_agent.agents.tools.navigation.navigator import NavigationTool, NavigationToPositionTool
+from caragent_agent.agents.tools.objects.approach_object import ApproachObjectInCurrentViewTool
 from caragent_agent.agents.tools.search.keyword_search import KeywordSearchTool
 from caragent_agent.agents.tools.search.requirement_search import RequirementSearchTool
 from caragent_agent.config.config import config, ensure_api_key_env
@@ -274,6 +287,10 @@ class AsyncAgent(BaseAgent):
         self.register_tool(RequirementSearchTool())
         self.register_tool(GetKeyFrameNodesInfoTool())
         self.register_tool(ImageAnalyzerTool())
+        self.register_tool(AttachedImageAnalyzerTool())
+        self.register_tool(AttachedImageKeyframeMatcherTool())
+        self.register_tool(AttachedImageObjectResolverTool())
+        self.register_tool(HistoricalKeyframeObjectPreanalysisTool())
         self.register_tool(QueryMemoryTool())
         # self.register_tool(MultiImageAnalyzerTool())
 
@@ -281,9 +298,12 @@ class AsyncAgent(BaseAgent):
             nav_tool = NavigationTool(self.controller)
             self.register_tool(nav_tool)
             self.controller = nav_tool.controller
+            self.register_tool(NavigationToPositionTool(self.controller))
 
             self.register_tool(Get_Current_State_Tool(self.controller))
+            self.register_tool(CaptureCurrentViewTool(self.controller))
             self.register_tool(CurrentImageAnalyzerTool(self.controller))
+            self.register_tool(ApproachObjectInCurrentViewTool(self.controller))
 
     def _bind_runtime_references_to_tools(self) -> None:
         """Attach runtime objects such as run memory to all registered tools."""
@@ -332,6 +352,8 @@ class AsyncAgent(BaseAgent):
             for param_name, param in sig.parameters.items():
                 if param_name == "self":
                     continue
+                if param.kind in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL):
+                    continue
 
                 param_type = type_hints.get(param_name, str)
                 schema_param_type = self._get_input_schema_param_type(param_type)
@@ -354,7 +376,14 @@ class AsyncAgent(BaseAgent):
                 **kwargs,
             ):
                 normalized_kwargs = self._normalize_tool_kwargs(kwargs, _type_hints)
-                return _tool.execute(**normalized_kwargs)
+                repeated_result = maybe_block_repeated_tool_call(
+                    _tool.name,
+                    normalized_kwargs,
+                )
+                if repeated_result is not None:
+                    return repeated_result
+                result = _tool.execute(**normalized_kwargs)
+                return maybe_add_keyframe_match_budget_hint(_tool.name, result)
 
             structured_tool = StructuredTool.from_function(
                 func=_wrapped_execute,
@@ -376,7 +405,11 @@ class AsyncAgent(BaseAgent):
     def _tool_should_return_direct(self, tool: Any) -> bool:
         """Stop the ReAct loop immediately after side-effectful navigation tools run."""
 
-        return getattr(tool, "name", "") == "go_to_keyframe"
+        return getattr(tool, "name", "") in {
+            "go_to_keyframe",
+            "go_to_position",
+            "submit_task_result",
+        }
 
     def _get_background_langchain_tools(self) -> List:
         """Filter and wrap tools that are safe to run in background workers. The tools for background worker exclude navigation and current state tools, which are not suitable for background processing."""
@@ -386,6 +419,7 @@ class AsyncAgent(BaseAgent):
             "RequirementSearchTool",
             "GetKeyFrameNodesInfoTool",
             "QueryMemoryTool",
+            "HistoricalKeyframeObjectPreanalysisTool",
         }
 
         langchain_tools = []
@@ -400,6 +434,8 @@ class AsyncAgent(BaseAgent):
             fields = {}
             for param_name, param in sig.parameters.items():
                 if param_name == "self":
+                    continue
+                if param.kind in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL):
                     continue
 
                 param_type = type_hints.get(param_name, str)
@@ -471,6 +507,7 @@ class AsyncAgent(BaseAgent):
         """Coerce common LLM-emitted argument shapes into the tool's expected runtime values."""
 
         normalized_kwargs = dict(kwargs)
+        normalized_kwargs.pop("kwargs", None)
         for param_name, param_type in type_hints.items():
             if param_name == "return" or param_name not in normalized_kwargs:
                 continue
@@ -566,6 +603,51 @@ class AsyncAgent(BaseAgent):
             or "navigation goal reached" in normalized
         )
 
+    def _controller_arrival_matches_active_navigation(
+        self,
+        message: str,
+        state: dict[str, Any],
+        *,
+        tolerance_m: float = 0.5,
+    ) -> bool:
+        """Reject stale controller arrival messages from a previous navigation leg."""
+
+        if not isinstance(state, dict):
+            return False
+        active_navigation = state.get("active_navigation")
+        if not isinstance(active_navigation, dict):
+            return False
+        active_plan_id = str(active_navigation.get("plan_id") or "").strip()
+        current_plan_id = str(state.get("current_plan_id") or "").strip()
+        if active_plan_id and current_plan_id and active_plan_id != current_plan_id:
+            return False
+        try:
+            active_task_id = int(active_navigation.get("task_id"))
+        except Exception:
+            active_task_id = None
+        task = (state.get("tasks") or {}).get(active_task_id) if active_task_id is not None else None
+        if not (
+            isinstance(task, dict)
+            and str(task.get("status") or "").strip().lower() == "waiting"
+            and task.get("wait_for_event") == "navigation_arrived"
+        ):
+            return False
+
+        reported_position = parse_navigation_arrival_position(message)
+        destination = active_navigation.get("destination_position")
+        if reported_position is None or not isinstance(destination, (list, tuple)):
+            return True
+        if len(reported_position) < 2 or len(destination) < 2:
+            return True
+
+        try:
+            dx = float(reported_position[0]) - float(destination[0])
+            dy = float(reported_position[1]) - float(destination[1])
+        except Exception:
+            return True
+
+        return (dx * dx + dy * dy) ** 0.5 <= float(tolerance_m)
+
     def _resolve_navigation_arrival_task_id(
         self,
         state: dict[str, Any],
@@ -632,11 +714,107 @@ class AsyncAgent(BaseAgent):
         """Build a physical navigation-arrival event without language ingest."""
 
         content = str(message or "").strip()
+        active_navigation = state.get("active_navigation") if isinstance(state, dict) else None
+
+        def attach_arrival_capture(event: dict[str, Any]) -> dict[str, Any]:
+            payload = event.setdefault("payload", {})
+            if not isinstance(payload, dict):
+                return event
+            if event.get("type") != "navigation_arrived":
+                return event
+            agent_cfg = config.get("agent") if isinstance(config.get("agent"), dict) else {}
+            if not bool(agent_cfg.get("capture_view_on_navigation_arrival", True)):
+                return event
+            image_format = str(agent_cfg.get("arrival_capture_image_format") or "jpg").strip() or "jpg"
+            note_parts = ["navigation_arrived"]
+            if payload.get("destination_description"):
+                note_parts.append(str(payload.get("destination_description")))
+            if event.get("task_id") is not None:
+                note_parts.append(f"task_id={event.get('task_id')}")
+            try:
+                capture_result = CaptureCurrentViewTool(self.controller).execute(
+                    note="; ".join(note_parts),
+                    image_format=image_format,
+                )
+            except Exception as exc:
+                payload["arrival_capture_error"] = {
+                    "code": "arrival_capture_exception",
+                    "message": str(exc),
+                }
+                if self.enable_logging and self.logger:
+                    self.logger.log_foreground(
+                        "arrival_current_view_capture_failed: "
+                        + json.dumps(payload["arrival_capture_error"], ensure_ascii=False, default=str)
+                    )
+                return event
+            data = (
+                capture_result.get("data")
+                if isinstance(capture_result, dict) and isinstance(capture_result.get("data"), dict)
+                else {}
+            )
+            status = str(capture_result.get("status") or "").strip().lower() if isinstance(capture_result, dict) else ""
+            if status in {"ok", "success", "succeeded"} and data.get("path"):
+                payload["arrival_image_ref"] = {
+                    key: data.get(key)
+                    for key in (
+                        "image_ref_id",
+                        "path",
+                        "source",
+                        "note",
+                        "image_format",
+                        "width",
+                        "height",
+                        "image_source",
+                    )
+                    if data.get(key) not in (None, "", [], {})
+                }
+                if self.enable_logging and self.logger:
+                    self.logger.log_foreground(
+                        "arrival_current_view_captured: "
+                        + json.dumps(payload["arrival_image_ref"], ensure_ascii=False, default=str)
+                    )
+            else:
+                payload["arrival_capture_error"] = {
+                    "code": (
+                        (capture_result.get("error") or {}).get("code")
+                        if isinstance(capture_result, dict) and isinstance(capture_result.get("error"), dict)
+                        else "arrival_capture_failed"
+                    ),
+                    "summary": capture_result.get("summary") if isinstance(capture_result, dict) else str(capture_result),
+                }
+                if self.enable_logging and self.logger:
+                    self.logger.log_foreground(
+                        "arrival_current_view_capture_failed: "
+                        + json.dumps(payload["arrival_capture_error"], ensure_ascii=False, default=str)
+                    )
+            return event
+
+        if isinstance(active_navigation, dict):
+            event = build_navigation_arrival_event(
+                ToolMessage(content=content, tool_call_id=new_structured_id("controller_message")),
+                messages=list(state.get("messages") or []),
+                tasks=dict(state.get("tasks") or {}),
+                current_task_id=state.get("current_task_id"),
+                current_plan_id=state.get("current_plan_id"),
+                active_navigation=active_navigation,
+                match_tolerance_meters=0.5,
+            )
+            event["message_id"] = new_structured_id("controller_message")
+            payload = event.setdefault("payload", {})
+            if isinstance(payload, dict):
+                payload["content"] = content
+                payload["reported_position"] = parse_navigation_arrival_position(content)
+                payload["turn_response_type"] = "result"
+                if event.get("type") == "navigation_arrived":
+                    payload["summary"] = "Controller reported navigation arrival."
+            return attach_arrival_capture(event)
+
         payload: dict[str, Any] = {
             "summary": "Controller reported navigation arrival.",
             "content": content,
             "reported_position": parse_navigation_arrival_position(content),
             "turn_response_type": "result",
+            "unmatched_reason": "missing_active_navigation",
         }
         task_id = self._resolve_navigation_arrival_task_id(state)
         if task_id is not None:
@@ -647,7 +825,7 @@ class AsyncAgent(BaseAgent):
 
         event: dict[str, Any] = {
             "event_id": new_structured_id("event"),
-            "type": "navigation_arrived",
+            "type": "navigation_arrival_unmatched",
             "source": "system",
             "created_at": now_iso(),
             "message_id": new_structured_id("controller_message"),
@@ -655,7 +833,7 @@ class AsyncAgent(BaseAgent):
         }
         if task_id is not None:
             event["task_id"] = task_id
-        return event
+        return attach_arrival_capture(event)
 
     def _dispatch_controller_arrival_event(
         self,
@@ -980,6 +1158,16 @@ class AsyncAgent(BaseAgent):
                             and message != last_arrival_message[0]
                             and self._controller_message_is_arrival(message)
                         ):
+                            if not self._controller_arrival_matches_active_navigation(message, state):
+                                last_arrival_message[0] = message
+                                if self.enable_logging and self.logger:
+                                    self.logger.log_foreground(
+                                        "Controller Arrival Watchdog: ignored stale arrival message for current navigation: {message}".format(
+                                            message=message
+                                        )
+                                    )
+                                time.sleep(poll_interval)
+                                continue
                             if self._dispatch_controller_arrival_event(message, thread_id):
                                 last_arrival_message[0] = message
                                 if self.enable_logging and self.logger:
@@ -990,7 +1178,11 @@ class AsyncAgent(BaseAgent):
                                             message=message
                                         )
                                     )
-                                continue
+                                post_dispatch_state = self.get_thread_state(thread_id)
+                                if self._state_has_waiting_navigation(post_dispatch_state):
+                                    time.sleep(poll_interval)
+                                    continue
+                                break
                         if not message:
                             last_arrival_message[0] = None
                         time.sleep(poll_interval)
@@ -1237,12 +1429,12 @@ class AsyncAgent(BaseAgent):
         """Return True when a streamed message indicates navigation is in progress."""
 
         if isinstance(message, ToolMessage):
-            return getattr(message, "name", "") == "go_to_keyframe"
+            return getattr(message, "name", "") in {"go_to_keyframe", "go_to_position"}
 
         if isinstance(message, AIMessage):
             tool_calls = getattr(message, "tool_calls", None) or []
             return any(
-                tool_call.get("name") == "go_to_keyframe"
+                tool_call.get("name") in {"go_to_keyframe", "go_to_position"}
                 for tool_call in tool_calls
                 if isinstance(tool_call, dict)
             )

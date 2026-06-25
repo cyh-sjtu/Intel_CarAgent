@@ -6,6 +6,7 @@ import hashlib
 import itertools
 import math
 import re
+import json
 from datetime import datetime
 from typing import Any, Optional, Sequence
 
@@ -23,6 +24,10 @@ from ..runtime.types import (
 )
 
 _STRUCTURED_ID_COUNTER = itertools.count()
+ATTACHED_IMAGES_BLOCK_RE = re.compile(
+    r"\[ATTACHED_IMAGES_JSON\]\s*(\[.*?\])\s*\[/ATTACHED_IMAGES_JSON\]",
+    re.DOTALL,
+)
 
 
 def now_iso() -> str:
@@ -71,6 +76,42 @@ def new_runtime_task_id(tasks: dict[int, TaskItem]) -> int:
     if not negative_ids:
         return -1
     return min(negative_ids) - 1
+
+
+def extract_attached_images_from_content(content: Any) -> list[dict[str, Any]]:
+    """Extract attached-image metadata embedded by UI/ROS boundary adapters."""
+
+    text = str(content or "")
+    attached: list[dict[str, Any]] = []
+    for match in ATTACHED_IMAGES_BLOCK_RE.finditer(text):
+        try:
+            parsed = json.loads(match.group(1))
+        except Exception:
+            continue
+        if not isinstance(parsed, list):
+            continue
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            image_ref_id = str(item.get("image_ref_id") or "").strip()
+            path = str(item.get("path") or "").strip()
+            if not image_ref_id and not path:
+                continue
+            attached.append(
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key
+                    in {
+                        "image_ref_id",
+                        "path",
+                        "source",
+                        "created_at",
+                    }
+                    and value not in (None, "")
+                }
+            )
+    return attached
 
 
 def task_status_is_terminal(status: Optional[TaskStatus]) -> bool:
@@ -162,6 +203,7 @@ def build_pending_navigation_snapshot(
     """Capture an in-flight navigation target so replanning does not orphan arrival."""
 
     snapshot: dict[str, Any] = {
+        "navigation_token": new_structured_id("nav"),
         "task_id": task_id,
         "plan_id": task.get("plan_id"),
         "user_input_id": task.get("user_input_id"),
@@ -192,6 +234,7 @@ def build_navigation_arrival_event(
     messages: Sequence[BaseMessage],
     tasks: dict[int, TaskItem],
     current_task_id: Optional[int],
+    current_plan_id: Optional[str] = None,
     active_navigation: Optional[dict[str, Any]] = None,
     pending_navigation: Optional[dict[str, Any]] = None,
     match_tolerance_meters: float = 2.0,
@@ -213,9 +256,28 @@ def build_navigation_arrival_event(
     )
     match_distance: Optional[float] = None
     is_matched = False
+    active_plan_id = str(navigation.get("plan_id") or "").strip() if navigation is not None else ""
+    expected_plan_id = str(current_plan_id or "").strip()
+    plan_matches = not expected_plan_id or not active_plan_id or active_plan_id == expected_plan_id
+    active_task_id = None
+    if navigation is not None:
+        try:
+            active_task_id = int(navigation.get("task_id"))
+        except Exception:
+            active_task_id = None
+    task = tasks.get(active_task_id) if active_task_id is not None else None
+    task_is_waiting = (
+        isinstance(task, dict)
+        and str(task.get("status") or "").strip().lower() == "waiting"
+        and task.get("wait_for_event") == "navigation_arrived"
+    )
     if reported_position is not None and destination_position is not None:
         match_distance = _position_distance(reported_position, destination_position)
-        is_matched = match_distance <= float(match_tolerance_meters)
+        is_matched = (
+            match_distance <= float(match_tolerance_meters)
+            and plan_matches
+            and task_is_waiting
+        )
 
     event_type = "navigation_arrived" if is_matched else "navigation_arrival_unmatched"
     event: EventItem = {
@@ -249,6 +311,9 @@ def build_navigation_arrival_event(
             event["plan_id"] = navigation.get("plan_id")
         if navigation.get("user_input_id"):
             event["user_input_id"] = navigation.get("user_input_id")
+        if navigation.get("navigation_token"):
+            event["navigation_token"] = navigation.get("navigation_token")  # type: ignore[typeddict-unknown-key]
+            event["payload"]["navigation_token"] = navigation.get("navigation_token")
         event["payload"]["destination_description"] = str(
             navigation.get("description") or ""
         ).strip()
@@ -262,6 +327,10 @@ def build_navigation_arrival_event(
             event["payload"]["orphaned_waiting_navigation"] = True
     if navigation is None:
         event["payload"]["unmatched_reason"] = "missing_active_navigation"
+    elif not plan_matches:
+        event["payload"]["unmatched_reason"] = "stale_plan"
+    elif not task_is_waiting:
+        event["payload"]["unmatched_reason"] = "task_not_waiting"
     elif reported_position is None:
         event["payload"]["unmatched_reason"] = "missing_reported_position"
     elif destination_position is None:
@@ -295,12 +364,15 @@ def build_user_input_received_event(
     )
 
     if existing_user_input is None:
+        attached_images = extract_attached_images_from_content(message.content)
         existing_user_input = {
             "user_input_id": new_structured_id("user_input"),
             "message_id": message_id,
             "content": str(message.content),
             "created_at": now_iso(),
         }
+        if attached_images:
+            existing_user_input["attached_images"] = attached_images
         updated_user_inputs.append(existing_user_input)
 
     event: EventItem = {
@@ -314,6 +386,8 @@ def build_user_input_received_event(
             "content": existing_user_input["content"],
         },
     }
+    if existing_user_input.get("attached_images"):
+        event["payload"]["attached_images"] = existing_user_input.get("attached_images")
     return event, updated_user_inputs
 
 

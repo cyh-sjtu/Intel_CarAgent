@@ -16,6 +16,11 @@ def generate_launch_description():
     camera_backend = LaunchConfiguration("camera_backend")
     camera_show_image = LaunchConfiguration("camera_show_image")
     camera_calib_file = LaunchConfiguration("camera_calib_file")
+    camera_width = LaunchConfiguration("camera_width")
+    camera_height = LaunchConfiguration("camera_height")
+    camera_left_width = LaunchConfiguration("camera_left_width")
+    camera_right_width = LaunchConfiguration("camera_right_width")
+    camera_fps = LaunchConfiguration("camera_fps")
     map_file_name = LaunchConfiguration("map_file_name")
     map_start_at_dock = LaunchConfiguration("map_start_at_dock")
     use_rviz = LaunchConfiguration("use_rviz")
@@ -84,6 +89,11 @@ def generate_launch_description():
             "device": camera_device,
             "calib_file": camera_calib_file,
             "show_image": camera_show_image,
+            "width": camera_width,
+            "height": camera_height,
+            "left_width": camera_left_width,
+            "right_width": camera_right_width,
+            "fps": camera_fps,
             "publish_raw": "true",
             "publish_left": "true",
             "publish_right": "true",
@@ -104,8 +114,8 @@ def generate_launch_description():
                 "base_frame": "base_link",
                 "session_name": session_name,
                 "output_root": output_root,
-                "left_width": 640,
-                "right_width": 640,
+                "left_width": ParameterValue(camera_left_width, value_type=int),
+                "right_width": ParameterValue(camera_right_width, value_type=int),
                 "min_time_sec": ParameterValue(min_time_sec, value_type=float),
                 "min_distance_m": ParameterValue(min_distance_m, value_type=float),
                 "min_yaw_deg": ParameterValue(min_yaw_deg, value_type=float),
@@ -130,6 +140,11 @@ def generate_launch_description():
             DeclareLaunchArgument("camera_backend", default_value="pyav"),
             DeclareLaunchArgument("camera_show_image", default_value="false"),
             DeclareLaunchArgument("camera_calib_file", default_value=""),
+            DeclareLaunchArgument("camera_width", default_value="3840"),
+            DeclareLaunchArgument("camera_height", default_value="1200"),
+            DeclareLaunchArgument("camera_left_width", default_value="1920"),
+            DeclareLaunchArgument("camera_right_width", default_value="1920"),
+            DeclareLaunchArgument("camera_fps", default_value="30.0"),
             DeclareLaunchArgument("map_file_name", default_value=default_map_file),
             DeclareLaunchArgument("map_start_at_dock", default_value="true"),
             DeclareLaunchArgument("use_rviz", default_value="true"),

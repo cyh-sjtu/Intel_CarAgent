@@ -65,17 +65,45 @@ TaskStatus = Literal[
 TaskType = Literal["llm_action", "navigation_action", "decision"]
 
 
-NavigationTargetType = Literal["keyframe", "position", "task_output"]
+NavigationTargetType = Literal[
+    "keyframe",
+    "position",
+    "task_output",
+    "semantic_keyframe",
+    "semantic_object",
+]
+
+NavigationTargetSource = Literal[
+    "scene_memory",
+    "current_view",
+    "attached_image",
+    "arrived_scene",
+    "upstream_result",
+    "session_memory",
+    "explicit",
+]
+
+NavigationTargetKind = Literal["place", "object", "local_structure"]
+
+NavigationImageFocus = Literal["scene", "object"]
 
 
 class NavigationTarget(TypedDict):
     """Structured target contract for deterministic navigation actions."""
 
     type: NavigationTargetType
+    target_source: NotRequired[NavigationTargetSource]
+    target_kind: NotRequired[NavigationTargetKind]
+    image_focus: NotRequired[NavigationImageFocus]
     keyframe_id: NotRequired[int]
     position: NotRequired[list[float]]
     task_id: NotRequired[int]
     field: NotRequired[str]
+    query: NotRequired[str]
+    selection_policy: NotRequired[str]
+    object_description: NotRequired[str]
+    stop_distance_m: NotRequired[float]
+    inputs_from: NotRequired[Any]
 
 
 EventType = Literal[
@@ -113,6 +141,10 @@ class TaskResultItem(TypedDict):
     raw_output: NotRequired[str]
     decision: NotRequired[str]
     tool_name: NotRequired[str]
+    destination: NotRequired[dict[str, Any]]
+    selected_object: NotRequired[dict[str, Any]]
+    visual_observation: NotRequired[dict[str, Any]]
+    current_place_context: NotRequired[dict[str, Any]]
 
 
 class UserInputItem(TypedDict):
@@ -122,6 +154,7 @@ class UserInputItem(TypedDict):
     message_id: str
     content: str
     created_at: str
+    attached_images: NotRequired[list[dict[str, Any]]]
     original_content: NotRequired[str]
     resolved_referent_id: NotRequired[str]
     resolved_referent_ids: NotRequired[list[str]]
@@ -163,6 +196,10 @@ class BackgroundAnalysisItem(TypedDict):
     candidate_keyframe_ids: NotRequired[list[int]]
     candidate_keyframes: NotRequired[list[dict[str, Any]]]
     recommended_keyframe_id: NotRequired[int]
+    recommended_destination: NotRequired[dict[str, Any]]
+    destination_type: NotRequired[str]
+    object_preanalysis: NotRequired[dict[str, Any]]
+    failure_reason: NotRequired[str]
     recommendation_confidence: NotRequired[float]
     recommendation_reason: NotRequired[str]
     final_output: NotRequired[str]
@@ -217,6 +254,15 @@ class TaskItem(TypedDict):
     plan_id: NotRequired[str]
     user_input_id: NotRequired[str]
     depends_on: NotRequired[list[int]]
+    inputs_from: NotRequired[dict[str, Any]]
+    outputs: NotRequired[list[str]]
+    image_refs: NotRequired[list[str]]
+    resolver_kind: NotRequired[str]
+    primary_target: NotRequired[str]
+    scene_context: NotRequired[str]
+    selection_policy: NotRequired[str]
+    preanalysis_policy: NotRequired[str]
+    staging_task_id: NotRequired[int]
     parent_task_id: NotRequired[int]
     wait_for_event: NotRequired[EventType]
     result: NotRequired[list[TaskResultItem]]
@@ -246,6 +292,7 @@ class AsyncAgentState(TypedDict):
     ]
     active_navigation: NotRequired[dict[str, Any]]
     pending_navigation: NotRequired[dict[str, Any]]
+    navigation_arrival_receipts: NotRequired[list[dict[str, Any]]]
     current_plan_id: NotRequired[Optional[str]]
     turn_response_items: NotRequired[list[TurnResponseItem]]
     turn_response_type: NotRequired[Optional[TurnResponseType]]
@@ -279,7 +326,10 @@ __all__ = [
     "BackgroundAnalysisStatus",
     "EventItem",
     "EventType",
+    "NavigationImageFocus",
     "NavigationTarget",
+    "NavigationTargetKind",
+    "NavigationTargetSource",
     "NextAction",
     "NavigationGroundingStage",
     "OrchestrateContext",

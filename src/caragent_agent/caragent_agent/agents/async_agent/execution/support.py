@@ -117,6 +117,11 @@ def issued_navigation_command(
                 data.get("planned_path") or data.get("target_keyframe_id") is not None
             ):
                 return True
+            if isinstance(data, dict) and (
+                data.get("nav2_dispatched") is True
+                or isinstance((data.get("approach") or {}).get("map_goal"), dict)
+            ):
+                return True
             continue
 
         lowered = content.lower()
@@ -147,6 +152,33 @@ def find_tool_failure_message(tool_trace: dict[str, Any]) -> Optional[str]:
             continue
         if tool_content_indicates_error(content):
             return f"{tool_result.get('name')}: {content}"
+    return None
+
+
+def find_tool_contract_violation_message(tool_trace: dict[str, Any]) -> Optional[str]:
+    """Return unrecoverable executor/tool-boundary violations.
+
+    These are not ordinary perception failures. They mean the model attempted
+    to use a tool outside the active task's exposed contract, so continuing the
+    same ReAct loop usually just repeats the same invalid call.
+    """
+
+    for tool_result in reversed(tool_trace.get("tool_results", [])):
+        tool_name = str(tool_result.get("name") or "").strip()
+        content = stringify_tool_content(tool_result.get("content", ""))
+        lowered = content.lower()
+        if "is not a valid tool" in lowered or "not a valid tool" in lowered:
+            return (
+                f"{tool_name}: attempted a tool outside this task's allowed tool "
+                "boundary. This task should finish or be replanned instead of "
+                "retrying the unavailable tool."
+            )
+        if "repetitive tool calls detected" in lowered:
+            return (
+                f"{tool_name}: repeated identical tool calls were rejected by the "
+                "model provider. This task should stop and expose the boundary "
+                "problem instead of continuing the loop."
+            )
     return None
 
 
@@ -192,6 +224,10 @@ def append_task_result(
     raw_output: Optional[str] = None,
     tool_name: Optional[str] = None,
     decision: Optional[str] = None,
+    destination: Optional[dict[str, Any]] = None,
+    selected_object: Optional[dict[str, Any]] = None,
+    visual_observation: Optional[dict[str, Any]] = None,
+    current_place_context: Optional[dict[str, Any]] = None,
 ) -> None:
     """Append a structured result entry to a task."""
 
@@ -207,6 +243,14 @@ def append_task_result(
         entry["tool_name"] = tool_name
     if decision is not None:
         entry["decision"] = decision
+    if destination:
+        entry["destination"] = destination
+    if selected_object:
+        entry["selected_object"] = selected_object
+    if visual_observation:
+        entry["visual_observation"] = visual_observation
+    if current_place_context:
+        entry["current_place_context"] = current_place_context
     result_entries.append(entry)
     task["result"] = result_entries
     task["updated_at"] = now_iso()
@@ -274,6 +318,11 @@ def navigation_state_for_task(task: Optional[TaskItem]) -> Optional[str]:
 def navigation_waiting_summary(task: Optional[TaskItem]) -> str:
     """Build a task-result summary for an issued navigation command."""
 
+    description = str((task or {}).get("description") or "").strip()
+    if description.lower().startswith(
+        ("approach ", "inspect ", "capture ", "photograph ", "navigate from ")
+    ):
+        return ensure_sentence_ending(f"I have started: {description}")
     destination_label = task_destination_label(task)
     return f"I am heading to {destination_label}."
 
@@ -281,6 +330,11 @@ def navigation_waiting_summary(task: Optional[TaskItem]) -> str:
 def navigation_arrival_summary(task: Optional[TaskItem]) -> str:
     """Build a task-result summary for a confirmed navigation arrival."""
 
+    description = str((task or {}).get("description") or "").strip()
+    if description.lower().startswith(
+        ("approach ", "inspect ", "capture ", "photograph ", "navigate from ")
+    ):
+        return ensure_sentence_ending(f"I have completed: {description}")
     destination_label = task_destination_label(task)
     return f"I have arrived at {destination_label}."
 
@@ -681,6 +735,86 @@ def calculate_distance_between_positions(
     )
 
 
+def submit_task_result(
+    summary: str = "",
+    destination: Any = None,
+    selected_object: Any = None,
+    visual_observation: Any = None,
+    current_place_context: Any = None,
+    confidence: Optional[float] = None,
+    failure_reason: str = "",
+) -> dict[str, Any]:
+    """Submit the current executor task's structured result.
+
+    This is a contract boundary, not a navigation or perception shortcut. It
+    lets the model hand structured task outputs to the async-agent runtime
+    without pretending that fields such as "destination" are tools.
+    """
+
+    def normalize_structured_field(value: Any) -> Any:
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                return {"text": text}
+            return parsed
+        return value
+
+    data: dict[str, Any] = {}
+    destination = normalize_structured_field(destination)
+    selected_object = normalize_structured_field(selected_object)
+    visual_observation = normalize_structured_field(visual_observation)
+    current_place_context = normalize_structured_field(current_place_context)
+
+    if destination:
+        data["destination"] = destination
+    if selected_object:
+        data["selected_object"] = selected_object
+    if visual_observation:
+        data["visual_observation"] = visual_observation
+    if current_place_context:
+        data["current_place_context"] = current_place_context
+    if confidence is not None:
+        try:
+            data["confidence"] = float(confidence)
+        except Exception:
+            data["confidence"] = confidence
+    if failure_reason:
+        data["failure_reason"] = str(failure_reason)
+
+    normalized_summary = str(summary or "").strip()
+    if not normalized_summary:
+        if destination:
+            normalized_summary = "Submitted a structured destination for the current task."
+        elif data:
+            normalized_summary = "Submitted a structured result for the current task."
+        else:
+            normalized_summary = "Submitted an empty structured result for the current task."
+
+    status = "partial" if failure_reason and not data.get("destination") else "ok"
+    return {
+        "status": status,
+        "summary": normalized_summary,
+        "data": data,
+        "error": (
+            {
+                "code": "submitted_failure_reason",
+                "message": str(failure_reason),
+            }
+            if failure_reason
+            else None
+        ),
+        "provenance": {
+            "source_type": "executor_contract",
+            "tool_name": "submit_task_result",
+            "contract_version": "tool_result_v1",
+        },
+    }
+
+
 def build_precision_support_tools(existing_tools: Sequence[BaseTool]) -> list[BaseTool]:
     """Add small deterministic helper tools that improve executor accuracy."""
 
@@ -698,6 +832,23 @@ def build_precision_support_tools(existing_tools: Sequence[BaseTool]) -> list[Ba
                 description=(
                     "Deterministically compute the Euclidean distance in meters between two numeric positions. "
                     "Use this instead of mental math whenever the task involves coordinates, lengths, or threshold comparisons."
+                ),
+            )
+        )
+
+    if "submit_task_result" not in existing_tool_names:
+        support_tools.append(
+            StructuredTool.from_function(
+                func=submit_task_result,
+                name="submit_task_result",
+                return_direct=True,
+                description=(
+                    "Submit the current task's final structured result to the runtime. "
+                    "Use this when the task has resolved fields such as destination, "
+                    "selected_object, visual_observation, or current_place_context. "
+                    "This is not a navigation command. For a keyframe destination, call "
+                    "submit_task_result(destination={\"type\":\"keyframe\",\"keyframe_id\":63}, "
+                    "summary=\"...\"). Do not invent tools named destination or selected_object."
                 ),
             )
         )

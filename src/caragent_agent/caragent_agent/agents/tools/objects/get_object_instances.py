@@ -1,4 +1,4 @@
-"""Object-level depth tools are disabled until CarAgent has depth memory."""
+"""Semantic object depth tools are disabled until CarAgent has depth memory."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ class _DepthUnavailableTool(ToolBase):
     def execute(self, *args, **kwargs):
         del args, kwargs
         return self.blocked(
-            "Object-level 3D analysis is unavailable because CarAgent v1 scene memory has no depth images.",
+            "Semantic object 3D analysis is unavailable because CarAgent v1 scene memory has no depth images.",
             error={
                 "code": "depth_unavailable",
                 "message": "Use keyframe image analysis or scene-memory search instead.",
@@ -22,7 +22,7 @@ class AnalyseWithObjectsOnSelectedKF(_DepthUnavailableTool):
     def __init__(self):
         super().__init__(
             name="analyse_objects_on_selected_keyframes",
-            description="Unavailable CarAgent v1 object-level 3D analysis tool.",
+            description="Unavailable CarAgent v1 semantic object 3D analysis tool.",
             capability_tags=("scene_memory_search", "background_safe"),
         )
 
@@ -31,6 +31,6 @@ class AnalyseWithObjectsTool(_DepthUnavailableTool):
     def __init__(self):
         super().__init__(
             name="analyse_objects",
-            description="Unavailable CarAgent v1 object-level 3D analysis tool.",
+            description="Unavailable CarAgent v1 semantic object 3D analysis tool.",
             capability_tags=("scene_memory_search", "background_safe"),
         )

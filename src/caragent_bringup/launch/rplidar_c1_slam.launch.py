@@ -303,8 +303,8 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "log_pc_debug",
-                default_value="true",
-                description="Log PCDBG lines returned by STM32.",
+                default_value="false",
+                description="Log PCDBG/RCDBG serial debug lines returned by STM32.",
             ),
             DeclareLaunchArgument(
                 "lidar_package",

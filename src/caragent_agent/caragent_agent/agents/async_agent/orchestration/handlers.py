@@ -22,6 +22,7 @@ from ..runtime.types import (
     TurnResponseType,
 )
 from ..runtime.control import record_decision_branch, set_background_enabled
+from ..target_resolution.session_anchors import record_anchor_from_navigation_arrival
 
 
 def normalize_next_action_value(
@@ -577,6 +578,139 @@ def proceed_to_next_task_from_context(
     )
 
 
+def _arrival_receipts(state: AsyncAgentState) -> list[dict[str, Any]]:
+    receipts = state.get("navigation_arrival_receipts", [])  # type: ignore[typeddict-item]
+    return [dict(item) for item in receipts if isinstance(item, dict)]
+
+
+def _same_position(left: Any, right: Any, *, tolerance_m: float = 0.5) -> bool:
+    if not isinstance(left, (list, tuple)) or not isinstance(right, (list, tuple)):
+        return False
+    if len(left) < 2 or len(right) < 2:
+        return False
+    try:
+        dx = float(left[0]) - float(right[0])
+        dy = float(left[1]) - float(right[1])
+    except Exception:
+        return False
+    return (dx * dx + dy * dy) ** 0.5 <= float(tolerance_m)
+
+
+def _find_matching_arrival_receipt(
+    state: AsyncAgentState,
+    event: EventItem,
+) -> Optional[dict[str, Any]]:
+    payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+    event_token = str(event.get("navigation_token") or payload.get("navigation_token") or "").strip()
+    event_task_id = event.get("task_id")
+    event_plan_id = str(event.get("plan_id") or "").strip()
+    event_has_structured_identity = bool(event_token or event_task_id is not None or event_plan_id)
+    reported_position = payload.get("reported_position")
+    for receipt in reversed(_arrival_receipts(state)):
+        receipt_token = str(receipt.get("navigation_token") or "").strip()
+        if event_token and receipt_token and event_token == receipt_token:
+            return receipt
+        if event_task_id is not None and receipt.get("task_id") == event_task_id:
+            receipt_plan_id = str(receipt.get("plan_id") or "").strip()
+            if not event_plan_id or not receipt_plan_id or event_plan_id == receipt_plan_id:
+                return receipt
+        receipt_has_structured_identity = bool(
+            receipt_token
+            or receipt.get("task_id") is not None
+            or str(receipt.get("plan_id") or "").strip()
+        )
+        if (
+            not event_has_structured_identity
+            and not receipt_has_structured_identity
+            and _same_position(reported_position, receipt.get("reported_position"))
+        ):
+            return receipt
+    return None
+
+
+def _remember_arrival_receipt(
+    state: AsyncAgentState,
+    event: EventItem,
+    *,
+    task: Optional[TaskItem],
+) -> None:
+    payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+    receipts = _arrival_receipts(state)
+    receipt = {
+        "decision": "accepted",
+        "event_id": event.get("event_id"),
+        "navigation_token": event.get("navigation_token") or payload.get("navigation_token"),
+        "task_id": event.get("task_id"),
+        "plan_id": event.get("plan_id") or (task or {}).get("plan_id"),
+        "user_input_id": event.get("user_input_id") or (task or {}).get("user_input_id"),
+        "reported_position": payload.get("reported_position"),
+        "destination_position": payload.get("destination_position"),
+        "accepted_at": event.get("created_at"),
+    }
+    receipts.append({key: value for key, value in receipt.items() if value not in (None, "", [], {})})
+    state["navigation_arrival_receipts"] = receipts[-20:]  # type: ignore[typeddict-item]
+
+
+def _arrival_gate_log(
+    logger: Any,
+    *,
+    decision: str,
+    reason: str,
+    event: EventItem,
+) -> None:
+    if not logger:
+        return
+    payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+    logger.log_foreground(
+        "Navigation arrival gate: decision={decision}; reason={reason}; "
+        "task_id={task_id}; plan_id={plan_id}; token={token}; reported={reported}; destination={destination}".format(
+            decision=decision,
+            reason=reason,
+            task_id=event.get("task_id"),
+            plan_id=event.get("plan_id"),
+            token=event.get("navigation_token") or payload.get("navigation_token"),
+            reported=payload.get("reported_position"),
+            destination=payload.get("destination_position"),
+        )
+    )
+
+
+def _record_arrival_snapshot_anchor(
+    context: OrchestrateContext,
+    task: TaskItem,
+    event: EventItem,
+) -> None:
+    logger = context.get("logger")
+    try:
+        anchor = record_anchor_from_navigation_arrival(
+            context.get("shared_runtime_control"),
+            task=task,
+            event=event,
+            image_ref=(
+                (event.get("payload") or {}).get("arrival_image_ref")
+                if isinstance(event.get("payload"), dict)
+                else None
+            ),
+        )
+    except Exception as exc:
+        if logger:
+            try:
+                logger.log_foreground(
+                    f"arrival_snapshot_record_failed: {type(exc).__name__}: {exc}"
+                )
+            except Exception:
+                pass
+        return
+    if anchor and logger:
+        try:
+            logger.log_foreground(
+                "arrival_snapshot_recorded: "
+                + json.dumps(anchor, ensure_ascii=False, default=str)
+            )
+        except Exception:
+            pass
+
+
 def handle_plan_created_event(
     event: EventItem,
     context: OrchestrateContext,
@@ -744,7 +878,7 @@ def handle_task_waiting_event(
         if runtime_control is not None:
             set_background_enabled(runtime_control, True)
         if (
-            str(event.get("payload", {}).get("tool_name") or "") == "go_to_keyframe"
+            str(event.get("payload", {}).get("tool_name") or "") in {"go_to_keyframe", "go_to_position"}
             and build_pending_navigation_snapshot_fn is not None
         ):
             active_navigation = build_pending_navigation_snapshot_fn(
@@ -893,14 +1027,55 @@ def handle_navigation_arrived_event(
     tasks = context["tasks"]
     current_task_id = context["current_task_id"]
     run_memory = context.get("run_memory")
+    logger = context.get("logger")
+
+    def _clear_consumed_navigation_if_unchanged(
+        result_state: AsyncAgentState,
+    ) -> AsyncAgentState:
+        """Clear only the navigation snapshot consumed by this arrival event.
+
+        A navigation arrival can immediately advance into the next task, and that
+        task may dispatch a fresh navigation command in the same graph turn.  In
+        that case the downstream task_waiting handler has already replaced
+        active_navigation/pending_navigation; clearing unconditionally would
+        orphan the new navigation leg and its future arrival event.
+        """
+
+        event_token = str(event.get("navigation_token") or event.get("payload", {}).get("navigation_token") or "")
+        for key in ("active_navigation", "pending_navigation"):
+            navigation = result_state.get(key)
+            if not isinstance(navigation, dict):
+                continue
+            same_task = navigation.get("task_id") == event.get("task_id")
+            nav_token = str(navigation.get("navigation_token") or "")
+            same_token = bool(event_token and nav_token and nav_token == event_token)
+            if same_task or same_token:
+                result_state.pop(key, None)
+        return result_state
 
     arrived_task_id = event.get("task_id")
     if arrived_task_id is None:
         arrived_task_id = current_task_id
 
+    duplicate_receipt = _find_matching_arrival_receipt(state, event)
+    if duplicate_receipt is not None:
+        _arrival_gate_log(
+            logger,
+            decision="ignored_duplicate",
+            reason="arrival_already_consumed",
+            event=event,
+        )
+        return mark_event_processed_from_context({**state}, event, context)
+
     if arrived_task_id is not None and arrived_task_id in tasks:
         arrived_task_status = str(tasks[arrived_task_id].get("status") or "").lower()
         if arrived_task_status == "completed":
+            _arrival_gate_log(
+                logger,
+                decision="ignored_duplicate",
+                reason="task_already_completed",
+                event=event,
+            )
             return mark_event_processed_from_context({**state}, event, context)
 
     active_navigation = state.get("active_navigation")
@@ -910,10 +1085,22 @@ def handle_navigation_arrived_event(
         arrived_task_can_complete = (
             candidate_task.get("status") == "waiting"
             and candidate_task.get("wait_for_event") == "navigation_arrived"
+            and (
+                not event.get("plan_id")
+                or not candidate_task.get("plan_id")
+                or str(event.get("plan_id")) == str(candidate_task.get("plan_id"))
+            )
         )
 
     if arrived_task_id is not None and arrived_task_id in tasks and arrived_task_can_complete:
         arrived_task = tasks[arrived_task_id]
+        _arrival_gate_log(
+            logger,
+            decision="accepted",
+            reason="matched_waiting_navigation",
+            event=event,
+        )
+        _remember_arrival_receipt(state, event, task=arrived_task)
         latest_result = (
             (arrived_task.get("result") or [])[-1]
             if arrived_task.get("result")
@@ -922,6 +1109,7 @@ def handle_navigation_arrived_event(
         arrival_summary = navigation_arrival_summary(arrived_task)
         if arrived_task.get("inserted"):
             arrived_task["status"] = "completed"
+            _record_arrival_snapshot_anchor(context, arrived_task, event)
             if run_memory:
                 try:
                     run_memory.record_task_result(
@@ -942,8 +1130,7 @@ def handle_navigation_arrived_event(
                 source_event_type=str(event.get("type") or ""),
                 task_id=arrived_task_id,
             )
-            result_state.pop("active_navigation", None)
-            result_state.pop("pending_navigation", None)
+            result_state = _clear_consumed_navigation_if_unchanged(result_state)
             return mark_event_processed_from_context(result_state, event, context)
 
         arrived_task["status"] = "completed"
@@ -951,6 +1138,7 @@ def handle_navigation_arrived_event(
         arrival_payload["destination_description"] = str(
             arrived_task.get("description") or ""
         ).strip()
+        _record_arrival_snapshot_anchor(context, arrived_task, event)
         latest_summary = str(latest_result.get("summary") or "").strip() if latest_result else ""
         if arrival_summary and arrival_summary != latest_summary:
             append_task_result(
@@ -987,11 +1175,16 @@ def handle_navigation_arrived_event(
             tasks,
             context,
         )
-        result_state.pop("active_navigation", None)
-        result_state.pop("pending_navigation", None)
+        result_state = _clear_consumed_navigation_if_unchanged(result_state)
         return mark_event_processed_from_context(result_state, event, context)
 
     if isinstance(active_navigation, dict) and event.get("task_id") == active_navigation.get("task_id"):
+        _arrival_gate_log(
+            logger,
+            decision="ignored_stale",
+            reason="active_navigation_not_waiting",
+            event=event,
+        )
         result_state = {
             **state,
             "active_navigation": None,
@@ -1000,6 +1193,12 @@ def handle_navigation_arrived_event(
         result_state.pop("pending_navigation", None)
         return mark_event_processed_from_context(result_state, event, context)
 
+    _arrival_gate_log(
+        logger,
+        decision="ignored_stale",
+        reason="no_matching_waiting_navigation",
+        event=event,
+    )
     return mark_event_processed_from_context({**state}, event, context)
 
 
@@ -1012,7 +1211,28 @@ def handle_navigation_arrival_unmatched_event(
     state = context["state"]
     logger = context.get("logger")
     payload = event.get("payload", {})
-    if logger:
+    duplicate_receipt = _find_matching_arrival_receipt(state, event)
+    decision = "ignored_duplicate" if duplicate_receipt is not None else "ignored_stale"
+    reason = (
+        "arrival_already_consumed"
+        if duplicate_receipt is not None
+        else str(payload.get("unmatched_reason") or "unmatched_arrival")
+    )
+    if (
+        duplicate_receipt is None
+        and reason == "task_not_waiting"
+        and payload.get("orphaned_waiting_navigation")
+        and payload.get("match_distance_meters") is not None
+        and payload.get("match_tolerance_meters") is not None
+    ):
+        try:
+            if float(payload.get("match_distance_meters")) <= float(payload.get("match_tolerance_meters")):
+                decision = "ignored_late_duplicate"
+                reason = "arrival_after_task_completed"
+        except Exception:
+            pass
+    _arrival_gate_log(logger, decision=decision, reason=reason, event=event)
+    if logger and decision not in {"ignored_duplicate", "ignored_late_duplicate"}:
         logger.log_foreground(
             "Orchestrate: Ignoring unmatched navigation arrival; reason={reason}, reported={reported}, destination={destination}".format(
                 reason=payload.get("unmatched_reason"),
@@ -1053,8 +1273,10 @@ def handle_user_input_received_event(
     shared_runtime_control = context["shared_runtime_control"]
     run_memory = context.get("run_memory")
 
-    user_input = str(event.get("payload", {}).get("content", ""))
+    payload = event.get("payload", {}) or {}
+    user_input = str(payload.get("content", ""))
     user_input_id = event.get("user_input_id")
+    attached_images = list(payload.get("attached_images") or [])
     user_inputs = list(state.get("user_inputs", []))
     if logger:
         logger.log_foreground(
@@ -1067,6 +1289,21 @@ def handle_user_input_received_event(
         is_require_planning_fn(user_input, context["llm"])
     )
     requires_plan = bool(planning_decision.get("requires_planning"))
+    if logger:
+        logger.log_foreground(
+            "Orchestrate: planning gate requires_planning={requires}; reason={reason}; task_type={task_type}".format(
+                requires=requires_plan,
+                reason=planning_decision.get("reason"),
+                task_type=planning_decision.get("task_type"),
+            )
+        )
+    if attached_images and not requires_plan:
+        planning_decision = {**planning_decision, "requires_planning": True}
+        requires_plan = True
+        if logger:
+            logger.log_foreground(
+                "Orchestrate: attached_images present; routing through planner so image_refs can be assigned explicitly."
+            )
 
     if requires_plan:
         relation_decision = relation_classifier_fn(

@@ -43,6 +43,7 @@ def collect_plan_scope_snapshot(
                 "is_current": task_id == current_task_id,
                 "next_task_id": task.get("next_task_id"),
                 "branches": task.get("branches"),
+                "image_refs": task.get("image_refs", []),
                 "wait_for_event": task.get("wait_for_event"),
                 "latest_result_summary": latest_result.get("summary")
                 if latest_result
@@ -178,8 +179,9 @@ def build_plan_editing_messages(
                 + "- Return JSON only with this schema: {\"edit_type\":\"insert_after_current|replan_future_after_current\",\"rationale\":\"short reason\",\"resume\":\"original_next|none\",\"tasks\":[...]}.\n"
                 + "- `tasks` contains only the new inserted/future subgraph, not completed tasks and not the current task.\n"
                 + "- The current task is protected. Do not try to edit, cancel, replace, or include it in the returned tasks.\n"
-                + "- Task format: {\"task_id\":101,\"description\":\"...\",\"task_type\":\"llm_action\",\"next_task_id\":102,\"depends_on\":[]}.\n"
+                + "- Task format: {\"task_id\":101,\"description\":\"...\",\"task_type\":\"llm_action\",\"next_task_id\":102,\"depends_on\":[],\"image_refs\":[\"latest\"]}.\n"
                 + "- Supported task_type values: llm_action, navigation_action, decision.\n"
+                + "- Include image_refs only on tasks that must inspect an attached user image.\n"
                 + "- For navigation_action, include a structured target when the destination is already resolved: {\"type\":\"keyframe\",\"keyframe_id\":5}, {\"type\":\"position\",\"position\":[x,y,z]}, or {\"type\":\"task_output\",\"task_id\":101,\"field\":\"destination\"}.\n"
                 + "- For insert_after_current, new task ids only need to be unique inside `tasks`; the runtime will remap them. Use those local ids consistently in next_task_id, branches, depends_on, and target.task_id.\n"
                 + "- For replan_future_after_current, preserve existing future task ids from the plan snapshot for tasks that still represent the same work. Use fresh ids only for genuinely new future tasks.\n"

@@ -5,6 +5,9 @@ from typing import Any, Dict, List, Optional
 from caragent_agent.agents.tools.base.tool_base import ToolBase
 from caragent_agent.utils.llm_handler import UnifiedLLMClient
 
+DEFAULT_SEMANTIC_EXCERPT_CHARS = 500
+
+
 class GetKeyFrameNodesInfoTool(ToolBase):
     def __init__(self):
         super().__init__(
@@ -28,7 +31,11 @@ class GetKeyFrameNodesInfoTool(ToolBase):
                     get_orientation (bool): 
                         Include 3D orientation data. Default: False.
                     get_semantics (bool):
-                        Include semantic description. Default: False.
+                        Include semantic description. Default: False. By default this returns
+                        a compact excerpt, not the full semantic payload.
+                    semantic_mode (str):
+                        "excerpt" by default; use "full" only when complete debug-level
+                        semantics are explicitly needed.
 
                 Returns:
                     Dict[int, Dict]: Nested dictionary containing:
@@ -98,6 +105,12 @@ class GetKeyFrameNodesInfoTool(ToolBase):
                     f"Invalid keyframe node id value: {item!r}"
                 ) from exc
         return normalized_ids
+
+    def _semantic_excerpt(self, semantic: str, *, limit: int = DEFAULT_SEMANTIC_EXCERPT_CHARS) -> str:
+        text = str(semantic or "").strip()
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 3)].rstrip() + "..."
         
     def execute(self, 
             keyframe_nodes_id_list: Optional[List[int]] = None,
@@ -105,7 +118,8 @@ class GetKeyFrameNodesInfoTool(ToolBase):
             get_timestamp: bool = False,
             get_position: bool = False,
             get_orientation: bool = False,
-            get_semantics: bool = False) -> Dict[int, Dict]:
+            get_semantics: bool = False,
+            semantic_mode: str = "excerpt") -> Dict[int, Dict]:
         normalized_keyframe_nodes_id_list = self._normalize_keyframe_nodes_id_list(
             keyframe_nodes_id_list
         )
@@ -141,10 +155,20 @@ class GetKeyFrameNodesInfoTool(ToolBase):
                 )
 
             if get_semantics:
-                keyframe_node_meta['semantics'] = keyframe_node.semantic
+                mode = str(semantic_mode or "excerpt").strip().lower()
+                if mode == "full":
+                    keyframe_node_meta['semantics'] = keyframe_node.semantic
+                    keyframe_node_meta['semantics_mode'] = "full"
+                else:
+                    keyframe_node_meta['semantics_excerpt'] = self._semantic_excerpt(
+                        keyframe_node.semantic
+                    )
+                    keyframe_node_meta['semantics_mode'] = "excerpt"
+                    keyframe_node_meta['semantics_full_available'] = True
             info_dict[str(keyframe_nodes_id)] = keyframe_node_meta
 
         normalized_info = self.to_jsonable(info_dict)
+        mode = str(semantic_mode or "excerpt").strip().lower()
         return self.ok(
             "Retrieved keyframe-node metadata from scene memory.",
             data={
@@ -156,6 +180,7 @@ class GetKeyFrameNodesInfoTool(ToolBase):
                     "get_position": bool(get_position),
                     "get_orientation": bool(get_orientation),
                     "get_semantics": bool(get_semantics),
+                    "semantic_mode": "full" if mode == "full" else "excerpt",
                 },
             },
             provenance={"source_type": "scene_memory"},

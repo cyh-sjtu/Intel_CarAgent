@@ -63,7 +63,7 @@ class Stm32DriverNode(Node):
         self.declare_parameter("max_linear_mps", 0.12)
         self.declare_parameter("max_angular_radps", 0.8)
         self.declare_parameter("log_cmd_serial", False)
-        self.declare_parameter("log_pc_debug", True)
+        self.declare_parameter("log_pc_debug", False)
 
         self._odom_frame = self.get_parameter("odom_frame").get_parameter_value().string_value
         self._base_frame = self.get_parameter("base_frame").get_parameter_value().string_value
@@ -88,6 +88,7 @@ class Stm32DriverNode(Node):
         self._last_cmd_sent = None
         self._last_cmd_log_time = 0.0
         self._pc_debug_count = 0
+        self._rc_debug_count = 0
 
         self._connect_serial()
 
@@ -305,6 +306,8 @@ class Stm32DriverNode(Node):
                 "remote_turn": int(parts[15]) if len(parts) > 15 else 0,
                 "remote_linear_cmd": int(parts[16]) if len(parts) > 16 else 0,
                 "remote_turn_cmd": int(parts[17]) if len(parts) > 17 else 0,
+                "remote_linear_limit": int(parts[18]) if len(parts) > 18 else 0,
+                "remote_turn_limit": int(parts[19]) if len(parts) > 19 else 0,
             }
         except ValueError:
             self.get_logger().warn(f"malformed PCDBG line: {line}")
@@ -318,8 +321,41 @@ class Stm32DriverNode(Node):
                 f"cmd=({data['v']},{data['w']}) source={data['source']} "
                 f"rpm=({data['left_rpm']},{data['right_rpm']}) "
                 f"remote=(armed={data['remote_armed']} raw={data['remote_linear']},{data['remote_turn']} "
-                f"cmd={data['remote_linear_cmd']},{data['remote_turn_cmd']}) "
+                f"cmd={data['remote_linear_cmd']},{data['remote_turn_cmd']} "
+                f"limit={data['remote_linear_limit']},{data['remote_turn_limit']}) "
                 f"last_byte=0x{data['last_byte']:02X}"
+            )
+
+        return True
+
+    def _handle_rc_debug_line(self, line: str) -> bool:
+        line = line.strip()
+        if not line.startswith("RCDBG,"):
+            return False
+
+        self._rc_debug_count += 1
+        if not self.get_parameter("log_pc_debug").get_parameter_value().bool_value:
+            return True
+
+        parts = line.split(",")
+        if len(parts) < 19:
+            self.get_logger().warn(f"malformed RCDBG line: {line}")
+            return True
+
+        try:
+            t_ms = int(parts[1])
+            frames = int(parts[2])
+            channels = [int(value) for value in parts[3:19]]
+        except ValueError:
+            self.get_logger().warn(f"malformed RCDBG line: {line}")
+            return True
+
+        if self._rc_debug_count <= 5 or self._rc_debug_count % 4 == 0:
+            channel_text = " ".join(
+                f"ch{index + 1}={value}" for index, value in enumerate(channels)
+            )
+            self.get_logger().info(
+                f"rcdbg t={t_ms} frames={frames} {channel_text}"
             )
 
         return True
@@ -351,6 +387,8 @@ class Stm32DriverNode(Node):
                 self.get_logger().info(f"raw serial line: {line.strip()}")
 
             if self._handle_pc_debug_line(line):
+                continue
+            if self._handle_rc_debug_line(line):
                 continue
 
             parsed = self._parse_line(line)

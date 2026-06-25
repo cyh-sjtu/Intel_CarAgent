@@ -6,17 +6,19 @@
 
 | 话题 | 内容 |
 |------|------|
-| `/stereo/image_raw` | 原始拼接图（1280×480） |
-| `/stereo/left/image_raw` | 左目图像（640×480） |
-| `/stereo/right/image_raw` | 右目图像（640×480） |
+| `/stereo/image_raw` | 原始拼接图（默认 3840×1200） |
+| `/stereo/left/image_raw` | 左目图像（默认 1920×1200） |
+| `/stereo/right/image_raw` | 右目图像（默认 1920×1200） |
 
 ## 启动
 
 ```bash
 ros2 launch caragent_vision huibo_stereo_camera.launch.py \
   device:=/dev/video0 \
-  width:=1280 \
-  height:=480 \
+  width:=3840 \
+  height:=1200 \
+  left_width:=1920 \
+  right_width:=1920 \
   fps:=30.0 \
   show_image:=true
 ```

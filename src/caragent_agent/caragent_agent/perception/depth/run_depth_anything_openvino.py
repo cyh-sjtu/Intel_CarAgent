@@ -15,6 +15,8 @@ from PIL import Image
 DEFAULT_MODEL_DIR = Path("/home/car/caragent_ws/models/depth_anything_v2_openvino")
 DEFAULT_OUTPUT_DIR = Path("/home/car/caragent_ws/perception_outputs/depth_anything")
 RESAMPLING = getattr(Image, "Resampling", Image)
+DEFAULT_OPENVINO_EXPORT_WIDTH = 686
+DEFAULT_OPENVINO_EXPORT_HEIGHT = 518
 
 
 def normalize_depth(depth: np.ndarray) -> np.ndarray:
@@ -48,8 +50,9 @@ def colorize_depth(depth_u8: np.ndarray) -> np.ndarray:
 
 class DepthAnythingOpenVINO:
     def __init__(self, model_dir: str | Path = DEFAULT_MODEL_DIR, device: str = "CPU") -> None:
-        import openvino as ov
         from transformers import AutoImageProcessor
+
+        from caragent_agent.perception.openvino_utils import create_openvino_core
 
         self.model_dir = Path(model_dir)
         self.device = device
@@ -57,13 +60,27 @@ class DepthAnythingOpenVINO:
         if not self.model_xml.exists():
             raise FileNotFoundError(self.model_xml)
         self.processor = AutoImageProcessor.from_pretrained(self.model_dir)
-        core = ov.Core()
+        core = create_openvino_core()
         self.compiled_model = core.compile_model(str(self.model_xml), device)
         self.input_name = self.compiled_model.input(0).get_any_name()
         self.output_port = self.compiled_model.output(0)
+        size = getattr(self.processor, "size", {}) or {}
+        processor_height = int(size.get("height") or size.get("shortest_edge") or DEFAULT_OPENVINO_EXPORT_HEIGHT)
+        processor_width = int(size.get("width") or size.get("shortest_edge") or DEFAULT_OPENVINO_EXPORT_HEIGHT)
+        if processor_height == processor_width == DEFAULT_OPENVINO_EXPORT_HEIGHT:
+            self.input_height = DEFAULT_OPENVINO_EXPORT_HEIGHT
+            self.input_width = DEFAULT_OPENVINO_EXPORT_WIDTH
+        else:
+            self.input_height = processor_height
+            self.input_width = processor_width
 
     def predict(self, image: Image.Image) -> tuple[np.ndarray, float]:
-        inputs = self.processor(images=image, return_tensors="np")
+        # The exported OpenVINO IR is reliable with the processor's square
+        # training/export size. High-resolution live frames can otherwise make
+        # DPTImageProcessor keep aspect ratio and produce shapes that trip
+        # positional broadcast nodes inside the IR.
+        model_image = image.resize((self.input_width, self.input_height), resample=RESAMPLING.BICUBIC)
+        inputs = self.processor(images=model_image, return_tensors="np", do_resize=False)
         pixel_values = np.asarray(inputs["pixel_values"], dtype=np.float32)
         start = time.perf_counter()
         outputs = self.compiled_model({self.input_name: pixel_values})

@@ -160,8 +160,9 @@ class GroundingDINOOpenVINO:
         model_id: str = DEFAULT_MODEL_ID,
         device: str = "CPU",
     ) -> None:
-        import openvino as ov
         from transformers import AutoProcessor, AutoTokenizer
+
+        from caragent_agent.perception.openvino_utils import create_openvino_core
 
         self.model_dir = Path(model_dir)
         self.model_id = model_id
@@ -180,7 +181,7 @@ class GroundingDINOOpenVINO:
             self.tokenizer = getattr(self.processor, "tokenizer", None)
         if self.tokenizer is None:
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir)
-        core = ov.Core()
+        core = create_openvino_core()
         self.compiled_model = core.compile_model(str(self.model_xml), device)
         self.input_names = [inp.get_any_name() for inp in self.compiled_model.inputs]
         self.image_input_size = self._load_image_input_size()

@@ -20,6 +20,7 @@ LLM_API_CONFIG_NAME = "llm_api.yaml"
 PROFILE_ENV_VAR = "CARAGENT_PROFILE"
 LOCAL_CONFIG_ENV_VAR = "CARAGENT_CONFIG_FILE"
 BASE_CONFIG_ENV_VAR = "CARAGENT_BASE_CONFIG_FILE"
+EXTRA_CONFIG_ENV_VAR = "CARAGENT_EXTRA_CONFIG_FILE"
 
 API_ENV_BY_PROVIDER = {
     "qwen": "DASHSCOPE_API_KEY",
@@ -105,6 +106,13 @@ def _local_config_path() -> Path:
     return CONFIG_DIR / LOCAL_CONFIG_NAME
 
 
+def _extra_config_path() -> Path | None:
+    override = os.environ.get(EXTRA_CONFIG_ENV_VAR, "").strip()
+    if not override:
+        return None
+    return Path(override).expanduser().resolve()
+
+
 def _selected_profile_name(data: dict[str, Any]) -> str:
     env_profile = os.environ.get(PROFILE_ENV_VAR, "").strip()
     if env_profile:
@@ -161,8 +169,10 @@ def load_config() -> dict[str, Any]:
 
     local_path = _local_config_path()
     local_data = _read_yaml(local_path) if local_path.exists() else {}
+    extra_path = _extra_config_path()
+    extra_data = _read_yaml(extra_path) if extra_path and extra_path.exists() else {}
 
-    provisional_data = deep_merge(base_data, local_data)
+    provisional_data = deep_merge(deep_merge(base_data, local_data), extra_data)
     profile_name = _selected_profile_name(provisional_data)
     profile_data: dict[str, Any] = {}
     if profile_name:
@@ -189,6 +199,7 @@ def load_config() -> dict[str, Any]:
     if profile_data:
         data = deep_merge(data, profile_data)
         data["active_profile"] = profile_name
+    data = deep_merge(data, extra_data)
 
     # Keep the local secret-only file supported and ignored by version control.
     llm_api_path = CONFIG_DIR / LLM_API_CONFIG_NAME

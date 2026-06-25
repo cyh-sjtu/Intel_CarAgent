@@ -296,6 +296,27 @@ def _normalize_new_task(
                 field_name="task.target.task_id",
             )
         normalized_task["target"] = target
+    if isinstance(raw_task.get("image_refs"), list):
+        normalized_task["image_refs"] = [
+            str(value).strip()
+            for value in raw_task["image_refs"]
+            if str(value).strip()
+        ]
+    if isinstance(raw_task.get("outputs"), list):
+        normalized_task["outputs"] = [
+            str(value).strip()
+            for value in raw_task["outputs"]
+            if str(value).strip()
+        ]
+    if isinstance(raw_task.get("inputs_from"), dict):
+        normalized_task["inputs_from"] = dict(raw_task["inputs_from"])
+    for optional_key in (
+        "scene_context",
+        "selection_policy",
+    ):
+        optional_value = raw_task.get(optional_key)
+        if optional_value is not None and str(optional_value).strip():
+            normalized_task[optional_key] = str(optional_value).strip()
     return normalized_task
 
 

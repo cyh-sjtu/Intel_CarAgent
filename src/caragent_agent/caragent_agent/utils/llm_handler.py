@@ -31,6 +31,10 @@ class LLMCallbackHandler(AsyncCallbackHandler):
     async def on_llm_start(self, serialized: Dict[str, Any], prompts: List[str], **kwargs) -> None:
         self.stats['total_calls'] += 1
         logging.info(f"LLM call started: {serialized.get('name', 'unknown')}")
+
+    async def on_chat_model_start(self, serialized: Dict[str, Any], messages: List[Any], **kwargs) -> None:
+        self.stats['total_calls'] += 1
+        logging.info(f"Chat model call started: {serialized.get('name', 'unknown')}")
     
     async def on_llm_end(self, response, **kwargs) -> None:
         # Track token usage when available
@@ -64,7 +68,10 @@ class UnifiedLLMClient:
         dashscope_api_key = ensure_api_key_env("qwen")
         deepseek_api_key = ensure_api_key_env("deepseek")
         doubao_api_key = ensure_api_key_env("doubao")
-        request_timeout = float(config.get("llm_request_timeout_sec", 25))
+        raw_request_timeout = config.get("llm_request_timeout_sec", 25)
+        if isinstance(raw_request_timeout, dict):
+            raw_request_timeout = raw_request_timeout.get("default", 25)
+        default_request_timeout = float(raw_request_timeout)
         max_retries = int(config.get("llm_max_retries", 1))
 
         # Only initialize providers that are actually configured so local
@@ -87,7 +94,7 @@ class UnifiedLLMClient:
                     base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
                     model=self._get_qwen_model_id(model_name),
                     temperature=0.0,
-                    timeout=request_timeout,
+                    timeout=self._request_timeout_for_model(model_name, default_request_timeout),
                     max_retries=max_retries,
                     callbacks=[self.callback_handler]
                 )
@@ -104,7 +111,7 @@ class UnifiedLLMClient:
                     base_url="https://api.deepseek.com/v1",
                     model=self._get_deepseek_model_id(model_name),
                     temperature=0.0,
-                    timeout=request_timeout,
+                    timeout=self._request_timeout_for_model(model_name, default_request_timeout),
                     max_retries=max_retries,
                     callbacks=[self.callback_handler]
                 )
@@ -117,7 +124,7 @@ class UnifiedLLMClient:
                     base_url="https://ark.cn-beijing.volces.com/api/v3",
                     model=self._get_doubao_model_id(model_name),
                     temperature=0.0,
-                    timeout=request_timeout,
+                    timeout=self._request_timeout_for_model(model_name, default_request_timeout),
                     max_retries=max_retries,
                     callbacks=[self.callback_handler]
                 )
@@ -276,6 +283,43 @@ class UnifiedLLMClient:
             return int(value)
         except Exception:
             return default
+
+    def _configured_float(
+        self,
+        key: str,
+        lookup_key: str,
+        default: float,
+        *,
+        secondary_lookup_key: Optional[str] = None,
+    ) -> float:
+        """Read either scalar or mapping-style float config values."""
+
+        raw_value = config.get(key, default)
+        if isinstance(raw_value, dict):
+            value = raw_value.get(lookup_key)
+            if value is None and secondary_lookup_key:
+                value = raw_value.get(secondary_lookup_key)
+            if value is None:
+                value = raw_value.get("default", default)
+        else:
+            value = raw_value
+
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
+
+    def _request_timeout_for_model(self, model_name: str, default: float) -> float:
+        provider = self._provider_for_model(model_name)
+        return max(
+            1.0,
+            self._configured_float(
+                "llm_request_timeout_sec",
+                model_name,
+                default,
+                secondary_lookup_key=provider,
+            ),
+        )
 
     @classmethod
     def _get_shared_limiter(

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
+import mimetypes
 import re
 import threading
 import time
@@ -37,7 +39,6 @@ from caragent_agent.impression_graph.scene_memory import SceneMemory
 from caragent_agent.io_adapters import (
     adapt_turn_result_language,
     current_controller_image,
-    detect_language,
     describe_image_for_navigation,
     image_from_data_url,
     image_to_data_url,
@@ -47,6 +48,314 @@ from caragent_agent.io_adapters import (
 
 DEFAULT_DATASET_DIR = get_default_scene_dataset_dir()
 LOG_ENTRY_START_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\]")
+CHECKPOINT_SCHEMA_VERSION = 1
+CHECKPOINT_STATE_KEYS = (
+    "tasks",
+    "current_task_id",
+    "current_plan_id",
+    "next_action",
+    "background_results",
+    "events",
+    "processed_event_ids",
+    "user_inputs",
+    "active_navigation",
+    "pending_navigation",
+    "navigation_arrival_receipts",
+    "turn_response_items",
+    "turn_response_type",
+    "turn_response_text",
+    "turn_response_id",
+    "user_facing_response",
+    "user_facing_response_id",
+    "error_message",
+)
+ACTIVE_TASK_STATUSES = {"pending", "in_progress", "running", "waiting"}
+
+
+def file_to_data_url(path: Path) -> str:
+    """Encode one local image file as a browser data URL."""
+
+    mime_type = mimetypes.guess_type(str(path))[0] or "image/jpeg"
+    data = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{mime_type};base64,{data}"
+
+
+def _safe_checkpoint_name(thread_id: str) -> str:
+    """Return a filesystem-safe checkpoint stem for one LangGraph thread."""
+
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(thread_id or "").strip())
+    return safe_name.strip("._") or "web_console"
+
+
+def _default_checkpoint_path(thread_id: str) -> Path:
+    """Return the default persisted Web UI checkpoint path."""
+
+    log_dir = normalize_runtime_path(config.get("log_dir", "logs"))
+    return log_dir / "web_checkpoints" / f"{_safe_checkpoint_name(thread_id)}.json"
+
+
+def _json_safe(value: Any) -> Any:
+    """Convert runtime values into a compact JSON-safe checkpoint payload."""
+
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+
+    content = getattr(value, "content", None)
+    if content is not None:
+        return {
+            "type": value.__class__.__name__,
+            "content": str(content),
+        }
+    return str(value)
+
+
+def _int_keyed_dict(value: Any) -> dict[int, Any]:
+    """Coerce JSON-loaded string keys back to int keys where possible."""
+
+    if not isinstance(value, dict):
+        return {}
+
+    result: dict[int, Any] = {}
+    for raw_key, item in value.items():
+        try:
+            key = int(raw_key)
+        except (TypeError, ValueError):
+            continue
+        result[key] = item
+    return result
+
+
+def _state_for_checkpoint(state: dict[str, Any]) -> dict[str, Any]:
+    """Keep only UI-relevant state fields in the persisted checkpoint."""
+
+    if not isinstance(state, dict):
+        return {}
+    return {
+        key: _json_safe(state.get(key))
+        for key in CHECKPOINT_STATE_KEYS
+        if key in state
+    }
+
+
+def _normalize_checkpoint_state(state: Any) -> dict[str, Any]:
+    """Normalize JSON-loaded state into the runtime shape used by the UI."""
+
+    if not isinstance(state, dict):
+        return {}
+    normalized = dict(state)
+    normalized["tasks"] = _int_keyed_dict(normalized.get("tasks"))
+    normalized["background_results"] = _int_keyed_dict(
+        normalized.get("background_results")
+    )
+    next_action = normalized.get("next_action")
+    if not isinstance(next_action, dict):
+        normalized["next_action"] = {"type": "idle"}
+    return normalized
+
+
+def _state_has_thread_content(state: dict[str, Any]) -> bool:
+    """Return True when a live in-process graph state should take precedence."""
+
+    if not isinstance(state, dict) or not state:
+        return False
+    if state.get("messages") or state.get("tasks"):
+        return True
+    if state.get("current_plan_id") or state.get("current_task_id") is not None:
+        return True
+    if state.get("events") or state.get("user_inputs"):
+        return True
+    return False
+
+
+def _state_has_active_plan_residue(state: dict[str, Any]) -> bool:
+    """Return True when a restored checkpoint contains in-flight task state."""
+
+    if not isinstance(state, dict):
+        return False
+    if state.get("current_plan_id") or state.get("current_task_id") is not None:
+        return True
+    next_action = state.get("next_action")
+    if isinstance(next_action, dict) and next_action.get("type") not in (None, "", "idle"):
+        return True
+    if state.get("active_navigation") or state.get("pending_navigation"):
+        return True
+
+    tasks = state.get("tasks")
+    if not isinstance(tasks, dict):
+        return False
+    for task in tasks.values():
+        if not isinstance(task, dict):
+            continue
+        if str(task.get("status") or "").strip().lower() in ACTIVE_TASK_STATUSES:
+            return True
+    return False
+
+
+def _clear_resumed_runtime_state(state: dict[str, Any]) -> dict[str, Any]:
+    """Drop restored in-flight plan/task state so a restarted robot starts idle."""
+
+    if not isinstance(state, dict):
+        return {"tasks": {}, "current_task_id": None, "current_plan_id": None, "next_action": {"type": "idle"}}
+
+    return {
+        "tasks": {},
+        "current_task_id": None,
+        "current_plan_id": None,
+        "background_results": {},
+        "events": [],
+        "processed_event_ids": [],
+        "user_inputs": [],
+        "active_navigation": {},
+        "pending_navigation": {},
+        "navigation_arrival_receipts": [],
+        "next_action": {"type": "idle"},
+        "turn_response_items": [],
+        "turn_response_type": "none",
+        "turn_response_text": "",
+        "user_facing_response": "",
+    }
+
+
+def _normalize_checkpoint_turns(turns: Any) -> list[dict[str, Any]]:
+    """Load visible completed chat turns and drop interrupted in-flight turns."""
+
+    if not isinstance(turns, list):
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    for item in turns[-80:]:
+        if not isinstance(item, dict):
+            continue
+        turn = dict(item)
+        if str(turn.get("status") or "").strip().lower() == "running":
+            continue
+        normalized.append(turn)
+    return normalized
+
+
+def _checkpoint_payload_has_resume_content(payload: dict[str, Any]) -> bool:
+    """Return True when a checkpoint should ask the user to resume or start fresh."""
+
+    if not isinstance(payload, dict):
+        return False
+    if _normalize_checkpoint_turns(payload.get("turn_history")):
+        return True
+    checkpoint_state = _normalize_checkpoint_state(
+        payload.get("state_cache") or payload.get("state") or {}
+    )
+    return _state_has_thread_content(checkpoint_state)
+
+
+def _run_memory_record_matches(record: dict[str, Any], thread_id: str) -> bool:
+    """Return True when one run-memory row belongs to this Web thread."""
+
+    record_thread_id = str(record.get("thread_id") or "").strip()
+    return not record_thread_id or record_thread_id == str(thread_id)
+
+
+def _run_memory_state_for_checkpoint(data: dict[str, Any], thread_id: str) -> dict[str, Any]:
+    """Build a UI checkpoint state cache from a run-memory thread excerpt."""
+
+    threads = data.get("threads") if isinstance(data.get("threads"), dict) else {}
+    thread = threads.get(thread_id) if isinstance(threads.get(thread_id), dict) else {}
+    state_excerpt = (
+        thread.get("state_excerpt") if isinstance(thread.get("state_excerpt"), dict) else {}
+    )
+    tasks = {}
+    for task in list(state_excerpt.get("tasks") or []):
+        if not isinstance(task, dict):
+            continue
+        task_id = task.get("task_id")
+        if task_id is not None:
+            tasks[str(task_id)] = dict(task)
+    return {
+        "tasks": tasks,
+        "current_task_id": state_excerpt.get("current_task_id"),
+        "current_plan_id": state_excerpt.get("current_plan_id"),
+        "background_results": state_excerpt.get("background_results") or {},
+        "events": state_excerpt.get("recent_events") or [],
+        "processed_event_ids": [],
+        "user_inputs": [],
+        "active_navigation": {},
+        "pending_navigation": {},
+        "navigation_arrival_receipts": [],
+        "next_action": state_excerpt.get("next_action") or {"type": "idle"},
+        "turn_response_items": state_excerpt.get("turn_response_items") or [],
+        "turn_response_type": state_excerpt.get("turn_response_type") or "none",
+        "turn_response_text": state_excerpt.get("turn_response_text") or "",
+        "user_facing_response": state_excerpt.get("user_facing_response") or "",
+    }
+
+
+def _run_memory_turn_history(data: dict[str, Any], thread_id: str) -> list[dict[str, Any]]:
+    """Convert completed run-memory turns into visible Web turn history."""
+
+    completed = [
+        item
+        for item in list(data.get("turns") or [])
+        if isinstance(item, dict)
+        and _run_memory_record_matches(item, thread_id)
+        and str(item.get("status") or "").strip() == "completed"
+    ]
+    history: list[dict[str, Any]] = []
+    for index, item in enumerate(completed[-80:], start=1):
+        role = str(item.get("role") or "user")
+        history.append(
+            {
+                "turn_id": index,
+                "role": role,
+                "role_label": "System" if role == "system" else "User Instruction",
+                "source": "restored-run-memory",
+                "content": str(item.get("message") or ""),
+                "response": str(item.get("turn_response_text") or ""),
+                "response_items": item.get("response_items") or [],
+                "created_at": item.get("recorded_at") or "",
+                "updated_at": item.get("recorded_at") or "",
+                "finished_at": item.get("recorded_at") or "",
+                "visited_nodes": item.get("visited_nodes") or [],
+                "step_trace": item.get("step_trace") or [],
+                "status": "completed",
+                "live_node": "",
+                "turn_response_type": str(item.get("turn_response_type") or ""),
+                "saw_plan_node": bool(item.get("saw_plan_node")),
+                "saw_navigation_activity": bool(item.get("saw_navigation_activity")),
+            }
+        )
+    return history
+
+
+def _checkpoint_payload_from_run_memory_snapshot(
+    snapshot_path: Path,
+    *,
+    thread_id: str,
+) -> dict[str, Any]:
+    """Build a checkpoint payload from one persisted run-memory snapshot."""
+
+    data = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"Run-memory snapshot is not an object: {snapshot_path}")
+    now = _now_display()
+    history = _run_memory_turn_history(data, thread_id)
+    return {
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "thread_id": thread_id,
+        "saved_at": now,
+        "updated_at": now,
+        "input_language": "zh",
+        "output_language": "zh",
+        "turn_counter": len(history),
+        "turn_history": history,
+        "state_cache": _run_memory_state_for_checkpoint(data, thread_id),
+        "run_memory_snapshot_path": str(snapshot_path),
+        "latest_error": None,
+    }
+
 
 APP_HTML = """<!doctype html>
 <html lang="en">
@@ -132,6 +441,53 @@ APP_HTML = """<!doctype html>
       border: 1px solid rgba(137, 103, 71, 0.16);
       color: var(--muted);
       font-size: 13px;
+    }
+
+    .session-choice {
+      display: none;
+      gap: 12px;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px;
+      border-radius: 8px;
+      border: 1px solid rgba(56, 116, 93, 0.18);
+      background: rgba(244,255,249,0.9);
+    }
+
+    .session-choice-main {
+      min-width: 0;
+      display: grid;
+      gap: 4px;
+    }
+
+    .session-choice-main strong {
+      font-size: 13px;
+      color: var(--ok);
+    }
+
+    .session-choice-main span {
+      color: var(--muted);
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+
+    .session-resume-select {
+      width: min(520px, 100%);
+      max-width: 100%;
+      margin-top: 4px;
+      border-radius: 8px;
+      border: 1px solid rgba(56, 116, 93, 0.18);
+      background: rgba(255,255,255,0.9);
+      color: var(--text);
+      padding: 8px 10px;
+      font-size: 13px;
+    }
+
+    .session-choice-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
     }
 
     .layout {
@@ -484,12 +840,32 @@ APP_HTML = """<!doctype html>
       background: rgba(255,255,255,0.72);
     }
 
+    .agent-capture-preview {
+      display: none;
+      gap: 12px;
+      align-items: flex-start;
+      margin-bottom: 10px;
+      padding: 10px;
+      border: 1px solid rgba(56, 116, 93, 0.16);
+      border-radius: 14px;
+      background: rgba(244,255,249,0.76);
+    }
+
     .image-preview img {
       width: 132px;
       height: 88px;
       object-fit: cover;
       border-radius: 10px;
       border: 1px solid rgba(137, 103, 71, 0.16);
+      background: white;
+    }
+
+    .agent-capture-preview img {
+      width: 132px;
+      height: 88px;
+      object-fit: cover;
+      border-radius: 10px;
+      border: 1px solid rgba(56, 116, 93, 0.18);
       background: white;
     }
 
@@ -501,6 +877,53 @@ APP_HTML = """<!doctype html>
       line-height: 1.45;
       white-space: pre-wrap;
       overflow-wrap: anywhere;
+    }
+
+    .image-preview-body {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .image-preview-status {
+      display: inline-flex;
+      align-self: flex-start;
+      padding: 4px 8px;
+      border-radius: 999px;
+      background: rgba(137, 103, 71, 0.1);
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+
+    .image-preview-status.attached {
+      background: rgba(56, 116, 93, 0.12);
+      color: var(--ok);
+    }
+
+    .image-preview-actions {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      align-items: flex-end;
+    }
+
+    .image-preview-actions .mini-btn {
+      white-space: nowrap;
+    }
+
+    .mini-btn.icon-btn {
+      width: 30px;
+      height: 30px;
+      padding: 0;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 16px;
+      line-height: 1;
     }
 
     .side {
@@ -976,6 +1399,9 @@ APP_HTML = """<!doctype html>
       .hero { padding: 18px; }
       .summary-grid { grid-template-columns: repeat(2, minmax(120px, 1fr)); }
       .composer-top { grid-template-columns: 1fr 1fr; }
+      .session-choice { align-items: stretch; flex-direction: column; }
+      .session-choice-actions { justify-content: stretch; }
+      .session-choice-actions .btn { flex: 1; }
     }
   </style>
 </head>
@@ -989,6 +1415,7 @@ APP_HTML = """<!doctype html>
       <div class="meta-chip-row">
         <div class="meta-chip">Thread: <span id="thread-id">-</span></div>
         <div class="meta-chip">Updated: <span id="updated-at">-</span></div>
+        <div class="meta-chip">Memory: <span id="checkpoint-status">-</span></div>
       </div>
     </section>
 
@@ -1006,6 +1433,17 @@ APP_HTML = """<!doctype html>
             <div class="summary-card"><div class="k">Current Task</div><div class="v" id="summary-task">-</div></div>
             <div class="summary-card"><div class="k">Next Action</div><div class="v" id="summary-next-action">idle</div></div>
             <div class="summary-card"><div class="k">Visible Tasks</div><div class="v" id="summary-task-count">0</div></div>
+          </div>
+          <div class="session-choice" id="session-choice">
+            <div class="session-choice-main">
+              <strong>Saved session found</strong>
+              <span id="session-choice-detail">Choose how to open this console.</span>
+              <select class="session-resume-select" id="session-resume-select"></select>
+            </div>
+            <div class="session-choice-actions">
+              <button class="btn btn-primary" type="button" id="resume-session-btn">Resume</button>
+              <button class="btn btn-secondary" type="button" id="new-session-btn">New session</button>
+            </div>
           </div>
         </div>
 
@@ -1026,14 +1464,12 @@ APP_HTML = """<!doctype html>
           <div class="io-toolbar">
             <label>Input
               <select id="input-language">
-                <option value="auto">Auto</option>
                 <option value="zh">中文</option>
                 <option value="en">English</option>
               </select>
             </label>
             <label>Reply
               <select id="output-language">
-                <option value="auto">Auto</option>
                 <option value="zh">中文</option>
                 <option value="en">English</option>
               </select>
@@ -1044,7 +1480,26 @@ APP_HTML = """<!doctype html>
           </div>
           <div class="image-preview" id="image-preview">
             <img id="image-preview-img" alt="Selected or captured frame">
-            <div class="image-preview-text" id="image-preview-text"></div>
+            <div class="image-preview-body">
+              <div class="image-preview-status" id="image-preview-status">preview only</div>
+              <div class="image-preview-text" id="image-preview-text"></div>
+            </div>
+            <div class="image-preview-actions">
+              <button class="mini-btn icon-btn" type="button" id="clear-image-btn" title="Clear image preview">×</button>
+              <button class="mini-btn" type="button" id="attach-image-btn" disabled>Attach</button>
+              <button class="mini-btn" type="button" id="download-image-btn" disabled>Download</button>
+            </div>
+          </div>
+          <div class="agent-capture-preview" id="agent-capture-preview">
+            <img id="agent-capture-img" alt="Latest agent capture">
+            <div class="image-preview-body">
+              <div class="image-preview-status">agent capture</div>
+              <div class="image-preview-text" id="agent-capture-text"></div>
+            </div>
+            <div class="image-preview-actions">
+              <button class="mini-btn" type="button" id="use-agent-capture-btn" disabled>Use as input</button>
+              <button class="mini-btn" type="button" id="download-agent-capture-btn" disabled>Download</button>
+            </div>
           </div>
           <textarea id="message-input" placeholder="Enter a user instruction. Controller arrivals are handled automatically."></textarea>
         </form>
@@ -1099,6 +1554,11 @@ APP_HTML = """<!doctype html>
     const logsEl = document.getElementById("logs");
     const statusStripEl = document.getElementById("status-strip");
     const errorBannerEl = document.getElementById("error-banner");
+    const sessionChoiceEl = document.getElementById("session-choice");
+    const sessionChoiceDetailEl = document.getElementById("session-choice-detail");
+    const sessionResumeSelectEl = document.getElementById("session-resume-select");
+    const resumeSessionBtnEl = document.getElementById("resume-session-btn");
+    const newSessionBtnEl = document.getElementById("new-session-btn");
     const formEl = document.getElementById("composer");
     const messageInputEl = document.getElementById("message-input");
     const sendBtnEl = document.getElementById("send-btn");
@@ -1114,7 +1574,16 @@ APP_HTML = """<!doctype html>
     const describeImageBtnEl = document.getElementById("describe-image-btn");
     const imagePreviewEl = document.getElementById("image-preview");
     const imagePreviewImgEl = document.getElementById("image-preview-img");
+    const imagePreviewStatusEl = document.getElementById("image-preview-status");
     const imagePreviewTextEl = document.getElementById("image-preview-text");
+    const attachImageBtnEl = document.getElementById("attach-image-btn");
+    const clearImageBtnEl = document.getElementById("clear-image-btn");
+    const downloadImageBtnEl = document.getElementById("download-image-btn");
+    const agentCapturePreviewEl = document.getElementById("agent-capture-preview");
+    const agentCaptureImgEl = document.getElementById("agent-capture-img");
+    const agentCaptureTextEl = document.getElementById("agent-capture-text");
+    const useAgentCaptureBtnEl = document.getElementById("use-agent-capture-btn");
+    const downloadAgentCaptureBtnEl = document.getElementById("download-agent-capture-btn");
     let refreshTimer = null;
     let refreshInFlight = false;
     let logAutoFollow = true;
@@ -1122,6 +1591,12 @@ APP_HTML = """<!doctype html>
     let planViewMode = "list";
     let selectedGraphItem = null;
     let selectedImageDataUrl = "";
+    let previewImageDataUrl = "";
+    let selectedImageDownloadName = "caragent_capture.jpg";
+    let previewImageDownloadName = "caragent_capture.jpg";
+    let latestAgentCapture = null;
+    let languageInitialized = false;
+    let sessionChoiceRequired = false;
 
     function escapeHtml(text) {
       const normalized = text === null || text === undefined ? "" : String(text);
@@ -1640,7 +2115,26 @@ APP_HTML = """<!doctype html>
       errorBannerEl.textContent = errorText;
     }
 
+    function setSelectValueIfAvailable(selectEl, value) {
+      const normalized = String(value || "");
+      if (!normalized) return;
+      for (const option of selectEl.options) {
+        if (option.value === normalized) {
+          selectEl.value = normalized;
+          return;
+        }
+      }
+    }
+
+    function initializeLanguageSelectors(payload) {
+      if (languageInitialized) return;
+      setSelectValueIfAvailable(inputLanguageEl, payload.input_language || "zh");
+      setSelectValueIfAvailable(outputLanguageEl, payload.output_language || "zh");
+      languageInitialized = true;
+    }
+
     function renderPayload(payload) {
+      initializeLanguageSelectors(payload);
       renderSummary(payload.state, payload);
       renderStatusStrip(payload.state);
       renderHistory(payload.conversation_history || payload.turn_history || []);
@@ -1755,9 +2249,64 @@ APP_HTML = """<!doctype html>
       updateConsoleFollowIndicator();
     }
 
+    function renderSessionChoice(checkpoint) {
+      sessionChoiceRequired = Boolean(checkpoint && checkpoint.choice_required);
+      if (!sessionChoiceRequired) {
+        sessionChoiceEl.style.display = "none";
+        sessionResumeSelectEl.innerHTML = "";
+        resumeSessionBtnEl.disabled = false;
+        newSessionBtnEl.disabled = false;
+        return;
+      }
+      const previousSelection = sessionResumeSelectEl.value || "";
+      const sessions = Array.isArray(checkpoint.available_sessions)
+        ? checkpoint.available_sessions
+        : [];
+      const preferredPath = previousSelection
+        || checkpoint.pending_run_memory_snapshot_path
+        || (sessions[0] && sessions[0].path)
+        || "";
+      sessionResumeSelectEl.innerHTML = "";
+      sessions.forEach((item) => {
+        const option = document.createElement("option");
+        option.value = item.path || "";
+        option.textContent = item.label || item.path || "run_memory.json";
+        sessionResumeSelectEl.appendChild(option);
+      });
+      if (preferredPath) {
+        sessionResumeSelectEl.value = preferredPath;
+      }
+      sessionResumeSelectEl.style.display = sessions.length ? "block" : "none";
+      const savedAt = checkpoint.pending_saved_at || checkpoint.saved_at || "";
+      const sourcePath = sessionResumeSelectEl.value || checkpoint.pending_run_memory_snapshot_path || "";
+      const detailParts = [];
+      if (savedAt) detailParts.push("Saved: " + savedAt);
+      if (sourcePath) detailParts.push("Memory: " + sourcePath);
+      sessionChoiceDetailEl.textContent = detailParts.length
+        ? detailParts.join(" | ")
+        : "Resume the saved run memory or start clean.";
+      sessionChoiceEl.style.display = "flex";
+      resumeSessionBtnEl.disabled = false;
+      newSessionBtnEl.disabled = false;
+    }
+
     function renderSummary(state, payload) {
       document.getElementById("thread-id").textContent = payload.thread_id || "-";
       document.getElementById("updated-at").textContent = payload.updated_at || "-";
+      const checkpoint = payload.checkpoint || {};
+      const checkpointStatusEl = document.getElementById("checkpoint-status");
+      if (checkpointStatusEl) {
+        checkpointStatusEl.textContent = checkpoint.choice_required
+          ? "choose"
+          : checkpoint.run_memory_restored
+          ? "restored"
+          : checkpoint.mode === "new"
+            ? "new"
+          : checkpoint.enabled
+            ? "saved"
+            : "off";
+      }
+      renderSessionChoice(checkpoint);
       document.getElementById("summary-plan").textContent = state.current_plan_id || "-";
       document.getElementById("summary-task").textContent = state.current_task_label || state.agent_status || "-";
       document.getElementById("summary-next-action").textContent = state.processing ? "processing" : (state.next_action_type || "idle");
@@ -1766,20 +2315,28 @@ APP_HTML = """<!doctype html>
 
     function updateComposerState(state) {
       const inputWindow = state.input_window || {};
-      const locked = Boolean(inputWindow.locked);
+      const blockedBySessionChoice = Boolean(sessionChoiceRequired);
+      const locked = Boolean(inputWindow.locked) || blockedBySessionChoice;
       const mode = inputWindow.mode || "ready";
-      const noteTitle = inputWindow.title || "Ready for input";
-      const noteDetail = inputWindow.detail || "Send a new instruction when ready.";
+      const noteTitle = blockedBySessionChoice
+        ? "Choose session"
+        : inputWindow.title || "Ready for input";
+      const noteDetail = blockedBySessionChoice
+        ? "Resume the saved session or start a new one before sending commands."
+        : inputWindow.detail || "Send a new instruction when ready.";
       const placeholder = "Enter a user instruction. Controller arrivals are handled automatically.";
 
       window.__carAgentLatestState = state;
-      composerNoteEl.className = "composer-note " + escapeHtml(mode);
+      composerNoteEl.className = "composer-note " + escapeHtml(blockedBySessionChoice ? "waiting" : mode);
       composerNoteEl.innerHTML = "<strong>" + escapeHtml(noteTitle) + "</strong><span>" + escapeHtml(noteDetail) + "</span>";
       messageInputEl.disabled = locked;
       messageInputEl.placeholder = placeholder;
       sendBtnEl.disabled = locked || (!messageInputEl.value.trim() && !selectedImageDataUrl);
-      clearBtnEl.disabled = state.processing;
+      clearBtnEl.disabled = state.processing || blockedBySessionChoice;
       refreshBtnEl.disabled = refreshInFlight;
+      captureBtnEl.disabled = blockedBySessionChoice;
+      imageUploadEl.disabled = blockedBySessionChoice;
+      describeImageBtnEl.disabled = blockedBySessionChoice;
     }
 
     function renderPayload(payload) {
@@ -1791,6 +2348,7 @@ APP_HTML = """<!doctype html>
       renderPlanGraph(state.plan_graph || {});
       applyPlanViewMode();
       renderLogs(payload.console_entries || payload.console_output || "");
+      renderLatestAgentCapture(payload.latest_agent_capture || null);
       updateComposerState(state);
       renderError(payload.latest_error || "");
     }
@@ -1827,17 +2385,96 @@ APP_HTML = """<!doctype html>
       }
     }
 
-    function showImagePreview(dataUrl, text, attach) {
-      const attachToMessage = attach === true;
-      if (attachToMessage) {
-        selectedImageDataUrl = dataUrl || "";
-      }
-      const previewUrl = dataUrl || selectedImageDataUrl || "";
+    function dataUrlExtension(dataUrl) {
+      const match = String(dataUrl || "").match(/^data:image\/([^;,]+)/i);
+      if (!match) return "jpg";
+      const kind = match[1].toLowerCase();
+      if (kind === "jpeg") return "jpg";
+      return kind.replace(/[^a-z0-9]/g, "") || "jpg";
+    }
+
+    function safeDownloadName(name, dataUrl) {
+      const fallback = "caragent_capture." + dataUrlExtension(dataUrl);
+      const clean = String(name || "").trim().split(/[\\/]/).pop() || fallback;
+      if (/\.[a-z0-9]{2,5}$/i.test(clean)) return clean;
+      return clean + "." + dataUrlExtension(dataUrl);
+    }
+
+    function syncImagePreviewControls() {
+      const previewUrl = previewImageDataUrl || selectedImageDataUrl || "";
+      const attached = Boolean(selectedImageDataUrl && previewUrl === selectedImageDataUrl);
       if (previewUrl) {
         imagePreviewImgEl.src = previewUrl;
+      } else {
+        imagePreviewImgEl.removeAttribute("src");
+      }
+      imagePreviewStatusEl.textContent = attached ? "attached to next message" : "preview only";
+      imagePreviewStatusEl.classList.toggle("attached", attached);
+      attachImageBtnEl.disabled = !previewUrl;
+      attachImageBtnEl.textContent = attached ? "Detach" : "Attach";
+      clearImageBtnEl.disabled = !previewUrl;
+      downloadImageBtnEl.disabled = !previewUrl;
+      imagePreviewEl.style.display = previewUrl || imagePreviewTextEl.textContent ? "flex" : "none";
+    }
+
+    function clearImagePreview() {
+      selectedImageDataUrl = "";
+      previewImageDataUrl = "";
+      selectedImageDownloadName = "caragent_capture.jpg";
+      previewImageDownloadName = "caragent_capture.jpg";
+      imageUploadEl.value = "";
+      imagePreviewTextEl.textContent = "";
+      syncImagePreviewControls();
+      updateComposerState(window.__carAgentLatestState || { input_window: { locked: false, mode: "ready" }, processing: false });
+    }
+
+    function showImagePreview(dataUrl, text, attach, downloadName) {
+      if (dataUrl !== undefined) {
+        previewImageDataUrl = dataUrl || "";
+        if (previewImageDataUrl) {
+          previewImageDownloadName = safeDownloadName(downloadName, previewImageDataUrl);
+        }
+      }
+      const attachToMessage = attach === true;
+      if (attachToMessage) {
+        selectedImageDataUrl = previewImageDataUrl || "";
+        selectedImageDownloadName = safeDownloadName(downloadName, selectedImageDataUrl);
       }
       imagePreviewTextEl.textContent = text || "";
-      imagePreviewEl.style.display = previewUrl || text ? "flex" : "none";
+      syncImagePreviewControls();
+    }
+
+    function togglePreviewAttachment() {
+      const previewUrl = previewImageDataUrl || selectedImageDataUrl || "";
+      if (!previewUrl) return;
+      if (selectedImageDataUrl && previewUrl === selectedImageDataUrl) {
+        selectedImageDataUrl = "";
+      } else {
+        selectedImageDataUrl = previewUrl;
+        selectedImageDownloadName = safeDownloadName(previewImageDownloadName, selectedImageDataUrl);
+      }
+      syncImagePreviewControls();
+      updateComposerState(window.__carAgentLatestState || { input_window: { locked: false, mode: "ready" }, processing: false });
+    }
+
+    function renderLatestAgentCapture(capture) {
+      if (!capture || !capture.image_data_url) {
+        latestAgentCapture = null;
+        agentCapturePreviewEl.style.display = "none";
+        return;
+      }
+      const previousPath = latestAgentCapture && latestAgentCapture.path;
+      latestAgentCapture = capture;
+      agentCaptureImgEl.src = capture.image_data_url;
+      agentCaptureTextEl.textContent = capture.path
+        ? `Latest photo saved by agent tool.\nSaved on board: ${capture.path}`
+        : "Latest photo saved by agent tool.";
+      downloadAgentCaptureBtnEl.disabled = false;
+      useAgentCaptureBtnEl.disabled = false;
+      agentCapturePreviewEl.style.display = "flex";
+      if (capture.path && capture.path !== previousPath && !previewImageDataUrl && !selectedImageDataUrl) {
+        agentCapturePreviewEl.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      }
     }
 
     function readSelectedImageAsDataUrl() {
@@ -1860,7 +2497,14 @@ APP_HTML = """<!doctype html>
         if (!payload.image_data_url) {
           throw new Error(payload.error || "Current image is unavailable");
         }
-        showImagePreview(payload.image_data_url, "Captured current robot camera frame.", false);
+        const sourceText = payload.path
+          ? `Captured current robot camera frame for preview only.\nSaved on board: ${payload.path}`
+          : "Captured current robot camera frame for preview only.";
+        const captureName = payload.path ? payload.path.split("/").pop() : "";
+        selectedImageDataUrl = "";
+        showImagePreview(payload.image_data_url, sourceText, false, captureName);
+        imageUploadEl.value = "";
+        updateComposerState(window.__carAgentLatestState || { input_window: { locked: false, mode: "ready" }, processing: false });
       } catch (error) {
         renderError(error.message || String(error));
       } finally {
@@ -1871,7 +2515,7 @@ APP_HTML = """<!doctype html>
     async function describeSelectedImage() {
       describeImageBtnEl.disabled = true;
       try {
-        const dataUrl = selectedImageDataUrl || await readSelectedImageAsDataUrl();
+        const dataUrl = selectedImageDataUrl || previewImageDataUrl || await readSelectedImageAsDataUrl();
         if (!dataUrl) {
           throw new Error("Choose an image file first, or capture the current camera frame for preview.");
         }
@@ -1917,6 +2561,9 @@ APP_HTML = """<!doctype html>
         renderPayload(payload);
         messageInputEl.value = "";
         selectedImageDataUrl = "";
+        previewImageDataUrl = "";
+        selectedImageDownloadName = "caragent_capture.jpg";
+        previewImageDownloadName = "caragent_capture.jpg";
         imageUploadEl.value = "";
         showImagePreview("", "");
         scheduleRefresh(200);
@@ -1950,11 +2597,46 @@ APP_HTML = """<!doctype html>
 
     captureBtnEl.addEventListener("click", captureCurrentImage);
     describeImageBtnEl.addEventListener("click", describeSelectedImage);
+    attachImageBtnEl.addEventListener("click", togglePreviewAttachment);
+    clearImageBtnEl.addEventListener("click", clearImagePreview);
+    downloadImageBtnEl.addEventListener("click", () => {
+      const dataUrl = previewImageDataUrl || selectedImageDataUrl || imagePreviewImgEl.src || "";
+      if (!dataUrl) return;
+      const link = document.createElement("a");
+      link.href = dataUrl;
+      link.download = safeDownloadName(previewImageDownloadName || selectedImageDownloadName, dataUrl);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+    });
+    downloadAgentCaptureBtnEl.addEventListener("click", () => {
+      if (!latestAgentCapture || !latestAgentCapture.image_data_url) return;
+      const link = document.createElement("a");
+      link.href = latestAgentCapture.image_data_url;
+      link.download = safeDownloadName(latestAgentCapture.name || "agent_capture.jpg", latestAgentCapture.image_data_url);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+    });
+    useAgentCaptureBtnEl.addEventListener("click", () => {
+      if (!latestAgentCapture || !latestAgentCapture.image_data_url) return;
+      showImagePreview(
+        latestAgentCapture.image_data_url,
+        latestAgentCapture.path
+          ? `Agent capture attached to the next message.\nSaved on board: ${latestAgentCapture.path}`
+          : "Agent capture attached to the next message.",
+        true,
+        latestAgentCapture.name || "agent_capture.jpg"
+      );
+      imageUploadEl.value = "";
+      updateComposerState(window.__carAgentLatestState || { input_window: { locked: false, mode: "ready" }, processing: false });
+    });
     imageUploadEl.addEventListener("change", async () => {
       try {
         const dataUrl = await readSelectedImageAsDataUrl();
         if (dataUrl) {
-          showImagePreview(dataUrl, "Image attached. Type a message and click Send, or use Describe Image to search by this image.", true);
+          const file = imageUploadEl.files && imageUploadEl.files[0];
+          showImagePreview(dataUrl, "Image attached. Type a message and click Send, or use Describe Image to search by this image.", true, file ? file.name : "");
           const latestState = window.__carAgentLatestState || {
             input_window: { locked: false, mode: "ready" },
             processing: false,
@@ -1993,6 +2675,29 @@ APP_HTML = """<!doctype html>
       logAutoFollow = true;
       updateConsoleFollowIndicator();
     });
+
+    async function chooseSessionMode(mode) {
+      resumeSessionBtnEl.disabled = true;
+      newSessionBtnEl.disabled = true;
+      try {
+        const body = { mode };
+        if (mode === "resume" && sessionResumeSelectEl.value) {
+          body.run_memory_snapshot_path = sessionResumeSelectEl.value;
+        }
+        const payload = await request("/api/session", {
+          method: "POST",
+          body: JSON.stringify(body),
+        });
+        renderPayload(payload);
+      } catch (error) {
+        renderError(error.message || String(error));
+        resumeSessionBtnEl.disabled = false;
+        newSessionBtnEl.disabled = false;
+      }
+    }
+
+    resumeSessionBtnEl.addEventListener("click", () => chooseSessionMode("resume"));
+    newSessionBtnEl.addEventListener("click", () => chooseSessionMode("new"));
 
     planViewListBtnEl.addEventListener("click", () => {
       planViewMode = "list";
@@ -2050,22 +2755,89 @@ def _normalize_task_detail(task: dict[str, Any]) -> str:
         details.append(f"depends_on: {task['depends_on']}")
     if task.get("latest_result_summary"):
         details.append(f"latest_result: {task['latest_result_summary']}")
+    object_debug = task.get("object_approach_debug")
+    if isinstance(object_debug, dict):
+        if object_debug.get("output_dir"):
+            details.append(f"object_output_dir: {object_debug['output_dir']}")
+        if object_debug.get("summary_json"):
+            details.append(f"object_summary_json: {object_debug['summary_json']}")
+        if object_debug.get("stages"):
+            details.append(f"object_stages: {object_debug['stages']}")
     if task.get("terminal_reason"):
         details.append(f"terminal_reason: {task['terminal_reason']}")
     return "\n".join(details)
 
 
+def _extract_object_approach_debug(latest_result: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not latest_result:
+        return None
+    raw_output = latest_result.get("raw_output")
+    if not raw_output:
+        return None
+    try:
+        trace = json.loads(str(raw_output))
+    except Exception:
+        return None
+    tool_results = trace.get("tool_results") if isinstance(trace, dict) else None
+    if not isinstance(tool_results, list):
+        return None
+    for tool_result in reversed(tool_results):
+        if not isinstance(tool_result, dict):
+            continue
+        if str(tool_result.get("name") or "") != "approach_object_in_current_view":
+            continue
+        content = tool_result.get("content")
+        if isinstance(content, str):
+            try:
+                content = json.loads(content)
+            except Exception:
+                continue
+        if not isinstance(content, dict):
+            continue
+        data = content.get("data")
+        if not isinstance(data, dict):
+            continue
+        paths = data.get("paths") if isinstance(data.get("paths"), dict) else {}
+        stages = data.get("stages") if isinstance(data.get("stages"), list) else []
+        stage_text = " -> ".join(
+            f"{stage.get('name')}:{stage.get('status')}"
+            for stage in stages
+            if isinstance(stage, dict) and stage.get("name")
+        )
+        return {
+            "output_dir": data.get("output_dir") or paths.get("output_dir"),
+            "summary_json": data.get("summary_json") or paths.get("summary_json"),
+            "stages": stage_text,
+        }
+    return None
+
+
 class AsyncAgentWebApp:
     """Serve one AsyncAgent instance behind a tiny browser-based console."""
 
-    def __init__(self, agent: AsyncAgent, thread_id: str):
+    def __init__(
+        self,
+        agent: AsyncAgent,
+        thread_id: str,
+        *,
+        resume_checkpoint: bool | None = None,
+        checkpoint_path: Path | str | None = None,
+        clear_resumed_plan: bool | None = None,
+    ):
         """Initialize web-session state and cached agent state."""
 
         self.agent = agent
         self.thread_id = thread_id
         self.io_cfg = config.get("io", {})
-        self.last_input_language = str(self.io_cfg.get("input_language", "auto"))
-        self.last_output_language = str(self.io_cfg.get("output_language", "auto"))
+        web_cfg = config.get("web_ui", {}) or {}
+        self.last_input_language = normalize_language(
+            self.io_cfg.get("input_language", "zh"),
+            fallback="zh",
+        )
+        self.last_output_language = normalize_language(
+            self.io_cfg.get("output_language", "zh"),
+            fallback="zh",
+        )
         self.lock = threading.RLock()
         self.turn_history: list[dict[str, Any]] = []
         self.latest_error: str | None = None
@@ -2073,12 +2845,402 @@ class AsyncAgentWebApp:
         self.turn_counter = 0
         self.processing_turn_id: int | None = None
         self.controller_arrival_turn_id: int | None = None
-        self.state_cache: dict[str, Any] = self.agent.get_thread_state(thread_id) or {}
+        self.checkpoint_enabled = bool(
+            web_cfg.get("session_checkpoint_enabled", True)
+            if resume_checkpoint is None
+            else resume_checkpoint
+        )
+        self.clear_resumed_plan = bool(
+            web_cfg.get("clear_resumed_plan", True)
+            if clear_resumed_plan is None
+            else clear_resumed_plan
+        )
+        configured_checkpoint_path = (
+            checkpoint_path
+            if checkpoint_path is not None
+            else web_cfg.get("session_checkpoint_path")
+        )
+        self.checkpoint_path = (
+            normalize_runtime_path(configured_checkpoint_path)
+            if configured_checkpoint_path
+            else _default_checkpoint_path(thread_id)
+        )
+        self.checkpoint_loaded = False
+        self.checkpoint_loaded_at = ""
+        self.checkpoint_saved_at = ""
+        self.checkpoint_error: str | None = None
+        self.checkpoint_runtime_cleared = False
+        self.restored_checkpoint_active = False
+        self.checkpoint_prompt_on_start = bool(
+            web_cfg.get("session_checkpoint_prompt_on_start", True)
+        )
+        self.checkpoint_pending_payload: dict[str, Any] | None = None
+        self.checkpoint_choice_required = False
+        self.checkpoint_mode = "off" if not self.checkpoint_enabled else "new"
+        self.checkpoint_available = False
+        self.checkpoint_archived_path = ""
+        self.run_memory_restored = False
+        self.run_memory_restore_summary: dict[str, Any] = {}
+        self.run_memory_restore_error: str | None = None
+        live_state = self.agent.get_thread_state(thread_id) or {}
+        self.state_cache: dict[str, Any] = live_state
         self.max_log_lines = 28
+        workspace_root = Path((config.get("paths") or {}).get("workspace_root", "/home/car/caragent_ws"))
+        self.user_image_dir = workspace_root / "perception_outputs" / "agent_user_images"
+        self.agent_capture_dir = workspace_root / "perception_outputs" / "agent_captures"
+        checkpoint_payload = self._load_checkpoint_payload()
+        if checkpoint_payload is not None:
+            checkpoint_has_resume_content = _checkpoint_payload_has_resume_content(
+                checkpoint_payload
+            )
+            self.checkpoint_available = checkpoint_has_resume_content
+            self.checkpoint_saved_at = str(
+                checkpoint_payload.get("saved_at")
+                or checkpoint_payload.get("updated_at")
+                or ""
+            )
+            if (
+                checkpoint_has_resume_content
+                and
+                self.checkpoint_prompt_on_start
+                and not _state_has_thread_content(live_state)
+            ):
+                self.checkpoint_pending_payload = checkpoint_payload
+                self.checkpoint_choice_required = True
+                self.checkpoint_mode = "pending"
+            elif checkpoint_has_resume_content:
+                self._apply_checkpoint_payload(checkpoint_payload, live_state=live_state)
+        if (
+            self.checkpoint_enabled
+            and self.checkpoint_prompt_on_start
+            and not self.checkpoint_choice_required
+            and not self.checkpoint_loaded
+            and not _state_has_thread_content(live_state)
+            and self._available_run_memory_sessions(limit=1)
+        ):
+            self.checkpoint_available = True
+            self.checkpoint_choice_required = True
+            self.checkpoint_mode = "pending"
         if hasattr(self.agent, "add_controller_arrival_turn_listener"):
             self.agent.add_controller_arrival_turn_listener(
                 self._handle_background_controller_arrival_turn
             )
+
+    def _load_checkpoint_payload(self) -> dict[str, Any] | None:
+        """Load the persisted Web UI checkpoint when one exists."""
+
+        if not self.checkpoint_enabled:
+            return None
+        if not self.checkpoint_path.exists() or not self.checkpoint_path.is_file():
+            return None
+        try:
+            payload = json.loads(self.checkpoint_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            self.checkpoint_error = f"Failed to load session checkpoint: {exc}"
+            return None
+        if not isinstance(payload, dict):
+            self.checkpoint_error = "Session checkpoint payload is not an object."
+            return None
+        return payload
+
+    def _apply_checkpoint_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        live_state: dict[str, Any],
+    ) -> None:
+        """Restore visible session data without reviving interrupted work."""
+
+        if str(payload.get("thread_id") or "") not in {"", self.thread_id}:
+            return
+
+        self.checkpoint_loaded = True
+        self.checkpoint_available = True
+        self.checkpoint_pending_payload = None
+        self.checkpoint_choice_required = False
+        self.checkpoint_mode = "resumed"
+        self.checkpoint_loaded_at = _now_display()
+        self.checkpoint_saved_at = str(payload.get("saved_at") or payload.get("updated_at") or "")
+        self.turn_history = _normalize_checkpoint_turns(payload.get("turn_history"))
+        if self.turn_history:
+            self.turn_counter = max(
+                int(turn.get("turn_id") or 0)
+                for turn in self.turn_history
+                if isinstance(turn, dict)
+            )
+        self.last_input_language = normalize_language(
+            payload.get("input_language") or self.last_input_language,
+            fallback="zh",
+        )
+        self.last_output_language = normalize_language(
+            payload.get("output_language") or self.last_output_language,
+            fallback="zh",
+        )
+
+        if _state_has_thread_content(live_state):
+            self.state_cache = live_state
+            self.restored_checkpoint_active = False
+            self.checkpoint_runtime_cleared = False
+            return
+
+        checkpoint_state = _normalize_checkpoint_state(
+            payload.get("state_cache") or payload.get("state") or {}
+        )
+        if self.clear_resumed_plan and _state_has_active_plan_residue(checkpoint_state):
+            checkpoint_state = _clear_resumed_runtime_state(checkpoint_state)
+            self.checkpoint_runtime_cleared = True
+        self.state_cache = checkpoint_state
+        self._restore_run_memory_from_checkpoint(payload)
+        self.restored_checkpoint_active = bool(self.turn_history or checkpoint_state)
+
+    def _checkpoint_view(self) -> dict[str, Any]:
+        """Return checkpoint metadata for the browser payload."""
+
+        return {
+            "enabled": self.checkpoint_enabled,
+            "path": str(self.checkpoint_path) if self.checkpoint_enabled else "",
+            "available": self.checkpoint_available,
+            "choice_required": self.checkpoint_choice_required,
+            "mode": self.checkpoint_mode,
+            "loaded": self.checkpoint_loaded,
+            "loaded_at": self.checkpoint_loaded_at,
+            "saved_at": self.checkpoint_saved_at,
+            "pending_saved_at": str(
+                (self.checkpoint_pending_payload or {}).get("saved_at")
+                or (self.checkpoint_pending_payload or {}).get("updated_at")
+                or ""
+            ),
+            "pending_run_memory_snapshot_path": str(
+                (self.checkpoint_pending_payload or {}).get("run_memory_snapshot_path")
+                or ""
+            ),
+            "available_sessions": self._available_run_memory_sessions(),
+            "archived_path": self.checkpoint_archived_path,
+            "restored": self.restored_checkpoint_active,
+            "runtime_cleared": self.checkpoint_runtime_cleared,
+            "error": self.checkpoint_error,
+            "run_memory_restored": self.run_memory_restored,
+            "run_memory_restore_summary": self.run_memory_restore_summary,
+            "run_memory_restore_error": self.run_memory_restore_error,
+        }
+
+    def _run_memory_snapshot_path(self) -> str:
+        """Return the current run-memory JSON path when logging is enabled."""
+
+        run_memory = getattr(self.agent, "run_memory", None)
+        snapshot_path = getattr(run_memory, "snapshot_path", None)
+        return str(snapshot_path) if snapshot_path else ""
+
+    def _available_run_memory_sessions(self, limit: int = 30) -> list[dict[str, Any]]:
+        """Return recent persisted run-memory snapshots for the UI resume picker."""
+
+        log_dir = normalize_runtime_path(config.get("log_dir", "logs"))
+        if not log_dir.exists():
+            return []
+        sessions: list[dict[str, Any]] = []
+        for path in log_dir.glob("session_*/run_memory.json"):
+            if not path.is_file():
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    continue
+                if not (
+                    data.get("turns")
+                    or data.get("plans")
+                    or data.get("task_results")
+                    or data.get("threads")
+                ):
+                    continue
+                stat = path.stat()
+                session = data.get("session") if isinstance(data.get("session"), dict) else {}
+                session_id = str(session.get("session_id") or path.parent.name)
+                plan_count = len(list(data.get("plans") or []))
+                task_result_count = len(list(data.get("task_results") or []))
+                turn_count = len(list(data.get("turns") or []))
+                updated = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+                label = (
+                    f"{session_id} | {updated} | "
+                    f"plans={plan_count} tasks={task_result_count} turns={turn_count}"
+                )
+                sessions.append(
+                    {
+                        "path": str(path),
+                        "label": label,
+                        "session_id": session_id,
+                        "updated_at": updated,
+                        "plan_count": plan_count,
+                        "task_result_count": task_result_count,
+                        "turn_count": turn_count,
+                        "mtime": stat.st_mtime,
+                    }
+                )
+            except Exception:
+                continue
+        sessions.sort(key=lambda item: float(item.get("mtime") or 0.0), reverse=True)
+        return sessions[:limit]
+
+    def _restore_run_memory_from_checkpoint(self, payload: dict[str, Any]) -> None:
+        """Attach the previous run-memory snapshot to this fresh Agent instance."""
+
+        source_path = str(payload.get("run_memory_snapshot_path") or "").strip()
+        if not source_path:
+            return
+
+        current_snapshot_path = self._run_memory_snapshot_path()
+        if current_snapshot_path and Path(source_path) == Path(current_snapshot_path):
+            return
+
+        run_memory = getattr(self.agent, "run_memory", None)
+        restore_from_snapshot = getattr(run_memory, "restore_from_snapshot", None)
+        if not callable(restore_from_snapshot):
+            self.run_memory_restore_error = "Current Agent run_memory cannot restore snapshots."
+            return
+
+        try:
+            self.run_memory_restore_summary = restore_from_snapshot(
+                source_path,
+                thread_id=self.thread_id,
+            )
+            self.run_memory_restored = True
+            self.run_memory_restore_error = None
+        except Exception as exc:
+            self.run_memory_restore_error = f"Failed to restore run memory: {exc}"
+
+    def _save_checkpoint_locked(self, state: dict[str, Any] | None = None) -> None:
+        """Persist the current visible session snapshot to disk."""
+
+        if not self.checkpoint_enabled:
+            return
+        if self.checkpoint_choice_required:
+            return
+
+        now = _now_display()
+        payload = {
+            "schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "thread_id": self.thread_id,
+            "session_mode": self.checkpoint_mode,
+            "saved_at": now,
+            "updated_at": self.updated_at,
+            "input_language": self.last_input_language,
+            "output_language": self.last_output_language,
+            "turn_counter": self.turn_counter,
+            "turn_history": _json_safe(_normalize_checkpoint_turns(self.turn_history)),
+            "state_cache": _state_for_checkpoint(state or self.state_cache),
+            "run_memory_snapshot_path": self._run_memory_snapshot_path(),
+            "latest_error": self.latest_error,
+        }
+
+        try:
+            self.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = self.checkpoint_path.with_name(
+                f"{self.checkpoint_path.stem}_{time.time_ns()}.tmp"
+            )
+            temp_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temp_path.replace(self.checkpoint_path)
+            self.checkpoint_saved_at = now
+            self.checkpoint_error = None
+        except Exception as exc:
+            self.checkpoint_error = f"Failed to save session checkpoint: {exc}"
+
+    def _drop_restored_runtime_snapshot_locked(self) -> None:
+        """Discard restored display-only state before starting a fresh real turn."""
+
+        if not self.restored_checkpoint_active:
+            return
+        live_state = self.agent.get_thread_state(self.thread_id) or {}
+        self.state_cache = live_state if _state_has_thread_content(live_state) else {}
+        self.restored_checkpoint_active = False
+        self.checkpoint_runtime_cleared = False
+
+    def _archive_checkpoint_file_locked(self) -> str:
+        """Move the saved checkpoint out of the default load path."""
+
+        if not self.checkpoint_path.exists():
+            return ""
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        archived = self.checkpoint_path.with_name(
+            f"{self.checkpoint_path.stem}.archived_{stamp}{self.checkpoint_path.suffix}"
+        )
+        self.checkpoint_path.replace(archived)
+        return str(archived)
+
+    def _start_new_session_locked(self) -> None:
+        """Start from an empty visible session and archive any pending checkpoint."""
+
+        try:
+            self.checkpoint_archived_path = self._archive_checkpoint_file_locked()
+        except Exception as exc:
+            self.checkpoint_error = f"Failed to archive checkpoint: {exc}"
+            self.checkpoint_archived_path = ""
+        self.checkpoint_pending_payload = None
+        self.checkpoint_choice_required = False
+        self.checkpoint_loaded = False
+        self.checkpoint_loaded_at = ""
+        self.checkpoint_available = False
+        self.checkpoint_mode = "new" if self.checkpoint_enabled else "off"
+        self.checkpoint_runtime_cleared = False
+        self.restored_checkpoint_active = False
+        self.run_memory_restored = False
+        self.run_memory_restore_summary = {}
+        self.run_memory_restore_error = None
+        self.turn_history = []
+        self.turn_counter = 0
+        self.processing_turn_id = None
+        self.controller_arrival_turn_id = None
+        self.latest_error = None
+        live_state = self.agent.get_thread_state(self.thread_id) or {}
+        self.state_cache = live_state if _state_has_thread_content(live_state) else {}
+        self.updated_at = _now_display()
+
+    def choose_session_mode(
+        self,
+        mode: str,
+        *,
+        run_memory_snapshot_path: str | None = None,
+    ) -> dict[str, Any]:
+        """Apply the browser's startup session choice."""
+
+        clean_mode = str(mode or "").strip().lower()
+        with self.lock:
+            if self.processing_turn_id is not None:
+                self.latest_error = "A turn is already in progress. Wait before changing session mode."
+                return self._build_payload_locked()
+
+            if clean_mode in {"resume", "restore"}:
+                selected_snapshot = str(run_memory_snapshot_path or "").strip()
+                payload = None
+                if selected_snapshot:
+                    try:
+                        payload = _checkpoint_payload_from_run_memory_snapshot(
+                            Path(selected_snapshot).expanduser(),
+                            thread_id=self.thread_id,
+                        )
+                    except Exception as exc:
+                        self.latest_error = f"Failed to load selected session: {exc}"
+                        return self._build_payload_locked()
+                if payload is None:
+                    payload = self.checkpoint_pending_payload or self._load_checkpoint_payload()
+                if payload is None:
+                    self.latest_error = "No saved session checkpoint is available."
+                    self.checkpoint_choice_required = False
+                    self.checkpoint_mode = "new" if self.checkpoint_enabled else "off"
+                    return self._build_payload_locked()
+                live_state = self.agent.get_thread_state(self.thread_id) or {}
+                self._apply_checkpoint_payload(payload, live_state=live_state)
+                self.latest_error = None
+                self.updated_at = _now_display()
+                return self._build_payload_locked()
+
+            if clean_mode in {"new", "fresh", "reset"}:
+                self._start_new_session_locked()
+                return self._build_payload_locked()
+
+            self.latest_error = f"Unknown session mode: {mode}"
+            return self._build_payload_locked()
 
     def _build_task_view(self, state: dict[str, Any]) -> list[dict[str, Any]]:
         """Convert raw task records into ordered task cards for the UI."""
@@ -2120,6 +3282,7 @@ class AsyncAgentWebApp:
                 "next_task_id": task.get("next_task_id"),
                 "depends_on": task.get("depends_on"),
                 "latest_result_summary": latest_result.get("summary") if latest_result else None,
+                "object_approach_debug": _extract_object_approach_debug(latest_result),
                 "terminal_reason": task.get("terminal_reason"),
                 "sequence_label": sequence_label,
             }
@@ -2369,6 +3532,9 @@ class AsyncAgentWebApp:
             self.state_cache = state_override
             return state_override
 
+        if self.restored_checkpoint_active:
+            return dict(self.state_cache)
+
         if self.processing_turn_id is not None:
             return dict(self.state_cache)
 
@@ -2461,6 +3627,7 @@ class AsyncAgentWebApp:
         turn["live_node"] = str(update.get("node_name") or "")
         turn["updated_at"] = _now_display()
         self.updated_at = _now_display()
+        self._save_checkpoint_locked(self.state_cache)
 
     def _finalize_turn_locked(
         self,
@@ -2474,6 +3641,7 @@ class AsyncAgentWebApp:
             self.processing_turn_id = None
             self.state_cache = turn_result.get("state", {}) or self.state_cache
             self.updated_at = _now_display()
+            self._save_checkpoint_locked(self.state_cache)
             return
 
         response_text = str(turn_result.get("turn_response_text") or "").strip()
@@ -2513,6 +3681,7 @@ class AsyncAgentWebApp:
         self.processing_turn_id = None
         self.latest_error = None
         self.updated_at = _now_display()
+        self._save_checkpoint_locked(self.state_cache)
 
     def _adapt_controller_turn_result_language(
         self,
@@ -2521,9 +3690,10 @@ class AsyncAgentWebApp:
         """Use the latest UI language preference for background arrival turns."""
 
         output_language = self.last_output_language or str(
-            self.io_cfg.get("output_language", "auto")
+            self.io_cfg.get("output_language", "zh")
         )
-        input_language = self.last_input_language or "auto"
+        output_language = normalize_language(output_language, fallback="zh")
+        input_language = normalize_language(self.last_input_language or "zh", fallback="zh")
         return adapt_turn_result_language(
             turn_result,
             output_language=output_language,
@@ -2595,6 +3765,7 @@ class AsyncAgentWebApp:
         self.controller_arrival_turn_id = None
         self.latest_error = None
         self.updated_at = _now_display()
+        self._save_checkpoint_locked(self.state_cache)
 
     def _apply_controller_arrival_update_locked(self, update: dict[str, Any]) -> None:
         """Create/update the visible background controller turn while it is running."""
@@ -2656,6 +3827,7 @@ class AsyncAgentWebApp:
         self.processing_turn_id = None
         self.latest_error = error_text
         self.updated_at = _now_display()
+        self._save_checkpoint_locked(self.state_cache)
 
     def _run_turn_worker(
         self,
@@ -2669,25 +3841,31 @@ class AsyncAgentWebApp:
     ) -> None:
         """Process one message turn off-thread while publishing live state updates."""
 
-        del source
         try:
-            agent_source_message = self._compose_agent_message_with_image(
-                message,
-                image_data_url=image_data_url,
-            )
-            original_input_language = normalize_language(
+            configured_input_language = normalize_language(
                 input_language,
-                fallback=detect_language(message),
+                fallback=self.last_input_language or self.io_cfg.get("input_language", "zh"),
             )
-            requested_output_language = str(
-                output_language or self.io_cfg.get("output_language", "auto")
+            requested_output_language = normalize_language(
+                output_language or self.io_cfg.get("output_language", "zh"),
+                fallback="zh",
             )
             agent_message = prepare_user_message_for_agent(
-                agent_source_message,
-                input_language=str(input_language or self.io_cfg.get("input_language", "auto")),
+                message,
+                input_language=configured_input_language,
                 output_language=requested_output_language,
                 translate_boundary=bool(self.io_cfg.get("translate_boundary", True)),
             )
+            if image_data_url:
+                image_ref = self._save_attached_image(
+                    turn_id=turn_id,
+                    image_data_url=image_data_url,
+                    source=source,
+                )
+                agent_message = self._compose_agent_message_with_image_reference(
+                    agent_message,
+                    image_ref=image_ref,
+                )
             turn_result = self.agent.run_message_turn(
                 agent_message,
                 self.thread_id,
@@ -2701,7 +3879,7 @@ class AsyncAgentWebApp:
             turn_result = adapt_turn_result_language(
                 turn_result,
                 output_language=requested_output_language,
-                original_input_language=original_input_language,
+                original_input_language=configured_input_language,
             )
             with self.lock:
                 self._finalize_turn_locked(turn_id, turn_result)
@@ -2709,33 +3887,48 @@ class AsyncAgentWebApp:
             with self.lock:
                 self._fail_turn_locked(turn_id, str(exc))
 
-    def _compose_agent_message_with_image(
+    def _save_attached_image(
+        self,
+        *,
+        turn_id: int,
+        image_data_url: str,
+        source: str,
+    ) -> dict[str, Any]:
+        """Persist a browser image payload and return non-visual metadata."""
+
+        image = image_from_data_url(image_data_url)
+        self.user_image_dir.mkdir(parents=True, exist_ok=True)
+        image_ref_id = f"turn_{turn_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        image_path = self.user_image_dir / f"{image_ref_id}.jpg"
+        image.convert("RGB").save(image_path, format="JPEG", quality=92)
+        return {
+            "image_ref_id": image_ref_id,
+            "path": str(image_path),
+            "source": source,
+            "created_at": _now_display(),
+        }
+
+    def _compose_agent_message_with_image_reference(
         self,
         message: str,
         *,
-        image_data_url: str | None = None,
+        image_ref: dict[str, Any],
     ) -> str:
-        """Convert an optional attached image into text and combine it with input."""
+        """Append structured attached-image metadata to the agent message."""
 
         clean_message = str(message or "").strip()
-        if not image_data_url:
-            return clean_message
-
-        image = image_from_data_url(image_data_url)
-        image_description = describe_image_for_navigation(image)
         parts = []
         if clean_message:
             parts.append(f"User text request:\n{clean_message}")
         else:
             parts.append("User text request:\nUse the attached target image as the navigation/query reference.")
+        parts.append("[ATTACHED_IMAGES_JSON]")
+        parts.append(json.dumps([image_ref], ensure_ascii=False, indent=2))
+        parts.append("[/ATTACHED_IMAGES_JSON]")
         parts.append(
-            "Attached image search description:\n"
-            f"{image_description}"
-        )
-        parts.append(
-            "Instruction: combine the user text with the attached image description. "
-            "If this is a navigation request, quickly find the closest matching candidate keyframe; "
-            "do not require a perfect detail-by-detail match."
+            "Instruction: the attached image metadata above is available to the planner and executor. "
+            "Only tasks that must inspect the image should set image_refs:[\"latest\"]. "
+            "For image-only navigation, resolve the closest matching keyframe or image-contained object before navigating."
         )
         return "\n\n".join(parts)
 
@@ -2878,6 +4071,7 @@ class AsyncAgentWebApp:
         state = self._get_state_snapshot_locked(state_override=state_override)
         console_entries = self._build_console_entries()
         self.updated_at = _now_display()
+        self._save_checkpoint_locked(state)
         return {
             "thread_id": self.thread_id,
             "updated_at": self.updated_at,
@@ -2886,8 +4080,41 @@ class AsyncAgentWebApp:
             "conversation_history": self._build_conversation_history(),
             "console_entries": console_entries,
             "console_output": "\n\n".join(console_entries),
+            "input_language": self.last_input_language,
+            "output_language": self.last_output_language,
             "state": self._build_state_view(state),
+            "latest_agent_capture": self._latest_agent_capture_payload(),
+            "checkpoint": self._checkpoint_view(),
         }
+
+    def _latest_agent_capture_payload(self) -> dict[str, Any] | None:
+        """Return the newest image saved by the agent capture tool."""
+
+        if not self.agent_capture_dir.exists():
+            return None
+        candidates: list[Path] = []
+        for pattern in ("*.jpg", "*.jpeg", "*.png"):
+            candidates.extend(self.agent_capture_dir.glob(pattern))
+        candidates = [path for path in candidates if path.is_file()]
+        if not candidates:
+            return None
+        latest = max(candidates, key=lambda path: path.stat().st_mtime)
+        try:
+            return {
+                "status": "ok",
+                "name": latest.name,
+                "path": str(latest),
+                "mtime": latest.stat().st_mtime,
+                "image_data_url": file_to_data_url(latest),
+            }
+        except Exception as exc:
+            return {
+                "status": "error",
+                "name": latest.name,
+                "path": str(latest),
+                "error": str(exc),
+                "image_data_url": None,
+            }
 
     def get_payload(self) -> dict[str, Any]:
         """Return the latest UI payload for polling requests."""
@@ -2909,16 +4136,28 @@ class AsyncAgentWebApp:
 
         clean_message = str(message or "").strip()
         clean_role = "user"
-        if not clean_message:
+        if not clean_message and not image_data_url:
             return self.get_payload()
+        if not clean_message and image_data_url:
+            clean_message = "Use the attached image as the task reference."
 
         with self.lock:
             if self.processing_turn_id is not None:
                 self.latest_error = "A turn is already in progress. Please wait for the live workflow to settle."
                 return self._build_payload_locked()
+            if self.checkpoint_choice_required:
+                self.latest_error = "Choose Resume or New session before sending commands."
+                return self._build_payload_locked()
 
-            self.last_input_language = str(input_language or self.io_cfg.get("input_language", "auto"))
-            self.last_output_language = str(output_language or self.io_cfg.get("output_language", "auto"))
+            self._drop_restored_runtime_snapshot_locked()
+            self.last_input_language = normalize_language(
+                input_language or self.io_cfg.get("input_language", "zh"),
+                fallback="zh",
+            )
+            self.last_output_language = normalize_language(
+                output_language or self.io_cfg.get("output_language", "zh"),
+                fallback="zh",
+            )
             self.turn_counter += 1
             turn_id = self.turn_counter
             self.processing_turn_id = turn_id
@@ -2963,10 +4202,22 @@ class AsyncAgentWebApp:
                 "error": "Current image is unavailable.",
                 "image_data_url": None,
             }
+        path = self._save_robot_capture_image(image)
         return {
             "status": "ok",
             "image_data_url": image_to_data_url(image),
+            "path": str(path),
+            "source": "robot-camera",
         }
+
+    def _save_robot_capture_image(self, image) -> Path:
+        """Persist a robot-camera snapshot so remote browser captures are auditable."""
+
+        self.user_image_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        image_path = self.user_image_dir / f"capture_{stamp}.jpg"
+        image.convert("RGB").save(image_path, format="JPEG", quality=92)
+        return image_path
 
     def describe_uploaded_image(
         self,
@@ -3107,6 +4358,15 @@ class AsyncAgentWebHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/clear":
                 self._send_json(self.app.clear_history())
                 return
+            if parsed.path == "/api/session":
+                payload = self._read_json_body()
+                self._send_json(
+                    self.app.choose_session_mode(
+                        payload.get("mode", ""),
+                        run_memory_snapshot_path=payload.get("run_memory_snapshot_path"),
+                    )
+                )
+                return
             self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
         except Exception as exc:
             self.app.latest_error = str(exc)
@@ -3231,6 +4491,24 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="LangGraph thread id used by the web session.",
     )
     parser.add_argument(
+        "--session-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Persist and restore the visible web session plus previous run memory.",
+    )
+    parser.add_argument(
+        "--checkpoint-path",
+        type=Path,
+        default=None,
+        help="Optional explicit JSON checkpoint path for this web session.",
+    )
+    parser.add_argument(
+        "--clear-resumed-plan",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Restore historical run memory but keep the active runtime plan idle.",
+    )
+    parser.add_argument(
         "--disable-navigation",
         action="store_true",
         help="Disable navigation-related tools and controller polling.",
@@ -3263,7 +4541,13 @@ def main() -> None:
         num_background_workers=args.background_workers,
     )
 
-    app = AsyncAgentWebApp(agent, thread_id=args.thread_id)
+    app = AsyncAgentWebApp(
+        agent,
+        thread_id=args.thread_id,
+        resume_checkpoint=args.session_checkpoint,
+        checkpoint_path=args.checkpoint_path,
+        clear_resumed_plan=args.clear_resumed_plan,
+    )
 
     handler = type("BoundAsyncAgentWebHandler", (AsyncAgentWebHandler,), {"app": app})
     server = ThreadingHTTPServer((args.host, args.port), handler)

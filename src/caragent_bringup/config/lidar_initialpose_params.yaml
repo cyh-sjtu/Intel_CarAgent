@@ -92,6 +92,14 @@ lidar_initialpose_node:
     # than the old endpoint-only hits/valid score.
     min_score: 0.25
 
+    # Publish gate. Keep min_score low enough for diagnostics, but only inject
+    # a pose into slam_toolbox when the match has enough evidence.
+    enable_confidence_gate: true
+    min_publish_score: 0.55
+    min_hit_ratio: 0.62
+    max_miss_ratio: 0.25
+    max_blocked_ratio: 0.15
+
     # Ambiguity check. If best and second-best are too close, the pose is still
     # published by default, but with larger covariance. Set reject_ambiguous_pose
     # to true if you prefer fallback instead.
@@ -99,6 +107,8 @@ lidar_initialpose_node:
     reject_ambiguous_pose: false
     min_score_margin: 0.06
     min_score_ratio: 1.12
+    distinct_peak_xy_m: 0.75
+    distinct_peak_yaw_deg: 20.0
     ambiguous_cov_xy: 0.80
     ambiguous_cov_yaw: 0.60
 

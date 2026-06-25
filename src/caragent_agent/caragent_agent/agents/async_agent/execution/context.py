@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Optional, Sequence
 
 from langchain_core.tools import BaseTool
@@ -11,6 +12,10 @@ from ..runtime.types import (
     BackgroundAnalysisItem,
     EventItem,
     TaskItem,
+)
+from ..runtime.legacy_task_metadata import (
+    legacy_object_kind,
+    legacy_staging_kind,
 )
 
 def truncate_context_text(value: Any, limit: int = 400) -> Optional[str]:
@@ -100,7 +105,7 @@ def _has_query_dependency(
 
 
 def _navigation_action_resolver_task_id(task: Optional[TaskItem]) -> Optional[int]:
-    """Return the resolver task id used by a structured navigation target."""
+    """Return the source task id used by a structured navigation target."""
 
     if not task or task.get("task_type") != "navigation_action":
         return None
@@ -162,6 +167,22 @@ def task_depends_on_query_result(
     return _has_query_dependency(task, tasks)
 
 
+def background_result_is_reusable_for_task(
+    bg_result: Optional[BackgroundAnalysisItem | str],
+) -> bool:
+    """Return True when cached background output is useful executor evidence."""
+
+    if not isinstance(bg_result, dict):
+        return False
+    if isinstance(bg_result.get("recommended_destination"), dict):
+        return True
+    if bg_result.get("recommended_keyframe_id") is not None:
+        return True
+    if bg_result.get("failure_reason") or bg_result.get("object_preanalysis"):
+        return True
+    return False
+
+
 def get_default_execute_context_keys(
     current_task: Optional[TaskItem],
 ) -> tuple[str, ...]:
@@ -174,6 +195,7 @@ def get_default_execute_context_keys(
         "current_user_input",
         "upstream_tasks",
         "arrival_context",
+        "plan_blackboard",
     )
 
 
@@ -181,14 +203,49 @@ def should_preanalyze_future_task(
     current_task: Optional[TaskItem],
     tasks: dict[int, TaskItem],
 ) -> bool:
-    """Return True for pending destination resolvers used by navigation actions."""
+    """Return True for future tasks that can benefit from early grounding."""
 
-    if not current_task or current_task.get("task_type") != "llm_action":
+    if not current_task:
         return False
+    target = current_task.get("target")
+    if (
+        current_task.get("task_type") == "navigation_action"
+        and isinstance(target, dict)
+        and str(target.get("type") or "").strip() == "semantic_object"
+    ):
+        if str(target.get("target_source") or "").strip() == "current_view":
+            return False
+        return True
+    if (
+        current_task.get("task_type") == "navigation_action"
+        and isinstance(target, dict)
+        and str(target.get("type") or "").strip() == "semantic_keyframe"
+    ):
+        source = str(target.get("target_source") or "").strip()
+        return source in {"scene_memory", "explicit", ""}
+    if current_task.get("task_type") != "llm_action":
+        return False
+    outputs = {str(value).strip() for value in current_task.get("outputs", []) or []}
+    is_semantic_object = (
+        "destination" in outputs
+        and bool(current_task.get("inputs_from"))
+        and current_task.get("target") in (None, "", [], {})
+    )
+    if not is_semantic_object:
+        is_semantic_object = legacy_object_kind(current_task)
+    if not is_semantic_object and not current_task.get("target"):
+        description = str(current_task.get("description") or "").lower()
+        is_semantic_object = (
+            "approach_object_in_current_view" in description
+            or "semantic object" in description
+            or "object level" in description
+        )
     current_task_id = current_task.get("task_id")
     for task in tasks.values():
         if _navigation_action_resolver_task_id(task) == current_task_id:
             return True
+    if is_semantic_object:
+        return True
     return False
 
 
@@ -260,6 +317,12 @@ def summarize_task_for_execution_context(task: Optional[TaskItem]) -> Optional[d
         "task_id": task.get("task_id"),
         "task_type": task.get("task_type"),
         "target": task.get("target"),
+        "inputs_from": task.get("inputs_from", {}),
+        "outputs": task.get("outputs", []),
+        "image_refs": task.get("image_refs", []),
+        "primary_target": task.get("primary_target"),
+        "scene_context": task.get("scene_context"),
+        "selection_policy": task.get("selection_policy"),
         "type": task.get("type"),
         "description": task.get("description"),
         "status": task.get("status"),
@@ -269,6 +332,196 @@ def summarize_task_for_execution_context(task: Optional[TaskItem]) -> Optional[d
         "wait_for_event": task.get("wait_for_event"),
         "terminal_reason": task.get("terminal_reason"),
         "latest_result": compact_result,
+    }
+
+
+def _parse_json_like_context_payload(value: Any) -> Any:
+    """Parse a JSON-ish value for compact blackboard extraction."""
+
+    if value is None:
+        return None
+    if isinstance(value, (dict, list)):
+        return value
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    start = text.find("{")
+    while start >= 0:
+        depth = 0
+        in_string = False
+        escape = False
+        for index in range(start, len(text)):
+            char = text[index]
+            if escape:
+                escape = False
+                continue
+            if char == "\\":
+                escape = True
+                continue
+            if char == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start : index + 1])
+                    except Exception:
+                        break
+        start = text.find("{", start + 1)
+    return value
+
+
+def _extract_named_signal(value: Any, signal_name: str, *, _depth: int = 0) -> Any:
+    """Extract a compact named output signal from common task/tool payload shapes."""
+
+    if value is None or _depth > 8:
+        return None
+    parsed = _parse_json_like_context_payload(value)
+    if parsed is not value:
+        return _extract_named_signal(parsed, signal_name, _depth=_depth + 1)
+    if isinstance(value, list):
+        for item in reversed(value):
+            found = _extract_named_signal(item, signal_name, _depth=_depth + 1)
+            if found is not None:
+                return found
+        return None
+    if not isinstance(value, dict):
+        return None
+    if value.get(signal_name) not in (None, "", [], {}):
+        return value.get(signal_name)
+    if signal_name == "destination":
+        destination = value.get("destination")
+        if isinstance(destination, dict):
+            return destination
+        if isinstance(value.get("data"), dict):
+            destination = value["data"].get("destination")
+            if isinstance(destination, dict):
+                return destination
+    for key in (
+        "data",
+        "result",
+        "record",
+        "target",
+        "content",
+        "summary",
+        "raw_output",
+        "final_ai_content",
+        "tool_results",
+    ):
+        nested = value.get(key)
+        if nested is value:
+            continue
+        found = _extract_named_signal(nested, signal_name, _depth=_depth + 1)
+        if found is not None:
+            return found
+    return None
+
+
+def _compact_signal_value(value: Any, *, limit: int = 800) -> Any:
+    """Keep blackboard signals compact enough for prompt context."""
+
+    if isinstance(value, str):
+        return truncate_context_text(value, limit=limit)
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    try:
+        text = json.dumps(value, ensure_ascii=False)
+    except Exception:
+        text = str(value)
+    if len(text) <= limit:
+        return value
+    return {
+        "truncated": True,
+        "preview": truncate_context_text(text, limit=limit),
+    }
+
+
+def _latest_task_result(task: Optional[TaskItem]) -> Optional[dict[str, Any]]:
+    if not task:
+        return None
+    results = list(task.get("result") or [])
+    if not results:
+        return None
+    latest = results[-1]
+    return latest if isinstance(latest, dict) else {"summary": latest}
+
+
+def _task_declared_outputs(task: TaskItem) -> list[str]:
+    declared = [
+        str(value).strip()
+        for value in task.get("outputs", []) or []
+        if str(value).strip()
+    ]
+    if declared:
+        return declared
+    target = task.get("target")
+    if task.get("task_type") == "navigation_action" and isinstance(target, dict):
+        target_type = str(target.get("type") or "").strip()
+        if target_type == "semantic_keyframe":
+            return ["destination", "current_place_context"]
+        if target_type == "semantic_object":
+            return ["destination", "selected_object"]
+    if legacy_staging_kind(task):
+        return ["destination", "current_place_context"]
+    if legacy_object_kind(task):
+        return ["destination", "selected_object"]
+    return []
+
+
+def build_plan_blackboard(
+    tasks: dict[int, TaskItem],
+    *,
+    current_plan_id: Optional[str],
+) -> dict[str, Any]:
+    """Build current-plan working memory from declared task outputs."""
+
+    by_task: dict[str, dict[str, Any]] = {}
+    latest: dict[str, Any] = {}
+    for task_id in sorted(tasks):
+        task = tasks[task_id]
+        if current_plan_id and task.get("plan_id") != current_plan_id:
+            continue
+        if task.get("status") not in {"completed", "waiting"}:
+            continue
+        result = _latest_task_result(task)
+        if result is None:
+            continue
+        outputs = _task_declared_outputs(task)
+        task_signals: dict[str, Any] = {}
+        for output_name in outputs:
+            value = _extract_named_signal(result, output_name)
+            if value is None and output_name == "current_place_context":
+                destination = _extract_named_signal(result, "destination")
+                if destination is not None:
+                    value = {"destination": destination, "source_task_id": task_id}
+            if value is None:
+                continue
+            compact = _compact_signal_value(value)
+            task_signals[output_name] = compact
+            latest[output_name] = {
+                "source_task_id": task_id,
+                "value": compact,
+            }
+        if task_signals:
+            by_task[str(task_id)] = {
+                "description": truncate_context_text(task.get("description"), limit=180),
+                "outputs": task_signals,
+            }
+
+    return {
+        "by_task": by_task,
+        "latest": latest,
     }
 
 
@@ -396,11 +649,16 @@ def build_execution_context_snapshot(
         "current_user_input": {
             "user_input_id": current_user_input.get("user_input_id"),
             "content": truncate_context_text(scoped_user_input_content, limit=240),
+            "attached_images": list(current_user_input.get("attached_images") or []),
         }
         if current_user_input and scoped_user_input_content
         else None,
         "arrival_context": arrival_context,
         "upstream_tasks": upstream_tasks,
+        "plan_blackboard": build_plan_blackboard(
+            tasks,
+            current_plan_id=current_plan_id,
+        ),
     }
 
     return packet
@@ -464,7 +722,14 @@ def build_execution_guide(
         "12. For scene-memory destination search, map the intent into 3-6 concrete object/place phrases or aliases, search with those concrete variants in one request when possible, then inspect keyframe metadata to verify the target.",
         "13. If metadata verifies one candidate that satisfies the requested target, choose it and finish. If several candidates satisfy the same target, pick one directly instead of launching additional searches.",
         "14. Use keyframe image analysis only when metadata is insufficient or visual confirmation is genuinely needed.",
-        "15. Finish with a concise result for this task only.",
+        "15. Tool budget for keyframe matching: normally call one scene-memory search/match tool, then inspect metadata; analyze at most three candidate images. Do not keep searching for a perfect match.",
+        "16. For attached-image matching, use match_attached_image_to_keyframes with the task's image_focus. Trust its resolved recommended_keyframe_id when resolution_status is resolved; candidate evidence is for explanation/debugging.",
+        "17. For attached-image object targets, treat the image as approximate scene context. Prefer staging keyframes where the target object is closer, clearer, more complete, and less occluded rather than matching every background detail.",
+        "18. If current_task.target.target_source is current_view, use live/current-view tools and do not wait for historical background preanalysis.",
+        "19. If current_task.target.target_source is arrived_scene or upstream_result, start from current_task.target.inputs_from and upstream task results. Do not re-select a target object that an upstream task already selected unless the signal is missing or contradictory.",
+        "20. If this task is semantic object localization and an upstream selected_object is available, localize that selected object; do not repeat broad keyframe search or choose a different object.",
+        "21. Respect current_task.outputs as the task boundary. If outputs does not include destination, produce only the requested observation/selection/context signals and leave destination resolution to the downstream task.",
+        "22. Finish with a concise result for this task only.",
     ]
 
     if current_task is not None:
@@ -489,11 +754,41 @@ def build_execution_guide(
                     continue
                 if target_task_id != active_task_id:
                     continue
-                guide_lines.append(
-                    "This task is a destination resolver for a following navigation_action. Follow this exact workflow: (1) call query_memory with scope='navigation' and view='summary_table' to inspect reusable visited-place anchors; (2) if a navigation row clearly matches, call navigation detail for that row and reuse its keyframe/position; (3) if navigation memory returns no matching anchor, stop using runtime memory and resolve from scene memory: map the target into concrete object/place phrases, search once with those phrases, retrieve candidate keyframe metadata with positions, and choose one candidate whose metadata verifies the requested target; (4) analyze candidate images only when metadata is insufficient, and analyze at most three candidates; (5) if multiple returned keyframes satisfy the same target, pick one directly instead of launching additional searches; (6) do not query conversation, plan, task, or observation memory, and do not call live current-state/current-image tools for this destination resolver. End with a concrete destination, ideally JSON like {\"destination\":{\"type\":\"keyframe\",\"keyframe_id\":123}}."
+                upcoming_descriptions = " ".join(
+                    str(task.get("description") or "")
+                    for task in execution_context_packet.get("upcoming_tasks", [])
+                    if isinstance(task, dict)
+                ).lower()
+                staging_for_semantic_object = (
+                    "approach_object_in_current_view" in upcoming_descriptions
+                    or "semantic_object" in upcoming_descriptions
+                    or "object localization" in upcoming_descriptions
+                )
+                staging_constraint_note = (
+                    " If this task provides the staging destination for later semantic object localization, keep the final target and reference constraints in the scene-memory search phrases so the chosen keyframe gives a clear, close, localizable view of that final target. Prefer candidates where the final object appears reasonably large, complete, sharp, and unoccluded enough for detection, segmentation, and stereo depth; do not choose a keyframe merely because the broad landmark matches if the target object is tiny, far away, at the image edge, or only barely visible. For ordinary broad place navigation, keep the search broad and do not invent object constraints."
+                    if staging_for_semantic_object
+                    else ""
                 )
                 guide_lines.append(
-                    "For semantic destination search, use the pure target object/place as the search text. Treat phrases like 'from there', 'across the hall', 'near the previous stop', or 'after that' as route context, not required search keywords, unless the target is otherwise ambiguous."
+                    "This task produces a reusable destination signal for a following navigation_action. Follow this workflow: (1) call query_memory with scope='navigation' and view='summary_table' to inspect reusable visited-place anchors; (2) if a navigation row clearly matches, call navigation detail for that row and reuse its keyframe/position; (3) if navigation memory returns no matching anchor, stop using runtime memory and ground the target from scene memory: map the target into concrete object/place phrases; search once with those phrases, retrieve candidate keyframe metadata with positions, and choose one candidate whose best_semantic_chunk/semantic_excerpt verifies the requested target; retrieval_score is only an initial ranking signal, not answer confidence; (4) analyze candidate images only when metadata is insufficient, and analyze at most three candidates; (5) if multiple returned keyframes satisfy the same target, prefer the keyframe where the requested target appears closer, larger, clearer, more complete, more centered, less occluded, and localizable enough for later object perception; do not treat this as current-to-keyframe route distance; (6) do not query conversation, plan, task, or observation memory, and do not call live current-state/current-image tools for this reusable destination signal. Submit the result with submit_task_result(destination={...}, summary=...)."
+                    + staging_constraint_note
+                )
+                guide_lines.append(
+                    "Reusable destination boundary: do not call navigation tools such as go_to_keyframe/go_to_position in this task, even if they appear tempting. Also do not invent a tool named destination. Submit the structured destination; the following navigation_action task will dispatch movement."
+                )
+                guide_lines.append(
+                    "If this task uses an attached image, remember that the image is not a perfect-match template. For object targets, choose the keyframe where the target object is most visible and useful for later live object localization; minor scene-detail mismatches are acceptable."
+                )
+                if current_task.get("primary_target") or current_task.get("selection_policy"):
+                    guide_lines.append(
+                        "Structured task intent: primary_target={primary_target}; selection_policy={selection_policy}; scene_context={scene_context}. Use this intent to choose among candidate keyframes returned by tools.".format(
+                            primary_target=current_task.get("primary_target") or "",
+                            selection_policy=current_task.get("selection_policy") or "",
+                            scene_context=current_task.get("scene_context") or "",
+                        )
+                    )
+                guide_lines.append(
+                    "For semantic destination search, use the pure target object/place as the search text. Keep spatial constraints and reference landmarks that identify the final target or improve the staging viewpoint, such as 'left of the elevator entrance' for a later semantic object fire-extinguisher-box approach. Treat phrases like 'from there', 'across the hall', 'near the previous stop', or 'after that' as route context, not required search keywords, unless the target is otherwise ambiguous."
                 )
                 break
 
@@ -548,10 +843,12 @@ def summarize_background_reference(
         if str(value).strip().lstrip("-").isdigit()
     ]
     recommended_keyframe_id = bg_result.get("recommended_keyframe_id")
+    recommended_destination = bg_result.get("recommended_destination")
     recommendation_reason = truncate_context_text(
         bg_result.get("recommendation_reason"),
         limit=220,
     )
+    failure_reason = truncate_context_text(bg_result.get("failure_reason"), limit=260)
     recommendation_confidence = bg_result.get("recommendation_confidence")
     notes = [
         note
@@ -581,7 +878,14 @@ def summarize_background_reference(
             )
 
     if not (summary or final_output or notes or tool_observations or candidate_keyframe_lines):
-        if candidate_keyframe_ids or recommended_keyframe_id is not None:
+        object_preanalysis = bg_result.get("object_preanalysis")
+        if (
+            candidate_keyframe_ids
+            or recommended_keyframe_id is not None
+            or isinstance(bg_result.get("recommended_destination"), dict)
+            or failure_reason
+            or isinstance(object_preanalysis, dict)
+        ):
             lines = [f"Background analysis status: {status}."]
             if candidate_keyframe_ids:
                 lines.append(
@@ -590,6 +894,18 @@ def summarize_background_reference(
                 )
             if recommended_keyframe_id is not None:
                 lines.append(f"Recommended keyframe: {recommended_keyframe_id}")
+            if isinstance(bg_result.get("recommended_destination"), dict):
+                lines.append(
+                    "Recommended destination: "
+                    + truncate_context_text(bg_result.get("recommended_destination"), limit=360)
+                )
+            if failure_reason:
+                lines.append(f"Background failure reason: {failure_reason}")
+            if isinstance(object_preanalysis, dict):
+                paths = object_preanalysis.get("paths") if isinstance(object_preanalysis.get("paths"), dict) else {}
+                summary_json = paths.get("summary_json") or object_preanalysis.get("summary_json")
+                if summary_json:
+                    lines.append(f"Object preanalysis summary_json: {summary_json}")
             return "\n".join(lines)
         return None
 
@@ -609,6 +925,19 @@ def summarize_background_reference(
         if recommendation_reason:
             recommendation_line += f" - {recommendation_reason}"
         lines.append(recommendation_line)
+    if isinstance(recommended_destination, dict):
+        lines.append(
+            "Recommended destination: "
+            + truncate_context_text(recommended_destination, limit=360)
+        )
+    if failure_reason:
+        lines.append(f"Background failure reason: {failure_reason}")
+    object_preanalysis = bg_result.get("object_preanalysis")
+    if isinstance(object_preanalysis, dict):
+        paths = object_preanalysis.get("paths") if isinstance(object_preanalysis.get("paths"), dict) else {}
+        summary_json = paths.get("summary_json") or object_preanalysis.get("summary_json")
+        if summary_json:
+            lines.append(f"Object preanalysis summary_json: {summary_json}")
     if summary:
         lines.append(f"Current summary: {summary}")
     if final_output and final_output != summary:
@@ -652,6 +981,7 @@ def build_background_reference(
 
 
 __all__ = [
+    "background_result_is_reusable_for_task",
     "build_background_reference",
     "build_execution_context_snapshot",
     "build_execution_guide",

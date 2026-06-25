@@ -143,6 +143,54 @@ class NavigationTool(ToolBase):
         return [float(arr[0]), float(arr[1]), float(z)]
 
 
+class NavigationToPositionTool(ToolBase):
+    def __init__(self, controller: Any | None = None):
+        super().__init__(
+            name="go_to_position",
+            description="""
+                Dispatches navigation to a concrete map-frame position.
+
+                Args:
+                    x (float): Target x in map frame.
+                    y (float): Target y in map frame.
+                    z (float): Target z in map frame, defaults to 0.
+                    yaw_deg (float): Target yaw in degrees, defaults to 0.
+            """,
+            capability_tags=("navigation", "background_unsafe"),
+        )
+        self.controller = controller
+
+    def execute(self, x: float, y: float, z: float = 0.0, yaw_deg: float = 0.0):
+        if self.controller is None:
+            return self.blocked(
+                "Controller is unavailable, so navigation to position cannot be dispatched.",
+                error={"code": "controller_unavailable", "message": "Controller reference is missing."},
+                provenance={"source_type": "controller"},
+            )
+        waypoint = [float(x), float(y), float(z), float(yaw_deg)]
+        try:
+            self.controller.update_path([waypoint])
+            nav_status = self.controller.get_status() if hasattr(self.controller, "get_status") else "dispatched"
+        except Exception as exc:
+            return self.error_result(
+                "Controller failed to accept the map-frame position goal.",
+                data={"target_position": waypoint[:3], "target_yaw_deg": waypoint[3]},
+                error={"code": "controller_update_failed", "message": str(exc)},
+                provenance={"source_type": "controller"},
+            )
+        return self.ok(
+            f"Dispatched navigation to map position x={waypoint[0]:.2f}, y={waypoint[1]:.2f}.",
+            data={
+                "target_position": waypoint[:3],
+                "target_yaw_deg": waypoint[3],
+                "planned_path": [waypoint],
+                "path_waypoint_count": 1,
+                "navigation_status": nav_status,
+            },
+            provenance={"source_type": "controller"},
+        )
+
+
 def _yaw_deg_from_quaternion(quaternion) -> float:
     q = np.asarray(quaternion, dtype=float).reshape(-1)
     if q.size < 4:

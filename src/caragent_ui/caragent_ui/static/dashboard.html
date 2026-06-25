@@ -51,6 +51,12 @@
   <span class="hdr-label">Laser</span><select id="global-laser" class="hdr-port"></select>
   <span class="hdr-label">STM32</span><select id="global-stm32" class="hdr-port"></select>
   <span class="hdr-label">Camera</span><select id="global-camera" class="hdr-port"></select>
+  <span class="hdr-label">Resolution</span><select id="global-camera-resolution" class="hdr-port">
+    <option value="3840x1200">3840x1200</option>
+    <option value="3840x1080">3840x1080</option>
+    <option value="2560x720">2560x720</option>
+    <option value="1280x480">1280x480</option>
+  </select>
   <button onclick="loadPorts()">刷新端口</button>
   <button onclick="refreshAll()">刷新</button>
   <button class="danger" onclick="stopAll()">停止全部</button>
@@ -62,6 +68,7 @@
   <button onclick="showTab('scene')">场景地图</button>
   <button onclick="showTab('agent')">Agent</button>
   <button onclick="showTab('tests')">测试工具</button>
+  <button onclick="showTab('object_dataset')">Object Dataset</button>
   <button onclick="showTab('calib')">标定</button>
   <button onclick="showTab('logs')">日志</button>
 </nav>
@@ -102,6 +109,13 @@
         <h3>启动导航</h3>
         <label>地图 base path</label><select id="nav-map"></select>
         <label><input id="nav-cmd" type="checkbox" style="width:auto"> 速度使能 enable_cmd_vel</label>
+        <label><input id="nav-left-only" type="checkbox" style="width:auto"> left-only 接管测试</label>
+        <label>max linear m/s</label><input id="nav-max-linear" value="0.40" type="number" min="0.20" max="0.45" step="0.01">
+        <label>pre-align 策略</label><select id="nav-pre-align-strategy">
+          <option value="direct_bearing">direct_bearing</option>
+          <option value="path_heading">path_heading</option>
+        </select>
+        <label>path heading lookahead m</label><input id="nav-path-lookahead" value="0.70" type="number" min="0.20" max="2.00" step="0.05">
         <div class="row"><button class="primary" onclick="startNavigation()">启动导航 + RViz</button><button class="danger" onclick="stopProcess('navigation')">停止导航</button></div>
       </div>
     </div>
@@ -153,13 +167,93 @@
       <div class="card third"><h3>STM32</h3><button class="primary" onclick="startProcess('stm32_test', globalPorts())">启动 STM32 测试</button><button class="danger" onclick="stopProcess('stm32_test')">停止</button></div>
       <div class="card third"><h3>摄像头</h3><button class="primary" onclick="startProcess('camera_test', globalPorts())">启动双目预览</button><button class="danger" onclick="stopProcess('camera_test')">停止</button></div>
       <div class="card wide">
+        <h3>VLM 目标框选择</h3>
+        <div class="split">
+          <div>
+            <label>Session / selected</label><select id="vlm-session" onchange="refreshVlmImages()"></select>
+            <label>关键帧图片</label><select id="vlm-image"></select>
+            <div class="split"><div><label>DINO 检测词</label><input id="vlm-grounding-query" value="chair"></div><div><label>VLM 目标描述</label><input id="vlm-query" value="middle chair with a bag above"></div></div>
+            <label>输出目录</label><input id="vlm-out">
+          </div>
+          <div>
+            <div class="split"><div><label>Box Threshold</label><input id="vlm-box-threshold" value="0.25" type="number" step="0.01"></div><div><label>Text Threshold</label><input id="vlm-text-threshold" value="0.20" type="number" step="0.01"></div></div>
+            <div class="split"><div><label>Max Candidates</label><input id="vlm-max-candidates" value="8" type="number" min="1" max="20"></div><div><label>Grounding Device</label><select id="vlm-device"><option>GPU</option><option>CPU</option><option>AUTO</option></select></div></div>
+            <label>VLM Model</label><input id="vlm-model" value="qwen3-vl-plus">
+            <div class="row" style="margin-top:12px"><button class="primary" onclick="startVlmBoxSelect()">运行 VLM 选择</button><button class="danger" onclick="stopProcess('vlm_box_select')">停止</button><button onclick="refreshVlmImages()">刷新图片</button></div>
+          </div>
+        </div>
+        <p class="small muted">DINO 检测词建议用短类别词，如 chair；VLM 目标描述可以写空间和属性约束，如 middle chair with a bag above。</p>
+      </div>
+      <div class="card wide">
         <h3>物体级 pipeline</h3>
         <div class="split"><div><label>目标描述</label><input id="obj-target" value="chair"></div><div><label>SAM label query</label><input id="obj-label" value="chair"></div></div>
-        <div class="split"><div><label>真实距离 m</label><input id="obj-truth" placeholder="可空"></div><div><label>输出目录</label><input id="obj-out"></div></div>
+        <div class="split"><div><label>真实距离 m</label><input id="obj-truth" placeholder="可空"></div><div><label>定位模式</label><select id="obj-mode"><option value="stereo">stereo</option><option value="stereo_primary_mono_guard">stereo_primary_mono_guard</option><option value="mono_relative_lidar">mono_relative_lidar</option><option value="mono_absolute">mono_absolute</option></select></div></div>
+        <label>输出目录</label><input id="obj-out">
         <div class="row"><button class="primary" onclick="startObjectPipeline()">启动 live validation</button><button class="danger" onclick="stopProcess('object_pipeline')">停止</button><button onclick="refreshResults()">刷新结果</button></div>
         <div class="row" style="margin-top:6px"><button onclick="updateLiveTarget()" style="background:#f0a030">更新检测目标</button><span style="font-size:12px;color:#888;margin-left:8px">修改上方目标描述后点击，live 窗口自动同步</span></div>
       </div>
+      <div class="card wide">
+        <h3>物体靠近点测试</h3>
+        <div class="split">
+          <div>
+            <label>目标描述</label><input id="oa-target" value="box">
+            <label>地图 base path</label><select id="oa-map-base"></select>
+            <div class="split"><div><label>DINO query</label><input id="oa-grounding" placeholder="可空, 默认目标描述"></div><div><label>SAM query</label><input id="oa-sam" placeholder="可空"></div></div>
+            <label>VLM 选择描述</label><input id="oa-vlm" placeholder="可空, 可写空间/属性约束">
+            <div class="split"><div><label>深度后端</label><select id="oa-backend"><option value="stereo_primary_mono_guard">stereo_primary_mono_guard</option><option value="auto">auto</option><option value="stereo">stereo</option><option value="mono_relative_lidar">mono_relative_lidar</option></select></div><div><label>停止距离 m</label><input id="oa-stop" value="0.80" type="number" min="0.30" max="2.00" step="0.05"></div></div>
+            <div class="split"><div><label>输出目录</label><input id="oa-out"></div><div><label>超时 s</label><input id="oa-timeout" value="20.0" type="number" min="5" max="120" step="1"></div></div>
+          </div>
+          <div>
+            <div class="split"><div><label>left topic</label><input id="oa-left-topic" value="/stereo/left/image_raw"></div><div><label>right topic</label><input id="oa-right-topic" value="/stereo/right/image_raw"></div></div>
+            <div class="split"><div><label>scan topic</label><input id="oa-scan-topic" value="/scan"></div><div><label>map topic</label><input id="oa-map-topic" value="/global_costmap/costmap"></div></div>
+            <div class="split"><div><label>map frame</label><input id="oa-map-frame" value="map"></div><div><label>base frame</label><input id="oa-base-frame" value="base_link"></div></div>
+            <label>goal topic</label><input id="oa-goal-topic" value="/caragent/object_approach_goal">
+            <div class="row" style="margin-top:12px">
+              <button class="primary" onclick="startObjectApproachLive()">运行/刷新测试</button>
+              <button class="danger" onclick="stopProcess('object_approach_live')">停止</button>
+              <button onclick="refreshResults()">刷新结果</button>
+            </div>
+            <p class="small muted">会自动启动导航定位依赖，但速度默认不使能；只定位目标并生成靠近点，不发 Nav2。结果会写出 summary、approach_goal、approach_debug 地图标注图，并发布 PoseStamped 到 goal topic。</p>
+          </div>
+        </div>
+      </div>
       <div class="card wide"><h3>最新结果</h3><div id="results-list" class="list"></div></div>
+    </div>
+  </section>
+
+  <section id="object_dataset">
+    <h2>Object Depth Dataset</h2>
+    <div class="grid">
+      <div class="card wide">
+        <h3>采集数据集</h3>
+        <div class="split">
+          <div>
+            <label>选择已有数据集</label><select id="od-dataset"></select>
+            <label>新建/当前数据集名称</label><input id="od-name" placeholder="object_depth_chair_door_01">
+            <div class="split"><div><label>检测 prompt</label><input id="od-target" value="chair"></div><div><label>SAM label</label><input id="od-label" value="chair"></div></div>
+            <div class="split"><div><label>标准距离 m</label><input id="od-truth" placeholder="2.00"></div><div><label>备注</label><input id="od-note" placeholder="chair 2m center"></div></div>
+            <div class="row" style="margin-top:12px">
+              <button class="primary" onclick="startObjectDepthCollect()">启动采集窗口</button>
+              <button onclick="updateObjectDepthConfig()">更新目标/距离</button>
+              <button class="danger" onclick="stopProcess('object_depth_collect')">停止采集</button>
+            </div>
+            <p class="small muted">采集窗口快捷键：v 跑 GroundingDINO + SAM 预览框和 mask，c 保存样本，q 退出。选择已有数据集后会继续追加样本。</p>
+          </div>
+          <div>
+            <h3>模型评估</h3>
+            <label>评估 run 名称</label><input id="od-run" value="baseline">
+            <label>评估模式</label><input id="od-modes" value="stereo,mono_relative_lidar">
+            <label><input id="od-force" type="checkbox" style="width:auto"> 强制重跑已缓存样本</label>
+            <div class="row" style="margin-top:12px">
+              <button class="ok" onclick="startObjectDepthEval()">启动评估</button>
+              <button class="danger" onclick="stopProcess('object_depth_eval')">停止评估</button>
+              <button onclick="refreshObjectDepthDatasets()">刷新数据集</button>
+            </div>
+            <p class="small muted">结果保存在 dataset/evaluations/run_name/summary.csv 和 summary.jsonl。默认按样本+模式+模型配置缓存，跑过的不重跑。</p>
+          </div>
+        </div>
+      </div>
+      <div class="card wide"><h3>已有 Object Depth 数据集</h3><div id="od-datasets-list" class="list"></div></div>
     </div>
   </section>
 
@@ -170,16 +264,18 @@
         <h3>双目标定</h3>
         <label>已有参数</label><input id="stereo-calib" readonly>
         <label>采集输出目录</label><input id="stereo-capture-out">
-        <button class="primary" onclick="startProcess('stereo_calib_capture',{camera_device:$('global-camera').value,output_dir:$('stereo-capture-out').value})">启动棋盘格采集</button>
+        <div class="split"><div><label>内角点列 cols</label><input id="stereo-cols" placeholder="9"></div><div><label>内角点行 rows</label><input id="stereo-rows" placeholder="6"></div><div><label>方格边长 m</label><input id="stereo-square" placeholder="0.025"></div></div>
+        <button class="primary" onclick="startStereoCalibCapture()">启动棋盘格采集</button>
+        <button class="ok" onclick="startStereoCalibRun()">运行双目标定</button>
         <button class="danger" onclick="stopProcess('stereo_calib_capture')">停止</button>
       </div>
       <div class="card">
         <h3>雷达-相机外参</h3>
         <label>当前外参</label><input id="extrinsics-json" readonly>
         <label>对应点 JSONL</label><input id="lidar-cam-jsonl">
-        <button class="primary" onclick="startProcess('lidar_camera_collect',{output_jsonl:$('lidar-cam-jsonl').value,laser_port:$('global-laser').value,stm32_port:$('global-stm32').value,camera_device:$('global-camera').value})">启动对应点采集</button>
+        <button class="primary" onclick="startProcess('lidar_camera_collect',{...globalPorts(),output_jsonl:$('lidar-cam-jsonl').value})">启动对应点采集</button>
+        <button class="ok" onclick="startLidarCameraCalibRun()">运行外参求解</button>
         <button class="danger" onclick="stopProcess('lidar_camera_collect')">停止</button>
-        <p class="small muted">优化求解按钮作为 v1.1；当前先集成交互式采集入口。</p>
       </div>
     </div>
   </section>
@@ -207,7 +303,7 @@ function toast(msg){ console.log(msg); }
 function showTab(id){ document.querySelectorAll('main section').forEach(s=>s.classList.remove('active')); $(id).classList.add('active'); }
 function opt(sel, value, text){ const o=document.createElement('option'); o.value=value; o.textContent=text||value; sel.appendChild(o); }
 function fileLink(path, text){ return path ? `<a target="_blank" href="/api/file?path=${encodeURIComponent(path)}">${text||path.split('/').pop()}</a>` : ''; }
-function globalPorts(){ return { laser_port:$('global-laser').value, stm32_port:$('global-stm32').value, camera_device:$('global-camera').value }; }
+function globalPorts(){ return { laser_port:$('global-laser').value, stm32_port:$('global-stm32').value, camera_device:$('global-camera').value, camera_resolution:$('global-camera-resolution').value }; }
 async function loadPorts(){
   const data = await api('/api/ports');
   const serial = data.serial?.length ? data.serial : ['/dev/ttyUSB0','/dev/ttyUSB1'];
@@ -223,6 +319,8 @@ async function refreshStatus(){
   $('agent-link').textContent = `http://${location.hostname}:${statusCache.agent_web_port || 8123}`;
   $('agent-config').value ||= `${statusCache.workspace}/src/caragent_agent/config/config.yaml`;
   $('obj-out').value ||= `${statusCache.workspace}/perception_outputs/scan_monodepth_validation`;
+  $('oa-out').value ||= `${statusCache.workspace}/perception_outputs/object_approach_live`;
+  $('vlm-out').value ||= `${statusCache.workspace}/perception_outputs/vlm_box_select`;
   $('stereo-calib').value = statusCache.paths?.stereo_calib || '';
   $('extrinsics-json').value = statusCache.paths?.extrinsics || '';
   $('stereo-capture-out').value ||= `${statusCache.workspace}/calibration/stereo_new/capture_${new Date().toISOString().replace(/[-:T]/g,'').slice(0,15)}`;
@@ -236,20 +334,57 @@ async function refreshStatus(){
 async function refreshMaps(){
   const data = await api('/api/maps');
   const maps = data.maps || [];
-  for (const id of ['slam-map','nav-map','kf-map','agent-map']) { const s=$(id); if(!s) continue; const old=s.value; s.innerHTML=''; opt(s,'','-- 全新 --'); maps.forEach(m=>opt(s,m.base_path,m.name)); if(maps.some(m=>m.base_path===old))s.value=old; }
+  for (const id of ['slam-map','nav-map','kf-map','agent-map','oa-map-base']) { const s=$(id); if(!s) continue; const old=s.value; s.innerHTML=''; opt(s,'','-- 全新 --'); maps.forEach(m=>opt(s,m.base_path,m.name)); if(maps.some(m=>m.base_path===old))s.value=old; }
   $('maps-list').innerHTML = maps.map(m=>`<div class="item"><b>${m.name}</b><div class="small muted mono">${m.base_path}</div><div>${(m.files||[]).map(p=>fileLink(p)).join(' ')}</div></div>`).join('') || '<div class="muted">暂无地图</div>';
 }
 async function refreshKeyframes(){
   const data = await api('/api/keyframes'); const sessions=data.sessions||[];
-  const sel=$('scene-session'), asel=$('agent-session'); const old=sel.value, aold=asel.value;
-  sel.innerHTML=''; asel.innerHTML=''; sessions.forEach(x=>{ opt(sel,x.selected_path||x.path,x.name); opt(asel,x.selected_path||x.path,x.name); });
+  const sel=$('scene-session'), asel=$('agent-session'), vsel=$('vlm-session'); const old=sel.value, aold=asel.value, vold=vsel?.value || '';
+  sel.innerHTML=''; asel.innerHTML=''; if(vsel) vsel.innerHTML='';
+  sessions.forEach(x=>{ opt(sel,x.selected_path||x.path,x.name); opt(asel,x.selected_path||x.path,x.name); if(vsel) opt(vsel,x.selected_path||x.path,x.name); });
   if(sessions.some(x=>(x.selected_path||x.path)===old))sel.value=old;
   if(sessions.some(x=>(x.selected_path||x.path)===aold))asel.value=aold;
+  if(vsel && sessions.some(x=>(x.selected_path||x.path)===vold))vsel.value=vold;
   $('sessions-list').innerHTML=sessions.map(x=>`<div class="item"><b>${x.name}</b><div class="small muted mono">${x.path}</div><div>candidate=${x.candidate_frames} selected=${x.selected_frames} nodes=${x.keyframe_nodes} semantic=${x.semantic_nodes}</div><div>${fileLink(x.review_html,'review')} ${fileLink(x.scene_html,'scene map')}</div></div>`).join('') || '<div class="muted">暂无 session</div>';
+}
+async function refreshVlmImages(){
+  const session = $('vlm-session')?.value || '';
+  const sel = $('vlm-image');
+  if(!sel) return;
+  const old = sel.value;
+  sel.innerHTML = '';
+  if(!session){ opt(sel,'','-- 无 session --'); return; }
+  const data = await api('/api/keyframe_images?dataset='+encodeURIComponent(session));
+  const images = data.images || [];
+  images.forEach(img => opt(sel, img.path, img.name));
+  if(images.some(img => img.path === old)) sel.value = old;
+  if(!images.length) opt(sel,'','-- 无图片 --');
 }
 async function refreshResults(){
   const data=await api('/api/results'); const rows=data.results||[];
   $('results-list').innerHTML=rows.map(r=>`<div class="item">${fileLink(r.path,r.name)} <span class="small muted">${r.kind}</span><div class="small muted mono">${r.path}</div></div>`).join('') || '<div class="muted">暂无结果</div>';
+}
+async function refreshObjectDepthDatasets(){
+  const data = await api('/api/object_depth_datasets');
+  const datasets = data.datasets || [];
+  const sel = $('od-dataset');
+  if(sel){
+    const old = sel.value;
+    sel.innerHTML = '';
+    opt(sel, '', '-- 新建 --');
+    datasets.forEach(d => opt(sel, d.name, `${d.name} (${d.sample_count})`));
+    if(datasets.some(d => d.name === old)) sel.value = old;
+    sel.onchange = () => {
+      if(sel.value) $('od-name').value = sel.value;
+    };
+  }
+  const list = $('od-datasets-list');
+  if(list){
+    list.innerHTML = datasets.map(d => {
+      const summaries = (d.summaries || []).map(p => fileLink(p, p.split('/').slice(-2).join('/'))).join(' ');
+      return `<div class="item"><b>${d.name}</b><div>samples=${d.sample_count} targets=${(d.targets||[]).join(', ') || 'n/a'}</div><div class="small muted mono">${d.path}</div><div>${summaries || '<span class="muted">no evaluation yet</span>'}</div></div>`;
+    }).join('') || '<div class="muted">暂无 object depth 数据集</div>';
+  }
 }
 async function refreshLogs(){
   const p=$('log-filter').value; const data=await api('/api/logs'+(p?`?process=${encodeURIComponent(p)}`:''));
@@ -266,7 +401,7 @@ async function setInitialPose(){ const mapBase=$('slam-map').value; if(!mapBase)
 async function clearChanges(){ try{ const r=await api('/api/slam/clear_changes',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}); alert(r.ok?('clear_changes OK: '+(r.output||'')):('失败: '+(r.error||'unknown'))); }catch(e){ alert(e.message); } }
 async function toggleAutoClear(){ const enable=$('auto-clear').checked; const r=await api('/api/slam/auto_clear',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enable})}); if(!r.ok){ alert(r.error); $('auto-clear').checked=false; } }
 function startSlam(){ startProcess('slam',{...globalPorts(), map_base:$('slam-map').value}); }
-function startNavigation(){ startProcess('navigation',{...globalPorts(), map_base:$('nav-map').value, enable_cmd_vel:$('nav-cmd').checked}); }
+function startNavigation(){ startProcess('navigation',{...globalPorts(), map_base:$('nav-map').value, enable_cmd_vel:$('nav-cmd').checked, enable_left_only_goal_proxy:$('nav-left-only').checked, max_linear_mps:$('nav-max-linear').value, pre_align_strategy:$('nav-pre-align-strategy').value, path_heading_lookahead_m:$('nav-path-lookahead').value}); }
 function startKeyframes(){ startProcess('keyframe_record',{...globalPorts(), session_name:$('kf-session').value, map_base:$('kf-map').value}); }
 async function selectKeyframes(){ const chosen=$('scene-session').value; const dataset=chosen.endsWith('/selected') ? chosen.slice(0,-9) : chosen; await api('/api/keyframes/select',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dataset})}); showTab('logs'); $('log-filter').value='keyframe_select'; refreshLogs(); }
 async function visualizeScene(){ const r=await api('/api/keyframes/visualize',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dataset:$('scene-session').value})}); await refreshKeyframes(); if(r.path) window.open('/api/file?path='+encodeURIComponent(r.path),'_blank'); }
@@ -279,8 +414,98 @@ function toggleKf(id,el){ if(kfSelected.has(id)){ kfSelected.delete(id); el.clas
 function toggleSelectAll(){ if(kfSelected.size===kfNodesCache.length){ kfSelected.clear(); }else{ kfNodesCache.forEach(n=>kfSelected.add(n.kf_id)); } renderKfList(); }
 async function submitReannotate(){ if(kfSelected.size===0){ alert('请至少选择一个关键帧'); return; } const ids=Array.from(kfSelected).join(','); closeModal(); const body={dataset:$('scene-session').value,ids,batch_size:parseInt($('anno-batch').value)||5}; const apikey=$('anno-apikey').value.trim(); if(apikey) body.api_key=apikey; await api('/api/keyframes/annotate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); showTab('logs'); $('log-filter').value='keyframe_annotate'; refreshLogs(); }
 function startAgent(){ startProcess('agent',{...globalPorts(), dataset_dir:$('agent-session').value,config_file:$('agent-config').value,map_base:$('agent-map').value,enable_cmd_vel:$('agent-cmd').checked}); }
-function startObjectPipeline(){ startProcess('object_pipeline',{...globalPorts(), target:$('obj-target').value,label_query:$('obj-label').value,truth_distance_m:$('obj-truth').value,output_dir:$('obj-out').value}); }
+function startObjectPipeline(){ startProcess('object_pipeline',{...globalPorts(), target:$('obj-target').value,label_query:$('obj-label').value,truth_distance_m:$('obj-truth').value,localization_mode:$('obj-mode').value,output_dir:$('obj-out').value}); }
+function startObjectApproachLive(){
+  startProcess('object_approach_live',{
+    ...globalPorts(),
+    target:$('oa-target').value || 'box',
+    map_base:$('oa-map-base').value,
+    enable_cmd_vel:false,
+    enable_left_only_goal_proxy:true,
+    grounding_query:$('oa-grounding').value,
+    vlm_query:$('oa-vlm').value,
+    sam_query:$('oa-sam').value,
+    depth_backend:$('oa-backend').value || 'stereo_primary_mono_guard',
+    stop_distance_m:$('oa-stop').value || '0.80',
+    output_root:$('oa-out').value,
+    timeout_sec:$('oa-timeout').value || '20.0',
+    left_topic:$('oa-left-topic').value || '/stereo/left/image_raw',
+    right_topic:$('oa-right-topic').value || '/stereo/right/image_raw',
+    scan_topic:$('oa-scan-topic').value || '/scan',
+    map_topic:$('oa-map-topic').value || '/global_costmap/costmap',
+    goal_topic:$('oa-goal-topic').value || '/caragent/object_approach_goal',
+    map_frame:$('oa-map-frame').value || 'map',
+    base_frame:$('oa-base-frame').value || 'base_link',
+  });
+}
+function stereoCalibParams(){ return {cols:$('stereo-cols').value,rows:$('stereo-rows').value,square_size_m:$('stereo-square').value}; }
+function startStereoCalibCapture(){ startProcess('stereo_calib_capture',{...globalPorts(),output_dir:$('stereo-capture-out').value,...stereoCalibParams()}); }
+function startStereoCalibRun(){ const imageDir=$('stereo-capture-out').value.replace(/\/$/,''); if(!imageDir){ alert('请先填写采集输出目录'); return; } startProcess('stereo_calib_run',{image_dir:imageDir,output:imageDir+'/stereo_calibration.npz',...stereoCalibParams()}); }
+function startVlmBoxSelect(){
+  const image = $('vlm-image').value;
+  const query = $('vlm-query').value.trim();
+  const groundingQuery = $('vlm-grounding-query').value.trim() || query;
+  if(!image){ alert('请选择关键帧图片'); return; }
+  if(!query){ alert('请输入 VLM 目标描述'); return; }
+  startProcess('vlm_box_select',{
+    image,
+    query,
+    grounding_query: groundingQuery,
+    output_dir:$('vlm-out').value,
+    box_threshold:$('vlm-box-threshold').value || '0.25',
+    text_threshold:$('vlm-text-threshold').value || '0.20',
+    max_candidates:$('vlm-max-candidates').value || '8',
+    grounding_device:$('vlm-device').value || 'GPU',
+    vlm_model:$('vlm-model').value || 'qwen3-vl-plus',
+  });
+}
 async function updateLiveTarget(){ try{ let output_dir=$('obj-out').value; let truth=$('obj-truth').value.trim(); let body={output_dir,target:$('obj-target').value,label_query:$('obj-label').value}; if(truth) body.truth_distance_m=parseFloat(truth); await api('/api/live_config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); alert('已更新检测目标: '+body.target); }catch(e){ alert(e.message); } }
+function selectedObjectDatasetName(){
+  return ($('od-name').value || $('od-dataset').value || `object_depth_${new Date().toISOString().replace(/[-:T]/g,'').slice(0,15)}`).trim();
+}
+function objectDepthBody(){
+  const truth = $('od-truth').value.trim();
+  const body = {
+    ...globalPorts(),
+    dataset_name: selectedObjectDatasetName(),
+    target: $('od-target').value || 'chair',
+    label_query: $('od-label').value || $('od-target').value || 'chair',
+    note: $('od-note').value || '',
+  };
+  if(truth) body.truth_distance_m = parseFloat(truth);
+  return body;
+}
+async function updateObjectDepthConfig(){
+  try{
+    const body = objectDepthBody();
+    await api('/api/object_depth_dataset/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    await refreshObjectDepthDatasets();
+    alert('已更新采集配置: '+body.dataset_name);
+  }catch(e){ alert(e.message); }
+}
+async function startObjectDepthCollect(){
+  const body = objectDepthBody();
+  await api('/api/object_depth_dataset/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  await startProcess('object_depth_collect', body);
+}
+function startObjectDepthEval(){
+  const name = selectedObjectDatasetName();
+  startProcess('object_depth_eval',{
+    dataset_name: name,
+    dataset_dir: `${statusCache.workspace}/perception_datasets/object_depth/${name}`,
+    run_name: $('od-run').value || 'baseline',
+    modes: $('od-modes').value || 'stereo,mono_relative_lidar',
+    force: $('od-force').checked,
+  });
+}
+function startLidarCameraCalibRun(){
+  startProcess('lidar_camera_calib_run',{
+    ...globalPorts(),
+    samples_jsonl: $('lidar-cam-jsonl').value,
+    calib_file: $('stereo-calib').value,
+    output_json: $('extrinsics-json').value,
+  });
+}
 function copyText(id){ navigator.clipboard.writeText($(id).value || $(id).textContent || ''); }
 function copyLogs(){ navigator.clipboard.writeText($('log').textContent); }
 function escapeHtml(value){
@@ -311,7 +536,7 @@ function renderLogs(lines){
   $('log').innerHTML = normalized.map(renderLogLine).join('');
   $('log').scrollTop = $('log').scrollHeight;
 }
-async function refreshAll(){ await loadPorts(); await refreshStatus(); await refreshMaps(); await refreshKeyframes(); await refreshResults(); await refreshLogs(); }
+async function refreshAll(){ await loadPorts(); await refreshStatus(); await refreshMaps(); await refreshKeyframes(); await refreshVlmImages(); await refreshResults(); await refreshObjectDepthDatasets(); await refreshLogs(); }
 refreshAll(); setInterval(()=>{refreshStatus(); refreshLogs(); loadPorts();},2500);
 </script>
 <div class="modal-overlay" id="reannotate-modal">

@@ -24,6 +24,7 @@ def generate_launch_description():
     # ---- STM32 driver ----
     base_link_yaw_offset_deg = LaunchConfiguration("base_link_yaw_offset_deg")
     enable_cmd_vel = LaunchConfiguration("enable_cmd_vel")
+    log_pc_debug = LaunchConfiguration("log_pc_debug")
 
     # ---- SLAM / localization ----
     map_file_name = LaunchConfiguration("map_file_name")
@@ -34,10 +35,20 @@ def generate_launch_description():
     nav2_params_file = LaunchConfiguration("nav2_params_file")
     use_map_server = LaunchConfiguration("use_map_server")
     map_yaml_file = LaunchConfiguration("map_yaml_file")
+    enable_left_only_goal_proxy = LaunchConfiguration("enable_left_only_goal_proxy")
+    max_linear_mps = LaunchConfiguration("max_linear_mps")
+    max_angular_radps = LaunchConfiguration("max_angular_radps")
+    pre_align_strategy = LaunchConfiguration("pre_align_strategy")
+    path_heading_lookahead_m = LaunchConfiguration("path_heading_lookahead_m")
 
     # ---- camera ----
     camera_device = LaunchConfiguration("camera_device")
     camera_calib_file = LaunchConfiguration("camera_calib_file")
+    camera_width = LaunchConfiguration("camera_width")
+    camera_height = LaunchConfiguration("camera_height")
+    camera_left_width = LaunchConfiguration("camera_left_width")
+    camera_right_width = LaunchConfiguration("camera_right_width")
+    camera_fps = LaunchConfiguration("camera_fps")
 
     # ============================================================
     # Camera (all modes, when enabled)
@@ -55,6 +66,11 @@ def generate_launch_description():
         launch_arguments={
             "device": camera_device,
             "calib_file": camera_calib_file,
+            "width": camera_width,
+            "height": camera_height,
+            "left_width": camera_left_width,
+            "right_width": camera_right_width,
+            "fps": camera_fps,
         }.items(),
         condition=IfCondition(enable_camera),
     )
@@ -83,6 +99,7 @@ def generate_launch_description():
             "lidar_scan_mode": lidar_scan_mode,
             "use_slam": use_slam,
             "enable_cmd_vel": enable_cmd_vel,
+            "log_pc_debug": log_pc_debug,
             "map_file_name": map_file_name,
         }.items(),
         condition=IfCondition(PythonExpression(["'", mode, "' == 'slam'"])),
@@ -113,6 +130,7 @@ def generate_launch_description():
             "map_file_name": map_file_name,
             "map_start_at_dock": map_start_at_dock,
             "enable_cmd_vel": enable_cmd_vel,
+            "log_pc_debug": log_pc_debug,
         }.items(),
         condition=IfCondition(PythonExpression(["'", mode, "' == 'localization'"])),
     )
@@ -142,6 +160,12 @@ def generate_launch_description():
             "base_link_yaw_offset_deg": base_link_yaw_offset_deg,
             "lidar_inverted": lidar_inverted,
             "enable_cmd_vel": enable_cmd_vel,
+            "enable_left_only_goal_proxy": enable_left_only_goal_proxy,
+            "max_linear_mps": max_linear_mps,
+            "max_angular_radps": max_angular_radps,
+            "pre_align_strategy": pre_align_strategy,
+            "path_heading_lookahead_m": path_heading_lookahead_m,
+            "log_pc_debug": log_pc_debug,
         }.items(),
         condition=IfCondition(PythonExpression(["'", mode, "' == 'navigation'"])),
     )
@@ -197,8 +221,8 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "map_start_at_dock",
-                default_value="true",
-                description="Start localization near the first posegraph node.",
+                default_value="false",
+                description="Start localization near the first posegraph node. Keep false when lidar_initialpose_node handles global localization.",
             ),
             DeclareLaunchArgument(
                 "map_yaml_file",
@@ -219,6 +243,36 @@ def generate_launch_description():
                 "enable_cmd_vel",
                 default_value="false",
                 description="Forward /cmd_vel to STM32. Keep false for slam/localization, true for navigation.",
+            ),
+            DeclareLaunchArgument(
+                "log_pc_debug",
+                default_value="false",
+                description="Log PCDBG/RCDBG serial debug lines returned by STM32.",
+            ),
+            DeclareLaunchArgument(
+                "enable_left_only_goal_proxy",
+                default_value="false",
+                description="Start optional left-only goal proxy in navigation mode for A/B testing.",
+            ),
+            DeclareLaunchArgument(
+                "max_linear_mps",
+                default_value="0.40",
+                description="STM32 cmd_vel linear clamp for navigation mode.",
+            ),
+            DeclareLaunchArgument(
+                "max_angular_radps",
+                default_value="1.25",
+                description="STM32 cmd_vel angular clamp for navigation mode.",
+            ),
+            DeclareLaunchArgument(
+                "pre_align_strategy",
+                default_value="direct_bearing",
+                description="Left-only pre-align strategy: direct_bearing or path_heading.",
+            ),
+            DeclareLaunchArgument(
+                "path_heading_lookahead_m",
+                default_value="0.70",
+                description="Lookahead distance on the computed global path for path_heading pre-align.",
             ),
             DeclareLaunchArgument(
                 "base_link_yaw_offset_deg",
@@ -265,6 +319,31 @@ def generate_launch_description():
                 "camera_calib_file",
                 default_value="",
                 description="Path to stereo_calibration.npz (optional).",
+            ),
+            DeclareLaunchArgument(
+                "camera_width",
+                default_value="3840",
+                description="Side-by-side stereo camera frame width.",
+            ),
+            DeclareLaunchArgument(
+                "camera_height",
+                default_value="1200",
+                description="Side-by-side stereo camera frame height.",
+            ),
+            DeclareLaunchArgument(
+                "camera_left_width",
+                default_value="1920",
+                description="Left image width in the side-by-side frame.",
+            ),
+            DeclareLaunchArgument(
+                "camera_right_width",
+                default_value="1920",
+                description="Right image width in the side-by-side frame.",
+            ),
+            DeclareLaunchArgument(
+                "camera_fps",
+                default_value="30.0",
+                description="Requested stereo camera FPS.",
             ),
             slam_launch,
             localization_launch,

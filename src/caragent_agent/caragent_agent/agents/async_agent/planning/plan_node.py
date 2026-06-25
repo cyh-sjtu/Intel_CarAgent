@@ -119,7 +119,7 @@ def _invalidate_background_after_plan_edit(
     if shared_processing_tasks is not None:
         # A plan edit bumps background_generation below. Old in-flight workers may
         # still finish, but their final writes are stale; clear claims so the new
-        # generation can re-run still-future destination resolvers.
+        # generation can re-run still-future semantic grounding tasks.
         shared_processing_tasks.clear()
     if shared_runtime_control is not None:
         if updated_tasks:

@@ -26,11 +26,11 @@ class StereoCameraNode(Node):
         self.declare_parameter("backend", "pyav")
         self.declare_parameter("device", "/dev/video0")
         self.declare_parameter("video_format", "auto")
-        self.declare_parameter("width", 1280)
-        self.declare_parameter("height", 480)
+        self.declare_parameter("width", 3840)
+        self.declare_parameter("height", 1200)
         self.declare_parameter("fps", 30.0)
-        self.declare_parameter("left_width", 640)
-        self.declare_parameter("right_width", 640)
+        self.declare_parameter("left_width", 1920)
+        self.declare_parameter("right_width", 1920)
         self.declare_parameter("rtbufsize", "64M")
         self.declare_parameter("frame_id_raw", "camera_link")
         self.declare_parameter("frame_id_left", "camera_left")
@@ -39,6 +39,9 @@ class StereoCameraNode(Node):
         self.declare_parameter("publish_left", True)
         self.declare_parameter("publish_right", True)
         self.declare_parameter("show_image", False)
+        self.declare_parameter("display_max_width", 1600)
+        self.declare_parameter("display_max_height", 900)
+        self.declare_parameter("display_scale", 0.0)
         self.declare_parameter("timer_rate_hz", 30.0)
 
         # ---- calibration / rectification ----
@@ -52,6 +55,8 @@ class StereoCameraNode(Node):
         self.frame_lock = threading.Lock()
         self.latest_frame: Optional[np.ndarray] = None
         self.running = True
+        self.window_name = "CarAgent Stereo Camera"
+        self._preview_window_created = False
         self.frame_count = 0
         self.last_stat_time = time.monotonic()
         self.last_frame_count = 0
@@ -64,7 +69,7 @@ class StereoCameraNode(Node):
         self._Q: Optional[np.ndarray] = None
         self._stereo_matcher: Optional[cv2.StereoMatcher] = None
         self._rect_initialized = False
-        if self.calib_file and Path(self.calib_file).exists():
+        if (self.publish_rect or self.publish_disparity) and self.calib_file and Path(self.calib_file).exists():
             self._init_rectification()
 
         # ---- publishers ----
@@ -127,6 +132,9 @@ class StereoCameraNode(Node):
         self.publish_left = bool(self.get_parameter("publish_left").value)
         self.publish_right = bool(self.get_parameter("publish_right").value)
         self.show_image = bool(self.get_parameter("show_image").value)
+        self.display_max_width = int(self.get_parameter("display_max_width").value)
+        self.display_max_height = int(self.get_parameter("display_max_height").value)
+        self.display_scale = float(self.get_parameter("display_scale").value)
         self.timer_rate_hz = float(self.get_parameter("timer_rate_hz").value)
         self.calib_file = str(self.get_parameter("calib_file").value)
         self.publish_rect = bool(self.get_parameter("publish_rect").value)
@@ -410,7 +418,7 @@ class StereoCameraNode(Node):
         return msg
 
     def _show_frame(self, frame, left, right, rect_l, rect_r):
-        if rect_l is not None and rect_r is not None:
+        if (self.publish_rect or self.publish_disparity) and rect_l is not None and rect_r is not None:
             # draw horizontal lines for rectification verification
             for y in range(0, self.height, 40):
                 cv2.line(rect_l, (0, y), (self.left_width, y), (0, 255, 0), 1)
@@ -420,8 +428,25 @@ class StereoCameraNode(Node):
             show = cv2.hconcat([left, right])
         else:
             show = frame
-        cv2.imshow("CarAgent Stereo Camera", show)
+        show = self._resize_for_preview(show)
+        if not self._preview_window_created:
+            cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(self.window_name, show.shape[1], show.shape[0])
+            self._preview_window_created = True
+        cv2.imshow(self.window_name, show)
         cv2.waitKey(1)
+
+    def _resize_for_preview(self, image):
+        h, w = image.shape[:2]
+        scale = self.display_scale if self.display_scale > 0.0 else 1.0
+        if self.display_max_width > 0:
+            scale = min(scale, float(self.display_max_width) / float(w))
+        if self.display_max_height > 0:
+            scale = min(scale, float(self.display_max_height) / float(h))
+        if scale >= 0.999:
+            return image
+        new_size = (max(1, int(round(w * scale))), max(1, int(round(h * scale))))
+        return cv2.resize(image, new_size, interpolation=cv2.INTER_AREA)
 
     def destroy_node(self):
         self.running = False

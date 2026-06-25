@@ -273,7 +273,6 @@ def vlm_multi_images_request_message_co_analysis(kf_set, question):
         "type": "text",
         "text": f"<question>{question}</question>"
     })
-    print("len user_image_contents:", len(user_image_contents))
     messages=[
             {
                 "role": "system",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 import re
 from io import BytesIO
 from typing import Any
@@ -11,7 +12,10 @@ from typing import Any
 from PIL import Image
 
 
+_LOGGER = logging.getLogger(__name__)
 _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+_TRANSLATION_CACHE: dict[tuple[str, str, str], str] = {}
+_TRANSLATION_CACHE_MAX = 128
 
 
 def detect_language(text: str) -> str:
@@ -45,7 +49,7 @@ def prepare_user_message_for_agent(
     """
 
     clean_message = str(message or "").strip()
-    if not clean_message or not translate_boundary:
+    if not clean_message or not translate_boundary or not _translation_enabled("input"):
         return clean_message
 
     detected = detect_language(clean_message)
@@ -69,28 +73,69 @@ def normalize_language(language: str | None, *, fallback: str = "en") -> str:
     return raw
 
 
-def _run_text_llm(system_prompt: str, user_text: str) -> str:
-    """Run one configured text LLM request and return stripped text."""
+def _translation_enabled(direction: str) -> bool:
+    """Return whether boundary translation is enabled for one direction."""
 
     from caragent_agent.config.config import config
-    from caragent_agent.utils.llm_handler import UnifiedLLMClient
 
-    model = (
-        (config.get("llm_routing", {}) or {}).get("orchestrate")
+    io_cfg = config.get("io", {}) or {}
+    specific_key = f"translate_{direction}"
+    if specific_key in io_cfg:
+        return bool(io_cfg.get(specific_key))
+    return bool(io_cfg.get("translate_boundary", True))
+
+
+def _translation_model() -> str:
+    """Return the lightweight model used only for boundary translation."""
+
+    from caragent_agent.config.config import config
+
+    io_cfg = config.get("io", {}) or {}
+    routing = config.get("llm_routing", {}) or {}
+    return (
+        io_cfg.get("translation_model")
+        or routing.get("translation")
+        or routing.get("orchestrate")
         or config.get("llm_model")
         or "deepseek-chat"
     )
+
+
+def _remember_translation(cache_key: tuple[str, str, str], value: str) -> str:
+    """Bound the tiny in-process cache used for repeated UI/status strings."""
+
+    _TRANSLATION_CACHE[cache_key] = value
+    if len(_TRANSLATION_CACHE) > _TRANSLATION_CACHE_MAX:
+        oldest_key = next(iter(_TRANSLATION_CACHE))
+        _TRANSLATION_CACHE.pop(oldest_key, None)
+    return value
+
+
+def _run_text_llm(system_prompt: str, user_text: str) -> str:
+    """Run one configured text LLM request and return stripped text."""
+
+    from caragent_agent.utils.llm_handler import UnifiedLLMClient
+
+    model = _translation_model()
+    cache_key = (str(model), str(system_prompt), str(user_text))
+    cached = _TRANSLATION_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_text},
     ]
-    return asyncio.run(UnifiedLLMClient().chat_completion(model, messages)).strip()
+    result = asyncio.run(UnifiedLLMClient().chat_completion(model, messages)).strip()
+    return _remember_translation(cache_key, result)
 
 
 def translate_text_for_agent(text: str, *, source_language: str = "zh") -> str:
     """Translate a user request into concise English for planning/search."""
 
     clean_text = str(text or "").strip()
+    if not _translation_enabled("input"):
+        _LOGGER.debug("Input boundary translation is disabled; using original text.")
+        return clean_text
     if not clean_text:
         return ""
     try:
@@ -99,12 +144,17 @@ def translate_text_for_agent(text: str, *, source_language: str = "zh") -> str:
                 "Translate the user's robot navigation request into concise English. "
                 "Return only the translated request, with no explanation, no markdown, "
                 "and no added policy text. Preserve room labels, visible text, ids, "
-                "numbers, coordinates, and named objects exactly when possible."
+                "numbers, coordinates, and named objects exactly when possible. "
+                "Preserve the user's action verb and intent. Do not compress an action "
+                "request into only a noun phrase: for example, translate requests to "
+                "approach, go to, inspect, photograph, compare, follow, wait, stop, or "
+                "change a plan with the corresponding explicit verb still present."
             ),
             clean_text,
         )
         return translated or clean_text
-    except Exception:
+    except Exception as exc:
+        _LOGGER.warning("Input boundary translation failed; using original text: %s", exc)
         return clean_text
 
 
@@ -113,6 +163,9 @@ def translate_text_for_user(text: str, *, target_language: str = "zh") -> str:
 
     clean_text = str(text or "").strip()
     target = normalize_language(target_language, fallback="en")
+    if not _translation_enabled("output"):
+        _LOGGER.debug("Output boundary translation is disabled; using original text.")
+        return clean_text
     if not clean_text or target == "en":
         return clean_text
     try:
@@ -128,7 +181,8 @@ def translate_text_for_user(text: str, *, target_language: str = "zh") -> str:
             clean_text,
         )
         return translated or clean_text
-    except Exception:
+    except Exception as exc:
+        _LOGGER.warning("Output boundary translation failed; using original text: %s", exc)
         return clean_text
 
 
@@ -144,7 +198,7 @@ def adapt_turn_result_language(
         output_language,
         fallback=normalize_language(original_input_language, fallback="en"),
     )
-    if target == "en":
+    if target == "en" or not _translation_enabled("output"):
         return turn_result
 
     adapted = dict(turn_result)
@@ -209,26 +263,46 @@ def describe_image_for_navigation(
     from caragent_agent.config.config import config
     from caragent_agent.utils.llm_handler import UnifiedLLMClient
     from caragent_agent.utils.llm_request_generator import (
+        encode_PIL_image_to_base64,
         extract_answer_tags,
+        scene_memory_prompts,
         vlm_analyse_on_each_kf_images_request_message,
     )
 
-    prompt = question or (
-        "Convert this target image into a compact scene-memory search query for an indoor robot. "
-        "The image may be taken from a different angle, height, or crop than the robot keyframes, "
-        "so do not require an exact visual match. "
-        "Keep only stable navigation landmarks and spatial cues: object categories, distinctive colors, "
-        "doors/corridors/junctions, signs or readable text, stairs, fire extinguishers, furniture clusters, "
-        "and unusual wall/floor features. "
-        "Ignore fragile details such as viewpoint, camera height, exact object counts, small decorations, "
-        "lighting, reflections, or newly introduced objects unless they are the main landmark. "
-        "Output 1-2 concise English sentences suitable for approximate best-candidate keyframe retrieval. "
-        "No JSON, no markdown, no exhaustive description."
-    )
+    prompt = question or str(
+        scene_memory_prompts.get("vlm_give_a_kf_image_semantic") or ""
+    ).strip()
+    if not prompt:
+        prompt = (
+            "Describe this indoor scene from a robot's front-facing camera for later navigation search. "
+            "Focus on spatial layout, stable landmarks, readable text, distinctive objects, and obstacles. "
+            "Be concrete and avoid guessing."
+        )
+    if question:
+        messages = vlm_analyse_on_each_kf_images_request_message(image, prompt)
+    else:
+        base64_image = encode_PIL_image_to_base64(image)
+        messages = [
+            {
+                "role": "system",
+                "content": [{"type": "text", "text": prompt}],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{base64_image}"
+                        },
+                    },
+                ],
+            },
+        ]
     request = {
         "request_id": 0,
         "model": config.get("vlm_model_analyse_images", config.get("llm_model", "deepseek-chat")),
-        "messages": vlm_analyse_on_each_kf_images_request_message(image, prompt),
+        "messages": messages,
     }
     results = asyncio.run(UnifiedLLMClient().batch_chat_completion([request]))
     response = results.get(0, {}).get(0)

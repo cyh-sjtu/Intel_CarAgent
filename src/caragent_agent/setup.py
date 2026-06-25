@@ -39,6 +39,8 @@ setup(
             "agent_ros_node = caragent_agent.agent_ros_node:main",
             "agent_web_demo = caragent_agent.scripts.demo_ui.async_agent_web_demo:main",
             "annotate_keyframes = caragent_agent.scripts.annotate_keyframes:main",
+            "build_keyframe_chunk_index = caragent_agent.scripts.build_keyframe_chunk_index:main",
+            "object_approach_live_test = caragent_agent.perception.fusion.object_approach_live_test:main",
         ],
     },
 )

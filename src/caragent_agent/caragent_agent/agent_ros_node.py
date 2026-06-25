@@ -79,8 +79,52 @@ class CarAgentROSNode(Node):
             base_frame=nav_cfg.get("base_frame", "base_link"),
             dry_run=bool(nav_cfg.get("dry_run_navigation", False)),
             camera_topic=nav_cfg.get("camera_topic", "/stereo/left/image_raw"),
+            right_image_topic=nav_cfg.get("right_image_topic", "/stereo/right/image_raw"),
             odom_topic=nav_cfg.get("odom_topic", "/odom"),
-            arrival_tolerance_m=float(nav_cfg.get("arrival_tolerance_m", 0.50)),
+            scan_topic=nav_cfg.get("scan_topic", "/scan"),
+            map_topic=nav_cfg.get("map_topic", "/global_costmap/costmap"),
+            arrival_tolerance_m=float(nav_cfg.get("arrival_tolerance_m", 0.25)),
+            enable_rotation_takeover=bool(nav_cfg.get("enable_rotation_takeover", True)),
+            rotation_policy=nav_cfg.get("rotation_policy", "left_only"),
+            pre_align_enabled=bool(nav_cfg.get("pre_align_enabled", True)),
+            final_align_enabled=bool(nav_cfg.get("final_align_enabled", True)),
+            yaw_tolerance_deg=float(nav_cfg.get("yaw_tolerance_deg", 4.0)),
+            settle_time_sec=float(nav_cfg.get("settle_time_sec", 0.7)),
+            fast_omega=float(nav_cfg.get("fast_omega", 1.15)),
+            mid_omega=float(nav_cfg.get("mid_omega", 0.75)),
+            slow_omega=float(nav_cfg.get("slow_omega", 0.32)),
+            rotation_timeout_sec=float(nav_cfg.get("rotation_timeout_sec", 15.0)),
+            rotation_loop_rate_hz=float(nav_cfg.get("rotation_loop_rate_hz", 20.0)),
+            right_turn_shortcut_deg=float(nav_cfg.get("right_turn_shortcut_deg", 90.0)),
+            localization_handoff_gate_enabled=bool(
+                nav_cfg.get("localization_handoff_gate_enabled", True)
+            ),
+            localization_handoff_settle_sec=float(
+                nav_cfg.get("localization_handoff_settle_sec", 1.0)
+            ),
+            localization_handoff_timeout_sec=float(
+                nav_cfg.get("localization_handoff_timeout_sec", 2.0)
+            ),
+            localization_handoff_max_translation_m=float(
+                nav_cfg.get("localization_handoff_max_translation_m", 0.12)
+            ),
+            localization_handoff_max_yaw_deg=float(
+                nav_cfg.get("localization_handoff_max_yaw_deg", 8.0)
+            ),
+            localization_handoff_sensor_max_age_sec=float(
+                nav_cfg.get("localization_handoff_sensor_max_age_sec", 1.5)
+            ),
+            simulation_mode=bool(nav_cfg.get("simulation_mode", False)),
+            simulation_navigation_delay_sec=float(
+                nav_cfg.get("simulation_navigation_delay_sec", 30.0)
+            ),
+            simulation_navigation_delay_per_meter_sec=float(
+                nav_cfg.get("simulation_navigation_delay_per_meter_sec", 0.0)
+            ),
+            simulation_initial_position=nav_cfg.get("simulation_initial_position"),
+            simulation_initial_yaw_deg=float(
+                nav_cfg.get("simulation_initial_yaw_deg", 0.0)
+            ),
         )
         self.agent = AsyncAgent(
             scene_memory=self.scene_memory,
@@ -105,13 +149,13 @@ class CarAgentROSNode(Node):
         )
 
         web_cfg = config.get("web_ui", {})
+        self._thread_id = str(web_cfg.get("thread_id", "caragent"))
         if web_cfg.get("enabled", True):
             host = str(web_cfg.get("host", "0.0.0.0"))
             port = int(web_cfg.get("port", 8123))
-            thread_id = str(web_cfg.get("thread_id", "caragent"))
             threading.Thread(
                 target=_start_web_server,
-                args=(self.agent, host, port, thread_id),
+                args=(self.agent, host, port, self._thread_id),
                 daemon=True,
             ).start()
 
@@ -134,13 +178,33 @@ class CarAgentROSNode(Node):
                 output_language=str(self._io_cfg.get("output_language", "auto")),
                 translate_boundary=bool(self._io_cfg.get("translate_boundary", True)),
             )
-            result = self.agent.run(agent_input)
-            response = result if isinstance(result, str) else str(result)
+            result = self.agent.run_message_turn(
+                agent_input,
+                self._thread_id,
+                "user",
+            )
+            response = self._response_text_from_turn_result(result)
             response = self._translate_response_for_user(response, user_input)
         except Exception as exc:
-            self.get_logger().exception(f"Agent command failed: {exc}")
+            self.get_logger().error(f"Agent command failed: {exc}")
             response = f"Agent command failed: {exc}"
         self._response_pub.publish(String(data=response))
+
+    def _response_text_from_turn_result(self, result: object) -> str:
+        if isinstance(result, dict):
+            text = str(result.get("turn_response_text") or "").strip()
+            if text:
+                return text
+            candidates = result.get("answer_candidates")
+            if isinstance(candidates, list) and candidates:
+                return str(candidates[-1])
+            items = result.get("response_items")
+            if isinstance(items, list) and items:
+                last = items[-1]
+                if isinstance(last, dict) and last.get("response_text"):
+                    return str(last.get("response_text"))
+            return "任务已结束，但没有生成可展示的回答。请查看日志中的 turn_response 字段。"
+        return str(result)
 
     def _translate_response_for_user(self, response: str, user_input: str) -> str:
         output_language = str(self._io_cfg.get("output_language", "auto"))

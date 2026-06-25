@@ -7,11 +7,13 @@ import traceback
 from typing import Any, Optional, Sequence
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool
 from langgraph.prebuilt.tool_node import ToolNode
 
 from caragent_agent.agents.async_agent.execution.context import (
+    _extract_named_signal,
+    background_result_is_reusable_for_task,
     build_background_reference,
     build_execution_guide,
     build_tool_catalog,
@@ -30,11 +32,23 @@ from caragent_agent.agents.async_agent.execution.support import (
     build_task_turn_response_type,
     build_task_user_facing_response,
     count_successful_navigation_commands,
+    find_tool_contract_violation_message,
     extract_tool_trace,
     find_tool_failure_message,
     issued_navigation_command,
     navigation_arrival_summary,
     navigation_waiting_summary,
+    tool_content_indicates_error,
+)
+from caragent_agent.agents.async_agent.execution.runtime_tool_context import (
+    runtime_tool_context,
+)
+from caragent_agent.agents.async_agent.execution.tool_call_budget import (
+    execute_tool_budget_context,
+)
+from caragent_agent.agents.async_agent.target_resolution.session_anchors import (
+    record_anchor_from_object_destination,
+    record_anchor_from_resolution_result,
 )
 from caragent_agent.agents.async_agent.orchestration.node_common import (
     _get_current_task,
@@ -58,14 +72,255 @@ from caragent_agent.agents.async_agent.runtime.types import (
 from caragent_agent.third_party.from_langgraph.react_agent import create_react_agent
 
 
-NAVIGATION_TOOL_NAMES = {"go_to_keyframe"}
+NAVIGATION_TOOL_NAMES = {"go_to_keyframe", "go_to_position"}
+KEYFRAME_SEARCH_TOOL_NAMES = {"search_requirement_on_keyframe_nodes"}
+ATTACHED_IMAGE_TOOL_NAMES = {
+    "analyse_attached_image",
+    "match_attached_image_to_keyframes",
+}
+BACKGROUND_ONLY_TOOL_NAMES = {
+    "preanalyze_object_on_keyframe",
+}
+DIAGNOSTIC_ONLY_TOOL_NAMES = {
+    "resolve_object_from_attached_image",
+}
+SEMANTIC_GROUNDING_TOOL_NAMES = {
+    "approach_object_in_current_view",
+    "preanalyze_object_on_keyframe",
+}
 
 
-def _is_destination_resolver_for_navigation(
+def _task_outputs_signal(current_task: Optional[TaskItem], signal_name: str) -> bool:
+    outputs = (current_task or {}).get("outputs")
+    if outputs is None:
+        return True
+    if isinstance(outputs, str):
+        return outputs.strip() == signal_name
+    try:
+        return signal_name in {str(item).strip() for item in outputs}
+    except Exception:
+        return True
+
+
+def _compact_task_signal(tool_trace: dict[str, Any], signal_name: str) -> Optional[dict[str, Any]]:
+    """Extract one reusable task-output signal from a tool trace."""
+
+    value = _extract_named_signal(tool_trace, signal_name)
+    return value if isinstance(value, dict) else None
+
+
+def _submitted_task_result_data(tool_trace: dict[str, Any]) -> dict[str, Any]:
+    """Return the latest submit_task_result data payload, if any."""
+
+    for tool_result in reversed(tool_trace.get("tool_results", []) or []):
+        if str(tool_result.get("name") or "").strip() != "submit_task_result":
+            continue
+        content = tool_result.get("content")
+        try:
+            parsed = json.loads(content) if isinstance(content, str) else content
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict):
+            data = parsed.get("data")
+            if isinstance(data, dict):
+                return data
+    return {}
+
+
+def _submitted_task_result_summary(tool_trace: dict[str, Any]) -> str:
+    """Return the latest submit_task_result summary."""
+
+    for tool_result in reversed(tool_trace.get("tool_results", []) or []):
+        if str(tool_result.get("name") or "").strip() != "submit_task_result":
+            continue
+        content = tool_result.get("content")
+        try:
+            parsed = json.loads(content) if isinstance(content, str) else content
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict):
+            return str(parsed.get("summary") or "").strip()
+    return ""
+
+
+def _has_submitted_task_result(tool_trace: dict[str, Any]) -> bool:
+    """Return True when the executor formally submitted a task result."""
+
+    return any(
+        str(tool_result.get("name") or "").strip() == "submit_task_result"
+        for tool_result in tool_trace.get("tool_results", []) or []
+        if isinstance(tool_result, dict)
+    )
+
+
+def _latest_tool_result_payload(tool_trace: dict[str, Any], tool_name: str) -> Optional[dict[str, Any]]:
+    for tool_result in reversed(tool_trace.get("tool_results", []) or []):
+        if str(tool_result.get("name") or "").strip() != tool_name:
+            continue
+        content = tool_result.get("content")
+        try:
+            parsed = json.loads(content) if isinstance(content, str) else content
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _record_session_anchors_from_tool_trace(
+    *,
+    shared_runtime_control: Optional[dict[str, Any]],
+    current_task: Optional[TaskItem],
+    tool_trace: dict[str, Any],
+    logger: Optional[Any],
+) -> None:
+    if shared_runtime_control is None or current_task is None:
+        return
+    recorded: list[dict[str, Any]] = []
+    resolution_result = _latest_tool_result_payload(tool_trace, "target_resolution")
+    if isinstance(resolution_result, dict):
+        anchor = record_anchor_from_resolution_result(
+            shared_runtime_control,
+            resolution_result,
+            current_task=current_task,
+        )
+        if anchor:
+            recorded.append(anchor)
+    resolved_anchor = (
+        resolution_result.get("anchor")
+        if isinstance(resolution_result, dict) and isinstance(resolution_result.get("anchor"), dict)
+        else {}
+    )
+    resolved_ref = (
+        resolution_result.get("target_ref")
+        if isinstance(resolution_result, dict) and isinstance(resolution_result.get("target_ref"), dict)
+        else {}
+    )
+    submitted = _submitted_task_result_data(tool_trace)
+    destination = submitted.get("destination") if isinstance(submitted.get("destination"), dict) else None
+    selected_object = (
+        submitted.get("selected_object")
+        if isinstance(submitted.get("selected_object"), dict)
+        else None
+    )
+    already_recorded_resolved_object = (
+        str(resolved_ref.get("kind") or "") == "object"
+        and str(resolved_anchor.get("anchor_type") or "") == "position"
+    )
+    if destination is not None and selected_object is not None and not already_recorded_resolved_object:
+        anchor = record_anchor_from_object_destination(
+            shared_runtime_control,
+            current_task=current_task,
+            destination=destination,
+            selected_object=selected_object,
+            evidence=[],
+        )
+        if anchor:
+            recorded.append(anchor)
+    if logger is not None:
+        for anchor in recorded:
+            try:
+                logger.log_foreground(
+                    "session_anchor_recorded: "
+                    + json.dumps(anchor, ensure_ascii=False, default=str)
+                )
+            except Exception:
+                pass
+
+
+def _task_signal_from_trace(tool_trace: dict[str, Any], signal_name: str) -> Optional[dict[str, Any]]:
+    """Extract one task output signal, preferring formal submit_task_result."""
+
+    submitted = _submitted_task_result_data(tool_trace)
+    value = submitted.get(signal_name)
+    if isinstance(value, dict):
+        return value
+    return _compact_task_signal(tool_trace, signal_name)
+
+
+def _compact_background_object_preanalysis(value: Any) -> dict[str, Any] | None:
+    """Return executor/memory-facing object preanalysis evidence."""
+
+    if not isinstance(value, dict):
+        return None
+    compact: dict[str, Any] = {}
+    for key in ("status", "reason", "mode", "destination"):
+        if value.get(key) not in (None, "", [], {}):
+            compact[key] = value.get(key)
+    approach = value.get("approach") if isinstance(value.get("approach"), dict) else {}
+    if approach:
+        compact["approach"] = {
+            key: approach.get(key)
+            for key in ("status", "reason", "mode")
+            if approach.get(key) not in (None, "", [], {})
+        }
+    paths = value.get("paths") if isinstance(value.get("paths"), dict) else {}
+    artifact_paths = {
+        key: paths.get(key) or value.get(key)
+        for key in (
+            "output_dir",
+            "summary_json",
+            "status_json",
+            "approach_goal_json",
+            "debug_png",
+            "mono_guard_json",
+            "selected_grounding_json",
+        )
+        if paths.get(key) or value.get(key)
+    }
+    if artifact_paths:
+        compact["artifact_paths"] = artifact_paths
+    return compact or None
+
+
+def _tool_trace_has_success_evidence(tool_trace: dict[str, Any]) -> bool:
+    """Return True when at least one tool result produced usable evidence."""
+
+    for tool_result in tool_trace.get("tool_results", []) or []:
+        content = str(tool_result.get("content") or "")
+        if tool_content_indicates_error(content):
+            continue
+        return True
+    return False
+
+
+def _tool_failure_blocks_task(
+    current_task: Optional[TaskItem],
+    tasks: dict[int, TaskItem],
+    tool_trace: dict[str, Any],
+    *,
+    failure_summary: Optional[str],
+    final_ai_content: str,
+) -> bool:
+    """Decide whether a tool-level failure should fail the whole task.
+
+    Tool failures are fatal when the task's required output contract is missing.
+    For ordinary observation/reasoning tasks, one failed tool should not override
+    a final answer that is grounded by other successful tool evidence.
+    """
+
+    if not failure_summary:
+        return False
+    if _task_signal_from_trace(tool_trace, "destination") is not None:
+        return False
+    if not final_ai_content.strip():
+        return True
+
+    if (
+        _task_outputs_signal(current_task, "destination")
+        and _task_produces_reusable_destination_for_navigation(current_task, tasks)
+        and _task_signal_from_trace(tool_trace, "destination") is None
+    ):
+        return True
+
+    return not _tool_trace_has_success_evidence(tool_trace)
+
+
+def _task_produces_reusable_destination_for_navigation(
     current_task: Optional[TaskItem],
     tasks: dict[int, TaskItem],
 ) -> bool:
-    """Return True when an llm_action feeds a following navigation_action target."""
+    """Return True when an llm_action feeds a following navigation target."""
 
     if not current_task or current_task.get("task_type") != "llm_action":
         return False
@@ -92,20 +347,64 @@ def _is_destination_resolver_for_navigation(
     return False
 
 
-def _try_complete_destination_resolver_from_background(
+def _try_complete_semantic_grounding_from_background(
     current_task: Optional[TaskItem],
     *,
     tasks: dict[int, TaskItem],
     background_result: BackgroundAnalysisItem | str | None,
 ) -> Optional[dict[str, Any]]:
-    """Use completed destination-resolver background output as the task result."""
+    """Use completed semantic-grounding background output as the task result."""
 
-    if not _is_destination_resolver_for_navigation(current_task, tasks):
+    if not _task_produces_reusable_destination_for_navigation(current_task, tasks):
         return None
     if not isinstance(background_result, dict):
         return None
     if str(background_result.get("status") or "").strip().lower() != "completed":
         return None
+
+    raw_destination = background_result.get("recommended_destination")
+    if isinstance(raw_destination, dict):
+        destination = {"destination": dict(raw_destination)}
+        destination_json = json.dumps(destination, ensure_ascii=False)
+        reason = truncate_context_text(
+            background_result.get("recommendation_reason")
+            or background_result.get("summary")
+            or background_result.get("failure_reason"),
+            limit=320,
+        )
+        summary = "Resolved destination from background preanalysis."
+        if raw_destination.get("type"):
+            summary += f" Type: {raw_destination.get('type')}."
+        if reason:
+            summary += f" Reason: {reason}"
+        final_ai_content = f"{summary}\n\n{destination_json}"
+        synthetic_tool_payload = {
+            "status": "ok",
+            "summary": summary,
+            "data": {
+                "source": "background_preanalysis",
+                "destination": destination["destination"],
+                "object_preanalysis": _compact_background_object_preanalysis(
+                    background_result.get("object_preanalysis")
+                ),
+            },
+        }
+        return {
+            "event_type": "task_completed",
+            "summary": final_ai_content,
+            "tool_name": "background_preanalysis",
+            "tool_trace": {
+                "tool_calls": [],
+                "tool_results": [
+                    {
+                        "name": "background_preanalysis",
+                        "content": json.dumps(synthetic_tool_payload, ensure_ascii=False),
+                        "tool_call_id": None,
+                    }
+                ],
+                "final_ai_content": final_ai_content,
+            },
+        }
 
     raw_keyframe_id = background_result.get("recommended_keyframe_id")
     try:
@@ -159,17 +458,17 @@ def _try_complete_destination_resolver_from_background(
     }
 
 
-def _build_navigation_memory_context_for_resolver(
+def _build_navigation_memory_context_for_grounding(
     current_task: Optional[TaskItem],
     *,
     tasks: dict[int, TaskItem],
     run_memory: Optional[Any],
 ) -> str:
-    """Inject a compact navigation table for destination resolvers."""
+    """Inject a compact navigation table for reusable destination grounding."""
 
     if run_memory is None:
         return ""
-    if not _is_destination_resolver_for_navigation(current_task, tasks):
+    if not _task_produces_reusable_destination_for_navigation(current_task, tasks):
         return ""
     try:
         table = run_memory.query_memory(
@@ -211,7 +510,7 @@ def _build_navigation_memory_context_for_resolver(
 
     return (
         "\n--- NAVIGATION MEMORY TABLE ---\n"
-        "This destination resolver has already been given the compact navigation summary table.\n"
+        "This reusable destination signal task has already been given the compact navigation summary table.\n"
         "Use these rows only for visited-place reuse. If no row clearly matches, do not query other memory scopes; proceed to scene-memory search.\n"
         f"{json.dumps(compact_rows, ensure_ascii=False, indent=2)}\n"
         "--- END NAVIGATION MEMORY TABLE ---\n"
@@ -225,17 +524,104 @@ def _tools_for_current_execute_task(
     """Apply the minimal tool boundary for the new task schema."""
 
     task_type = str((current_task or {}).get("task_type") or "").strip()
+    image_refs = list((current_task or {}).get("image_refs") or [])
+    destination_is_in_contract = _task_outputs_signal(current_task, "destination")
     if task_type == "navigation_action":
+        target = (current_task or {}).get("target")
+        target_type = (
+            str((target or {}).get("type") or "").strip()
+            if isinstance(target, dict)
+            else ""
+        )
+        allowed_names = set(NAVIGATION_TOOL_NAMES)
+        if target_type == "semantic_keyframe":
+            allowed_names.update(KEYFRAME_SEARCH_TOOL_NAMES)
+            if isinstance(target, dict) and str(target.get("target_source") or "").strip() == "attached_image":
+                allowed_names.update({"match_attached_image_to_keyframes"})
+        elif target_type == "semantic_object":
+            allowed_names.update({"approach_object_in_current_view"})
         return [
             tool
             for tool in execution_tools
-            if str(getattr(tool, "name", "") or "").strip() in NAVIGATION_TOOL_NAMES
+            if str(getattr(tool, "name", "") or "").strip() in allowed_names
         ]
-    return [
-        tool
-        for tool in execution_tools
-        if str(getattr(tool, "name", "") or "").strip() not in NAVIGATION_TOOL_NAMES
-    ]
+    allowed = []
+    for tool in execution_tools:
+        tool_name = str(getattr(tool, "name", "") or "").strip()
+        if tool_name in NAVIGATION_TOOL_NAMES:
+            continue
+        if tool_name in BACKGROUND_ONLY_TOOL_NAMES:
+            continue
+        if tool_name in DIAGNOSTIC_ONLY_TOOL_NAMES:
+            continue
+        if tool_name in ATTACHED_IMAGE_TOOL_NAMES and not image_refs:
+            continue
+        if tool_name in SEMANTIC_GROUNDING_TOOL_NAMES and not destination_is_in_contract:
+            continue
+        allowed.append(tool)
+    return allowed
+
+
+def _canonical_tool_call_signature(tool_call: dict[str, Any]) -> str:
+    """Return a stable comparable signature for one LLM-requested tool call."""
+
+    try:
+        args = tool_call.get("args") or {}
+        args_text = json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        args_text = str(tool_call.get("args") or {})
+    return f"{tool_call.get('name')}:{args_text}"
+
+
+def _dedupe_repeated_tool_pairs_for_llm(messages: Sequence[BaseMessage]) -> list[BaseMessage]:
+    """Hide repeated identical tool-call pairs from the next provider request.
+
+    Some providers reject histories that contain the same tool call with the
+    same arguments across multiple consecutive rounds. The full trace remains
+    available in executor state; this only trims the LLM-facing prompt input so
+    the model can use the first result and finish the task.
+    """
+
+    seen_signatures: set[str] = set()
+    skip_tool_call_ids: set[str] = set()
+    filtered: list[BaseMessage] = []
+    removed_count = 0
+
+    for msg in messages:
+        if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+            tool_calls = list(msg.tool_calls or [])
+            signatures = [_canonical_tool_call_signature(call) for call in tool_calls]
+            if signatures and all(signature in seen_signatures for signature in signatures):
+                for call in tool_calls:
+                    call_id = str(call.get("id") or "").strip()
+                    if call_id:
+                        skip_tool_call_ids.add(call_id)
+                removed_count += 1
+                continue
+            seen_signatures.update(signatures)
+            filtered.append(msg)
+            continue
+
+        if isinstance(msg, ToolMessage):
+            tool_call_id = str(getattr(msg, "tool_call_id", "") or "").strip()
+            if tool_call_id and tool_call_id in skip_tool_call_ids:
+                removed_count += 1
+                continue
+        filtered.append(msg)
+
+    if removed_count > 0:
+        filtered.append(
+            SystemMessage(
+                content=(
+                    "Runtime guard: repeated identical tool-call turns were hidden "
+                    "from this model request. Use the first available result for "
+                    "that query; do not call the exact same tool with identical "
+                    "arguments again unless the arguments change."
+                )
+            )
+        )
+
+    return filtered
 
 def create_execute_node(
     llm: BaseChatModel,
@@ -304,6 +690,10 @@ def create_execute_node(
                 "EXECUTION RULES:",
                 "- Treat continuity context as small working memory, not full history.",
                 "- If historical facts are needed, call query_memory with the narrowest scope and view.",
+                "- query_memory only covers the currently loaded run session. Do not pass the current plan_id unless the user explicitly asks about the current plan; for earlier facts within this run session leave plan_id empty.",
+                "- After query_memory summary_table or timeline returns row_id values, use row_id for follow-up detail queries. task_id can repeat across plans and is not a session-global row identifier.",
+                "- If a query_memory detail lookup returns no items, do not repeat the same detail lookup. Use the summary/timeline rows you already have or move to scene-memory/tool evidence.",
+                "- When the current task has a structured result such as destination, selected_object, visual_observation, or current_place_context, submit it with submit_task_result. Do not invent tools named destination, selected_object, or observation.",
                 "- Do not answer historical navigation, task, plan, conversation, or observation questions by guessing from prompt context.",
                 "- When a deterministic helper tool is available for numeric computation, use it instead of mental arithmetic.",
             ]
@@ -323,22 +713,22 @@ def create_execute_node(
 
         candidate_background_result: BackgroundAnalysisItem | str | None = None
         if current_task and current_task.get("task_id", -1) >= 0:
-            if not task_depends_on_query_result(current_task, tasks):
-                candidate_background_result = shared_background_results.get(
-                    current_task["task_id"]
-                )
-                if not candidate_background_result:
-                    candidate_background_result = state.get("background_results", {}).get(
-                        current_task["task_id"]
-                    )
-            else:
-                if shared_background_results.pop(current_task["task_id"], None) is not None:
-                    if logger:
-                        logger.log_foreground(
-                            "Execute: Ignoring background analysis for task {task_id} because its target depends on an upstream query result.".format(
-                                task_id=current_task["task_id"],
-                            )
+            task_id = current_task["task_id"]
+            shared_candidate = shared_background_results.get(task_id)
+            state_candidate = state.get("background_results", {}).get(task_id)
+            candidate_background_result = shared_candidate or state_candidate
+            if (
+                task_depends_on_query_result(current_task, tasks)
+                and candidate_background_result is not None
+                and not background_result_is_reusable_for_task(candidate_background_result)
+            ):
+                candidate_background_result = None
+                if logger:
+                    logger.log_foreground(
+                        "Execute: Ignoring non-actionable background analysis for task {task_id} because its target depends on upstream task evidence.".format(
+                            task_id=task_id,
                         )
+                    )
 
         background_context = build_background_reference(candidate_background_result)
         prepared_context = prepare_context_bundle(
@@ -354,7 +744,7 @@ def create_execute_node(
             selected_execution_context_packet=selected_execution_context_packet,
             background_context=background_context,
         )
-        navigation_memory_context = _build_navigation_memory_context_for_resolver(
+        navigation_memory_context = _build_navigation_memory_context_for_grounding(
             current_task,
             tasks=tasks,
             run_memory=run_memory,
@@ -379,12 +769,45 @@ def create_execute_node(
         current_task = execute_inputs.get("current_task")
         allowed_tools = _tools_for_current_execute_task(current_task, execution_tools)
         agent_messages: list[BaseMessage] = []
-
-        deterministic_outcome = _try_dispatch_structured_navigation_action(
-            current_task,
-            tasks=dict(execute_inputs.get("tasks") or {}),
-            tools=allowed_tools,
+        selected_packet_for_tools = dict(
+            execute_inputs.get("selected_execution_context_packet") or {}
         )
+
+        background_fast_path = None
+        if not is_navigation_action(current_task):
+            background_fast_path = _try_complete_semantic_grounding_from_background(
+                current_task,
+                tasks=dict(execute_inputs.get("tasks") or {}),
+                background_result=execute_inputs.get("background_result"),
+            )
+        if background_fast_path is not None:
+            if logger and current_task:
+                logger.log_foreground(
+                    "Execute: Reusing completed background preanalysis for task {task_id}.".format(
+                        task_id=current_task.get("task_id")
+                    )
+                )
+            return {
+                "agent_messages": agent_messages,
+                "deterministic_outcome": background_fast_path,
+                "execution_error": None,
+            }
+
+        tool_context = {
+            "current_task": current_task,
+            "tasks": dict(execute_inputs.get("tasks") or {}),
+            "shared_background_results": shared_background_results,
+            "shared_runtime_control": shared_runtime_control,
+            "background_result": execute_inputs.get("background_result"),
+            "selected_execution_context_packet": selected_packet_for_tools,
+            "logger": logger,
+        }
+        with execute_tool_budget_context(), runtime_tool_context(tool_context):
+            deterministic_outcome = _try_dispatch_structured_navigation_action(
+                current_task,
+                tasks=dict(execute_inputs.get("tasks") or {}),
+                tools=allowed_tools,
+            )
         if deterministic_outcome is not None:
             if logger and current_task:
                 logger.log_foreground(
@@ -412,7 +835,7 @@ def create_execute_node(
                 "execution_error": None,
             }
 
-        background_outcome = _try_complete_destination_resolver_from_background(
+        background_outcome = _try_complete_semantic_grounding_from_background(
             current_task,
             tasks=dict(execute_inputs.get("tasks") or {}),
             background_result=execute_inputs.get("background_result"),
@@ -420,7 +843,7 @@ def create_execute_node(
         if background_outcome is not None:
             if logger and current_task:
                 logger.log_foreground(
-                    "Execute: Used completed background preanalysis for destination resolver task {task_id}.".format(
+                    "Execute: Used completed background preanalysis for semantic grounding task {task_id}.".format(
                         task_id=current_task.get("task_id")
                     )
                 )
@@ -431,10 +854,16 @@ def create_execute_node(
             }
 
         execution_error: Optional[Exception] = None
+
+        def _executor_pre_model_hook(state: dict[str, Any]) -> dict[str, Any]:
+            messages = list((state or {}).get("messages") or [])
+            return {"llm_input_messages": _dedupe_repeated_tool_pairs_for_llm(messages)}
+
         react_agent = create_react_agent(
             model=llm,
             tools=allowed_tools,
             prompt=AGENT_PROMPTS.get("react_system", ""),
+            pre_model_hook=_executor_pre_model_hook,
             logger=logger.log_foreground if logger else None,
         )
 
@@ -470,7 +899,8 @@ def create_execute_node(
                         )
 
         try:
-            stream_executor_pass(str(execute_inputs.get("plan_context") or ""))
+            with execute_tool_budget_context(), runtime_tool_context(tool_context):
+                stream_executor_pass(str(execute_inputs.get("plan_context") or ""))
         except Exception as exc:
             print(f"{Colors.REACT}Execute Error:{Colors.RESET} {str(exc)}")
             traceback.print_exc()
@@ -514,16 +944,28 @@ def create_execute_node(
         agent_messages = list(execute_run.get("agent_messages") or [])
         execution_error = execute_run.get("execution_error")
         tool_trace = extract_tool_trace(agent_messages)
+        tool_contract_violation = find_tool_contract_violation_message(tool_trace)
         failure_summary = find_tool_failure_message(tool_trace)
         navigation_command_count = count_successful_navigation_commands(
             tool_trace,
             navigation_tool_names=NAVIGATION_TOOL_NAMES,
         )
         final_ai_content = str(tool_trace.get("final_ai_content") or "").strip()
+        submitted_destination = _task_signal_from_trace(tool_trace, "destination")
+        has_submitted_result = _has_submitted_task_result(tool_trace)
 
         if execution_error is not None:
             event_type = "task_failed"
             summary = f"Task execution failed with exception: {str(execution_error)}"
+        elif tool_contract_violation and not (
+            submitted_destination is not None
+            and _task_produces_reusable_destination_for_navigation(
+                current_task,
+                dict(execute_inputs.get("tasks") or {}),
+            )
+        ):
+            event_type = "task_failed"
+            summary = tool_contract_violation
         elif navigation_command_count > 1:
             event_type = "task_failed"
             summary = (
@@ -536,12 +978,22 @@ def create_execute_node(
         ):
             event_type = "task_waiting"
             summary = navigation_waiting_summary(current_task)
-        elif failure_summary:
+        elif _tool_failure_blocks_task(
+            current_task,
+            dict(execute_inputs.get("tasks") or {}),
+            tool_trace,
+            failure_summary=failure_summary,
+            final_ai_content=final_ai_content,
+        ):
             event_type = "task_failed"
-            summary = failure_summary
+            summary = failure_summary or "Task failed."
         else:
             event_type = "task_completed"
             summary = (
+                _submitted_task_result_summary(tool_trace)
+                if has_submitted_result
+                else ""
+            ) or (
                 final_ai_content
                 or "Task completed successfully."
             )
@@ -654,6 +1106,10 @@ def create_execute_node(
         primary_tool_name = classified_result.get("primary_tool_name")
 
         raw_output = json.dumps(tool_trace, ensure_ascii=False)
+        task_destination = _task_signal_from_trace(tool_trace, "destination")
+        task_selected_object = _task_signal_from_trace(tool_trace, "selected_object")
+        task_visual_observation = _task_signal_from_trace(tool_trace, "visual_observation")
+        task_current_place_context = _task_signal_from_trace(tool_trace, "current_place_context")
         user_facing_response = build_task_user_facing_response(
             current_task,
             event_type=event_type,
@@ -680,6 +1136,10 @@ def create_execute_node(
                 summary=summary,
                 raw_output=raw_output,
                 tool_name=primary_tool_name,
+                destination=task_destination,
+                selected_object=task_selected_object,
+                visual_observation=task_visual_observation,
+                current_place_context=task_current_place_context,
             )
             try:
                 run_memory.record_task_result(
@@ -694,6 +1154,21 @@ def create_execute_node(
                 )
             except Exception:
                 pass
+            try:
+                _record_session_anchors_from_tool_trace(
+                    shared_runtime_control=shared_runtime_control,
+                    current_task=task_ref,
+                    tool_trace=tool_trace,
+                    logger=logger,
+                )
+            except Exception as exc:
+                if logger:
+                    try:
+                        logger.log_foreground(
+                            f"session_anchor_record_failed: {type(exc).__name__}: {exc}"
+                        )
+                    except Exception:
+                        pass
 
         if logger:
             logger.log_foreground(

@@ -30,6 +30,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'left_only_goal_proxy = caragent_navigation.left_only_goal_proxy:main',
         ],
     },
 )

@@ -20,6 +20,13 @@ DEFAULT_ENCODER_XML = Path("/home/car/caragent_ws/models/efficient_sam_openvino/
 DEFAULT_DECODER_XML = Path("/home/car/caragent_ws/models/efficient_sam_openvino/efficient_sam_vitt_decoder.xml")
 
 
+def _safe_print(message: str) -> None:
+    try:
+        print(message, flush=True)
+    except BrokenPipeError:
+        pass
+
+
 class EfficientSAMOpenVINO:
     """EfficientSAM inference wrapper using OpenVINO IR."""
 
@@ -31,9 +38,9 @@ class EfficientSAMOpenVINO:
         encoder_device: str | None = None,
         decoder_device: str | None = None,
     ):
-        from openvino import Core
+        from caragent_agent.perception.openvino_utils import create_openvino_core
 
-        self.core = Core()
+        self.core = create_openvino_core()
         self.device = device
         self.encoder_device = encoder_device or device
         self.decoder_device = decoder_device or device
@@ -46,10 +53,10 @@ class EfficientSAMOpenVINO:
         if not decoder_xml.exists():
             raise FileNotFoundError(f"Decoder IR not found: {decoder_xml}")
 
-        print(f"Loading encoder: {encoder_xml} on {self.encoder_device}")
+        _safe_print(f"Loading encoder: {encoder_xml} on {self.encoder_device}")
         self.encoder = self.core.compile_model(str(encoder_xml), self.encoder_device)
 
-        print(f"Loading decoder: {decoder_xml} on {self.decoder_device}")
+        _safe_print(f"Loading decoder: {decoder_xml} on {self.decoder_device}")
         self.decoder = self.core.compile_model(str(decoder_xml), self.decoder_device)
 
         # Cache encoder input shape for image preprocessing
