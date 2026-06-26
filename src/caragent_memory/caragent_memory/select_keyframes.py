@@ -191,7 +191,7 @@ def select_keyframes(
     dedupe_backend = str(dedupe_backend).lower()
     if dedupe_backend not in {"dinov2", "clip"}:
         raise ValueError("--dedupe-backend must be either 'dinov2' or 'clip'")
-    resolved_clip_device = str(clip_device or device or "GPU")
+    resolved_clip_device = str(clip_device or device or "NPU")
 
     records = list(iter_frame_records(dataset))
     if output.exists():
