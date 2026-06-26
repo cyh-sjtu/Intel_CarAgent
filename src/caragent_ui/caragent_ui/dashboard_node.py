@@ -284,6 +284,7 @@ class ManagedProcess:
     name: str
     command: str
     cwd: Path = WORKSPACE
+    env_overrides: dict[str, str] = field(default_factory=dict)
     proc: subprocess.Popen | None = None
     started_at: float | None = None
     stopped_at: float | None = None
@@ -310,6 +311,7 @@ class ManagedProcess:
             self.logs.append(f"[{_now_hms()}] COMMAND: {self.command}")
             env = os.environ.copy()
             env.setdefault("PYTHONUNBUFFERED", "1")
+            env.update(self.env_overrides)
             self.proc = subprocess.Popen(
                 self.command,
                 cwd=str(self.cwd),
@@ -550,16 +552,26 @@ class DashboardNode(Node):
             f"{command}"
         )
 
-    def _start_process(self, name: str, command: str) -> dict[str, Any]:
+    def _start_process(
+        self,
+        name: str,
+        command: str,
+        env_overrides: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         with self._lock:
             proc = self._processes.get(name)
             if proc is None:
-                proc = ManagedProcess(name=name, command=command)
+                proc = ManagedProcess(
+                    name=name,
+                    command=command,
+                    env_overrides=dict(env_overrides or {}),
+                )
                 self._processes[name] = proc
             elif proc.is_running():
                 return {"ok": False, "error": f"{name} is already running.", "status": proc.status()}
             else:
                 proc.command = command
+                proc.env_overrides = dict(env_overrides or {})
         result = proc.start()
         self.add_global_log(f"{name}: {result.get('message', result)}")
         return result
@@ -1093,12 +1105,14 @@ class DashboardNode(Node):
             args.append("--force")
         if bool(body.get("skip_clip")):
             args.append("--skip-clip")
+        env_overrides: dict[str, str] = {}
         if api_key:
-            command = self._ros_command(f"export DASHSCOPE_API_KEY={shlex.quote(api_key)} && " + _shell_join(args))
+            command = self._ros_command(_shell_join(args))
+            env_overrides["DASHSCOPE_API_KEY"] = api_key
             self.add_global_log("annotate_keyframes: using provided API key")
         else:
             command = self._ros_command(_shell_join(args))
-        return self._start_process("keyframe_annotate", command)
+        return self._start_process("keyframe_annotate", command, env_overrides=env_overrides)
 
     def api_keyframe_nodes(self, body: dict[str, Any]) -> dict[str, Any]:
         """Return list of keyframe nodes in a selected dataset, with id, semantic, x, y."""
