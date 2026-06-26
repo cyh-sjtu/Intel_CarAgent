@@ -1,106 +1,93 @@
 # caragent_memory
 
-CarAgent keyframe recording and selection tools.
+`caragent_memory` 负责关键帧候选采集、图像质量评估、CLIP/DINOv2 特征生成和离线关键帧筛选。它将机器人经过的位置与视觉观测绑定起来，为 Agent 提供轻量化语义场景地图。
 
-This package records stereo keyframe candidates after a LiDAR map is built. The
-final navigation target is still executed by LiDAR localization and Nav2; the
-camera frames are used as semantic memory anchors.
+## 模块定位
 
-## Online Collection
+当前系统没有构建稠密三维语义地图，而是记录带位姿的关键帧图像，并在离线阶段筛选为可检索的场景记忆。该路线计算负担较低，适合低成本移动平台和边缘 AI 部署。
 
-Start localization, camera, and the recorder with collection speed limits:
+## 关键入口文件
 
-```bash
-ros2 launch caragent_memory caragent_keyframe_collect.launch.py \
-  session_name:=lab_001 \
-  camera_device:=/dev/video0 \
-  laser_port:=/dev/ttyUSB1 \
-  stm32_port:=/dev/ttyUSB0
-```
+| 文件 | 作用 |
+| --- | --- |
+| `launch/caragent_keyframe_collect.launch.py` | 启动定位、相机和 keyframe recorder |
+| `keyframe_recorder_node.py` | 在线记录图像、位姿、scan 摘要和质量指标 |
+| `select_keyframes.py` | 离线筛选关键帧并生成 selected 数据集 |
+| `dataset.py` | 数据集结构、manifest 读写和记录解析 |
+| `image_quality.py` | 清晰度、亮度、对比度等图像质量评估 |
+| `openvino_clip.py` / `convert_clip_openvino.py` | CLIP OpenVINO 图像特征推理与转换 |
+| `dinov2_encoder.py` | DINOv2 PyTorch 图像特征编码回退 |
+| `dinov2_openvino.py` / `convert_dinov2_openvino.py` | DINOv2 OpenVINO 图像特征推理与转换 |
+| `scan_summary.py` | LiDAR scan 摘要保存 |
 
-Then drive the car manually by publishing `/cmd_vel`. The launch limits STM32
-commands to `0.16 m/s` and `0.45 rad/s` for stable image capture.
+## 数据集结构
 
-Manual capture:
-
-```bash
-ros2 service call /keyframe_recorder/capture_once std_srvs/srv/Trigger {}
-```
-
-Candidate dataset:
+在线采集候选帧：
 
 ```text
 ~/caragent_ws/keyframes/<session_name>/
-  raw/
-  left/
-  right/
-  pose/
-  scan/
-  meta/
-  manifest.jsonl
-  session.json
+├── raw/             side-by-side 原图
+├── left/            左目图像
+├── right/           右目图像
+├── pose/            关键帧 map 位姿
+├── scan/            scan 摘要
+├── meta/            图像质量、TF 状态、采集原因
+├── manifest.jsonl   候选帧索引
+└── session.json     采集参数快照
 ```
 
-## CLIP + DINOv2 Selection
+离线筛选输出：
 
-Convert or document the model export:
-
-```bash
-ros2 run caragent_memory convert_clip_openvino --dry-run
+```text
+selected/
+├── selected_manifest.jsonl
+├── rejected_manifest.jsonl
+├── review.html
+├── embeddings/
+└── constructed_memory/
+    ├── keyframe_nodes/
+    ├── semantic_chunk_index_records.json
+    └── semantic_chunk_index_matrix.npy
 ```
 
-The converter exports `CLIPModel.get_image_features(pixel_values)`, which keeps
-the CLIP `visual_projection` head. For ViT-B/32 the selector expects a 512-D
-image embedding. Do not use a raw vision-model hidden-state export such as
-`[1, 50, 768]`; flattening that tensor would break cosine similarity.
+## 采集规则
 
-After an OpenVINO image encoder XML is available:
+`keyframe_recorder_node` 订阅 `/stereo/image_raw`、`/scan`、`/odom` 和 TF，在满足以下条件时保存候选帧：
 
-```bash
-ros2 run caragent_memory select_keyframes \
-  --dataset ~/caragent_ws/keyframes/lab_001 \
-  --clip-model ~/caragent_ws/models/clip-vit-base-patch32/image_encoder.xml \
-  --dinov2-model ~/caragent_ws/models/dinov2-small \
-  --device AUTO \
-  --dinov2-device auto
-```
+- 第一帧或手动触发 `/keyframe_recorder/capture_once`。
+- 距离上次保存超过最小时间，且位移或航向变化超过阈值。
+- 图像通过清晰度、亮度和对比度基本质量检查。
+- TF 可解析为 `map -> base_link` 位姿。
 
-The selector stores two embeddings for every selected keyframe:
+默认采集阈值包括 `min_time_sec=1.5`、`min_distance_m=0.65`、`min_yaw_deg=30.0`。
 
-- `clip_encoding` is a 512-D CLIP image embedding for image-text retrieval.
-- `dinov2_encoding` is a 384-D DINOv2-small image embedding for frame-to-frame
-  visual similarity, deduplication, and place recognition.
+## 特征与筛选
 
-DINOv2 is the default frame deduplication backend. To reproduce the previous
-CLIP-based deduplication behavior, pass `--dedupe-backend clip`.
+| 特征 | 用途 |
+| --- | --- |
+| CLIP image embedding | 图文语义检索、参考图片与语义 chunk 匹配 |
+| DINOv2 image embedding | 图像间相似度、冗余去重、地点视觉相似性 |
+| 位姿与 yaw | 保证空间覆盖，避免只按图像相似度筛选 |
+| image quality | 过滤模糊、过暗、过曝或低对比度帧 |
 
-Selection output is written to `<dataset>/selected`, including
-`selected_manifest.jsonl`, `rejected_manifest.jsonl`, `review.html`,
-`embeddings/`, and `constructed_memory/keyframe_nodes/`.
+DINOv2 是当前默认去重后端，并默认通过 OpenVINO NPU 生成视觉特征；PyTorch 后端保留为回退路径。CLIP OpenVINO 图像编码用于边缘端语义检索加速。
 
-## Semantic Chunk Index Postprocess
+## 与其他模块关系
 
-After keyframe semantic annotation is complete, precompute the semantic chunk
-index used by the Agent keyframe search tool:
+- 上游依赖 `caragent_bringup` 提供定位、雷达和相机。
+- 输出的 selected 数据集由 `caragent_agent.impression_graph.SceneMemory` 加载。
+- `caragent_agent` 的关键帧检索、参考图片匹配和导航工具依赖该数据集中的图像、位姿和特征。
+- Dashboard 调用 `select_keyframes`、关键帧可视化和语义标注相关流程。
 
-```bash
-ros2 run caragent_agent build_keyframe_chunk_index \
-  --dataset ~/caragent_ws/keyframes/lab_001/selected \
-  --force
-```
+## 已实现能力
 
-This writes `constructed_memory/semantic_chunk_index_records.json` and
-`constructed_memory/semantic_chunk_index_matrix.npy`. Runtime keyframe search
-loads these files directly, avoiding first-query chunk-index construction during
-live robot interaction.
+- 在线采集带 map 位姿的双目关键帧候选。
+- 保存 scan 摘要和图像质量指标，便于后续审计。
+- 使用 CLIP / DINOv2 特征进行离线筛选和冗余去除。
+- 支持预计算 semantic chunk index，减少 live Agent 首次查询延迟。
 
-## v1 Rules
+## 边界说明
 
-- Online candidates: first frame, then `>=1.5s` and either `>=0.65m` movement or
-  `>=30deg` yaw change.
-- Image quality: Laplacian variance, brightness mean, and brightness standard
-  deviation.
-- Offline selection: OpenVINO CLIP image embeddings for semantic retrieval,
-  DINOv2 image embeddings for visual deduplication, plus pose/yaw coverage
-  rules.
-- No semantic weighting, OCR, object detection, or stereo-depth graph edges in v1.
+- 当前关键帧记忆主要适用于相对稳定的室内空间。
+- 动态环境变化可通过到达确认、局部搜索和周期性关键帧刷新扩展，但不作为当前已完全解决能力描述。
+- 本包负责图像和特征数据准备，不直接调用 Nav2 或多模态大模型完成任务编排。

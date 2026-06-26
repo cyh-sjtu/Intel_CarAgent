@@ -22,6 +22,7 @@ from caragent_memory.dataset import (
     write_json,
 )
 from caragent_memory.dinov2_encoder import DINOv2ImageEncoder
+from caragent_memory.dinov2_openvino import DINOv2OpenVINOImageEncoder
 from caragent_memory.geometry import planar_distance, yaw_difference_deg
 from caragent_memory.openvino_clip import OpenVINOClipImageEncoder, cosine_similarity
 
@@ -176,8 +177,10 @@ def select_keyframes(
     clip_model: Path,
     device: Optional[str] = None,
     clip_device: Optional[str] = None,
-    dinov2_model: str | Path = Path("~/caragent_ws/models/dinov2"),
-    dinov2_device: str = "auto",
+    dinov2_model: str | Path = Path("~/caragent_ws/models/dinov2-small"),
+    dinov2_backend: str = "openvino",
+    dinov2_openvino_model: str | Path = Path("~/caragent_ws/models/dinov2-small-openvino/openvino_model.xml"),
+    dinov2_device: str = "NPU",
     dinov2_local_files_only: bool = True,
     dedupe_backend: str = "dinov2",
     search_radius_m: float = 2.0,
@@ -191,6 +194,9 @@ def select_keyframes(
     dedupe_backend = str(dedupe_backend).lower()
     if dedupe_backend not in {"dinov2", "clip"}:
         raise ValueError("--dedupe-backend must be either 'dinov2' or 'clip'")
+    dinov2_backend = str(dinov2_backend).lower()
+    if dinov2_backend not in {"openvino", "torch"}:
+        raise ValueError("--dinov2-backend must be either 'openvino' or 'torch'")
     resolved_clip_device = str(clip_device or device or "NPU")
 
     records = list(iter_frame_records(dataset))
@@ -203,11 +209,19 @@ def select_keyframes(
         shutil.copy2(session_path, output / "source_session.json")
 
     clip_encoder = OpenVINOClipImageEncoder(clip_model, device=resolved_clip_device)
-    dinov2_encoder = DINOv2ImageEncoder(
-        dinov2_model,
-        device=dinov2_device,
-        local_files_only=dinov2_local_files_only,
-    )
+    if dinov2_backend == "openvino":
+        dinov2_encoder = DINOv2OpenVINOImageEncoder(
+            dinov2_openvino_model,
+            processor_ref=dinov2_model,
+            device=dinov2_device,
+            local_files_only=dinov2_local_files_only,
+        )
+    else:
+        dinov2_encoder = DINOv2ImageEncoder(
+            dinov2_model,
+            device=dinov2_device,
+            local_files_only=dinov2_local_files_only,
+        )
     selected: list[SelectedRecord] = []
     rejected = []
 
@@ -316,7 +330,14 @@ def select_keyframes(
             if Path(str(dinov2_model)).expanduser().exists()
             else str(dinov2_model)
         ),
+        "dinov2_backend": dinov2_backend,
+        "dinov2_openvino_model": (
+            str(Path(dinov2_openvino_model).expanduser().resolve())
+            if dinov2_backend == "openvino" and Path(str(dinov2_openvino_model)).expanduser().exists()
+            else str(dinov2_openvino_model)
+        ),
         "dinov2_device": str(dinov2_encoder.device),
+        "dinov2_embedding_dim": int(getattr(dinov2_encoder, "embedding_dim", 384)),
         "visual_similarity_backend": dedupe_backend,
         "candidate_count": len(records),
         "selected_count": len(selected),
@@ -429,10 +450,26 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dinov2-model",
         type=Path,
-        default=Path("~/caragent_ws/models/dinov2"),
+        default=Path("~/caragent_ws/models/dinov2-small"),
         help="Local Hugging Face DINOv2-small model directory or model id.",
     )
-    parser.add_argument("--dinov2-device", default="auto", help="DINOv2 torch device: auto, cpu, cuda, cuda:0.")
+    parser.add_argument(
+        "--dinov2-backend",
+        choices=("openvino", "torch"),
+        default="openvino",
+        help="DINOv2 runtime backend for visual deduplication.",
+    )
+    parser.add_argument(
+        "--dinov2-openvino-model",
+        type=Path,
+        default=Path("~/caragent_ws/models/dinov2-small-openvino/openvino_model.xml"),
+        help="OpenVINO IR XML path for DINOv2 CLS image encoder.",
+    )
+    parser.add_argument(
+        "--dinov2-device",
+        default="NPU",
+        help="DINOv2 device. Use OpenVINO devices such as CPU/GPU/NPU, or torch devices when --dinov2-backend=torch.",
+    )
     parser.add_argument(
         "--dinov2-allow-download",
         action="store_true",
@@ -488,6 +525,8 @@ def main() -> None:
             device=args.device,
             clip_device=args.clip_device,
             dinov2_model=args.dinov2_model.expanduser(),
+            dinov2_backend=args.dinov2_backend,
+            dinov2_openvino_model=args.dinov2_openvino_model.expanduser(),
             dinov2_device=args.dinov2_device,
             dinov2_local_files_only=not args.dinov2_allow_download,
             dedupe_backend=args.dedupe_backend,
