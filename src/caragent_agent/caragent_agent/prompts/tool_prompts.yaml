@@ -1,0 +1,91 @@
+llm_search_keywords_on_kf_request_message_system_and: |
+  You need to return a list of keyframe node IDs that contain all the keywords based on the given keyframe node dictionary and keywords list.
+  
+  You will receive <keyframe node dictionary>{{KEYFRAME_NODE_DICTIONARY}}</keyframe node dictionary> and <keywords list>{{KEYWORDS_LIST}}</keywords list>.
+  
+  First, carefully read the following keyframe node dictionary: <keyframe node dictionary>{{KEYFRAME_NODE_DICTIONARY}}</keyframe node dictionary>. Here, the keys of the dictionary are the IDs of the keyframe nodes, and the values are the semantics of the keyframe nodes.
+  
+  Next, review the following keywords list: <keywords list>{{KEYWORDS_LIST}}</keywords list>. When determining whether a keyframe node contains all the keywords, note that 'contain' refers to semantic inclusion, which can be synonymous or near-synonymous expressions or even the incorrect spelling of the given keywords, and does not necessarily require the exact words of the keywords to appear. And all the keywords must be included; missing even one does not meet the criteria.
+  
+  Please follow these steps for analysis:
+  
+  1. Iterate through each keyframe node in the keyframe node dictionary.
+  
+  2. For each keyframe node, determine whether its semantics contain all the keywords in the keywords list.
+  
+  3. If the semantics of the keyframe node contain all the keywords, add its ID to the list of IDs of keyframe nodes that meet the criteria.
+  
+  4. After analyzing all the keyframe nodes, return the list of IDs of keyframe nodes that meet the criteria, in the format '<answer>[ID1, ID2, ID3...]</answer>'.
+
+llm_search_keywords_on_kf_request_message_system_or: | 
+  You need to return a list of keyframe node IDs that contain all the keywords based on the given keyframe node dictionary and keywords list. You will receive <keyframe node dictionary>{{KEYFRAME_NODE_DICTIONARY}}</keyframe node dictionary> and <keywords list>{{KEYWORDS_LIST}}</keywords list>.
+  
+  First, carefully read the following keyframe node dictionary: <keyframe node dictionary>{{KEYFRAME_NODE_DICTIONARY}}</keyframe node dictionary>. Here, the keys of the dictionary are the IDs of the keyframe nodes, and the values are the semantics of the keyframe nodes.
+  
+  Next, review the following keywords list: <keywords list>{{KEYWORDS_LIST}}</keywords list> When determining whether a keyframe node contains any one of the keywords, note that 'contain' refers to semantic inclusion, which can be synonymous or near-synonymous expressions or even the incorrect spelling of the given keywords, and does not necessarily require the exact words of the keywords to appear. And as long as one of the keywords be included. Please follow these steps for analysis:
+  
+  1. Iterate through each keyframe node in the keyframe node dictionary.
+  
+  2. For each keyframe node, determine whether its semantics contain one of the keywords in the keywords list.
+  
+  3. If the semantics of the keyframe node contain one of the keywords, add its ID to the list of IDs of keyframe nodes that meet the criteria.
+  
+  4. After analyzing all the keyframe nodes, return the list of IDs of keyframe nodes that meet the criteria, in the format '<answer>[ID1, ID2, ID3...]</answer>'.
+
+llm_search_requirement_on_kf_request_message_system: | 
+  You need to return a list of keyframe node IDs that satisfy a navigation/search requirement based on the given keyframe node dictionary and requirement string. You will receive <keyframe node dictionary>{{KEYFRAME_NODE_DICTIONARY}}</keyframe node dictionary> and <requirement string>{{REQUIREMENT}}</requirement string>.
+  
+  First, carefully read the following keyframe node dictionary: <keyframe node dictionary>{{KEYFRAME_NODE_DICTIONARY}}</keyframe node dictionary>. Here, the keys of the dictionary are the IDs of the keyframe nodes, and the values are the semantics of the keyframe nodes.
+  
+  Next, review the following requirement: <requirement string>{{REQUIREMENT}}</requirement string>.
+
+  Important matching policy:
+  - The keyframe map is a finite set of robot viewpoints. A good match does not need to reproduce every detail, crop, viewpoint, object count, or transient object in the user's image or wording.
+  - For image-to-place matching, prefer stable scene layout and landmarks. Do not reject a candidate just because some minor visual details differ.
+  - For object-target navigation, the main criterion is whether the requested target object is present and useful as a staging viewpoint: closer, larger, clearer, more complete, more centered, and less occluded is better.
+  - If several keyframes satisfy the same target, return all plausible IDs in best-first order rather than only a perfect match.
+  - Be permissive about synonyms and paraphrases in the keyframe semantics.
+  
+  Please follow these steps for analysis:
+  
+  1. Iterate through each keyframe node in the keyframe node dictionary.
+  
+  2. For each keyframe node, determine whether its semantics meet the core requirement. Ignore nonessential mismatches unless they change the target place or target object.
+  
+  3. If the semantics of the keyframe node meet the requirement, add its ID to the list of IDs of keyframe nodes that meet the criteria. Put stronger viewpoints earlier when possible.
+  
+  4. After analyzing all the keyframe nodes, return the list of IDs of keyframe nodes that meet the criteria, in the format '<answer>[ID1, ID2, ID3...]</answer>'.
+
+vlm_model_analyse_each_image_system: | 
+  You will answer the questions based on the provided images.
+  
+  First, carefully examine the following image: <image>{{IMAGE}}</image>
+  
+  Then, answer the following question: <question>{{QUESTION}}</question>
+  
+  When answering the question, please follow these requirements: 
+  
+  1. Carefully observe the content of the image, including but not limited to people, objects, scenes, etc.
+  
+  2. Based on the information in the image and the requirements of the question, provide an accurate and concise answer.
+  
+  3. If there is not enough information in the image to answer the question, please indicate so.
+  
+  Please analyze the image and the question in the <thinking> tag, and then provide your answer in the <answer> tag. <answer> [Provide your answer here]</answer> <thinking>[Analyze the image and question here]</thinking>
+
+vlm_model_co_analyse_images_system: | 
+  You will answer the questions based on the provided images which is composed of multiple sub-images stitched together. For each sub-image, identify its unique content and describe it in the order of the kf_id labeled in the top-left corner.
+  
+  First, carefully examine the following image: <image>{{IMAGE}}</image>
+  
+  Then, answer the following question: <question>{{QUESTION}}</question>
+  
+  When answering the question, please follow these requirements:
+  
+  1. Carefully observe the content of the image, including but not limited to people, objects, scenes, etc.
+  
+  2. Based on the information in the image and the requirements of the question, provide an accurate and concise answer.
+  
+  3. If there is not enough information in the image to answer the question, please indicate so.
+  
+  Please analyze the image and the question in the <thinking> tag, and then provide your answer in the <answer> tag. <answer> [Provide your answer here]</answer> <thinking>[Analyze the image and question here]</thinking>

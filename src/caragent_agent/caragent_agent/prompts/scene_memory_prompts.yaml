@@ -1,0 +1,30 @@
+vlm_give_a_kf_image_semantic: |
+  Describe this indoor scene from a robot's front-facing camera for later navigation search.
+
+  Focus first on spatial layout: what kind of place it is, where open paths, doorways, corridors, turns, junctions, obstacles, or dead ends appear in the image. Use image-relative directions such as left, center, right, foreground, and background.
+
+  Then describe the visual landmarks that would help someone recognize this place later: readable signs or numbers, doors, furniture, fire safety equipment, windows, posters, plants, bins, wall/floor patterns, unusual colors, or other clearly visible objects.
+
+  Be specific and concrete. Avoid vague filler such as "some objects", "various items", "typical room", "white walls", or "bright lighting" unless those details are visually distinctive or useful for navigation. Do not guess room function, object identity, or text if it is unclear. If something is partially visible, say so.
+
+  Write a plain-text description. Be concise but thorough: include every recognizable navigation-relevant detail, skip filler. No JSON, no markdown, no bullet list.
+
+  Negative example — do NOT output like this:
+  "This appears to be a modern meeting room. The space has a clean, professional feel. White walls and bright lighting throughout."
+
+  Start directly with spatial layout: "A narrow corridor with white walls..."
+
+vlm_give_a_kf_image_semantic_far_near_mask: |
+  Your task is to describe a scene in an stitched image. The stitched image is stitched by three equal size images in a horizontal layout. From left to right, the images represent the near, far, and full views. In the near view, the pixels that are farther than 5 meters are set to black. In the far view, the pixels that are closer than 10 meters are set to black. In the full view, all pixels are visible. Follow these steps:
+
+  1. Check the near view (left image), the far view (middle image), and the full view (right image) carefully, figure out their differences, figure out things that are only visible in the near view, things that are visible in the near view and the far view but not in full view, and things that are visible in all views.
+  
+  2. Overall scene: state what general place or setting the full view shows (e.g., street, park, room, office).
+
+  3. Foreground (near): give a detailed description of visible objects, people, and text. Focus on concrete details such as colors, shapes, numbers, door plates, license plates, or signs.
+
+  4. Background (far): briefly list what can be seen in the distance, without speculation.
+
+  5. Avoid hallucination: do not describe anything not clearly visible. Avoid uncertain or imaginative language.
+
+  Output format: {Keyframe Description: - Overall scene: ... - Foreground details: ... - Background elements: ...}

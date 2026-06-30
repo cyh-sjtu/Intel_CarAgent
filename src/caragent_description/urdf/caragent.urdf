@@ -1,0 +1,118 @@
+<?xml version="1.0"?>
+<robot name="CarAgent" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- ============================================
+  CarAgent chassis URDF model
+
+  Frame convention:
+    base_link origin: ground projection of the rear wheel hub motor center
+    X: forward, from rear to front
+    Y: left side of the vehicle
+    Z: upward
+
+  Sensor mounting positions are expressed relative to base_link.
+  ============================================ -->
+
+  <!-- ======== Base ======== -->
+  <!--
+    The visual box follows the Nav2 footprint:
+      front: +0.32 m, rear: -0.10 m
+      left:  +0.20 m, right: -0.16 m
+      height: 0.32 m
+
+    Since URDF box geometry is centered on its own origin, the visual origin is
+    placed at the center of that footprint box:
+      x = (0.32 + -0.10) / 2 = 0.11 m
+      y = (0.20 + -0.16) / 2 = 0.02 m
+      z = 0.32 / 2 = 0.16 m
+  -->
+  <link name="base_link">
+    <visual>
+      <geometry>
+        <box size="0.42 0.36 0.32"/>
+      </geometry>
+      <origin xyz="0.11 0.02 0.16"/>
+      <material name="dark_gray">
+        <color rgba="0.2 0.2 0.2 1.0"/>
+      </material>
+    </visual>
+  </link>
+
+  <!-- ======== 2D LiDAR (SLLIDAR C1) ======== -->
+  <!--
+    Physical mount: x=0.115 m, y=0.0 m, z=0.30 m.
+    The C1 LiDAR data frame points backward on this vehicle,
+    so the joint rotates it 180 degrees around Z.
+  -->
+  <joint name="base_to_laser" type="fixed">
+    <parent link="base_link"/>
+    <child link="laser"/>
+    <origin xyz="0.115 0 0.30" rpy="0 0 3.14159"/>
+  </joint>
+
+  <link name="laser">
+    <visual>
+      <geometry>
+        <cylinder radius="0.04" length="0.04"/>
+      </geometry>
+      <material name="red">
+        <color rgba="0.8 0.2 0.2 1.0"/>
+      </material>
+    </visual>
+  </link>
+
+  <!-- ======== Stereo Camera (Huibo Stereo) ======== -->
+  <!--
+    Initial nominal camera pose before calibration.
+    Left camera:  x=0.30 m, y= 0.03 m, z=0.22 m.
+    Right camera: x=0.30 m, y=-0.03 m, z=0.22 m.
+    Camera extrinsics are expected to be refined by calibration.
+  -->
+  <joint name="base_to_camera_left" type="fixed">
+    <parent link="base_link"/>
+    <child link="camera_left"/>
+    <origin xyz="0.30 0.03 0.22" rpy="0 0 0"/>
+  </joint>
+
+  <link name="camera_left">
+    <visual>
+      <geometry>
+        <box size="0.02 0.02 0.02"/>
+      </geometry>
+      <material name="blue">
+        <color rgba="0.2 0.4 0.8 1.0"/>
+      </material>
+    </visual>
+  </link>
+
+  <joint name="base_to_camera_right" type="fixed">
+    <parent link="base_link"/>
+    <child link="camera_right"/>
+    <origin xyz="0.30 -0.03 0.22" rpy="0 0 0"/>
+  </joint>
+
+  <link name="camera_right">
+    <visual>
+      <geometry>
+        <box size="0.02 0.02 0.02"/>
+      </geometry>
+      <material name="cyan">
+        <color rgba="0.2 0.7 0.8 1.0"/>
+      </material>
+    </visual>
+  </link>
+
+  <!-- ======== IMU (HI219M) ======== -->
+  <!--
+    Physical mount: x=0.20 m, y=-0.033 m, z=0.16 m.
+    The lateral offset does not affect yaw/gyro readings for a rigid body.
+  -->
+  <joint name="base_to_imu" type="fixed">
+    <parent link="base_link"/>
+    <child link="imu_link"/>
+    <origin xyz="0.20 -0.033 0.16" rpy="0 0 0"/>
+  </joint>
+
+  <link name="imu_link"/>
+
+</robot>

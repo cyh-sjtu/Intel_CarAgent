@@ -1,0 +1,126 @@
+# lidar_initialpose_node parameters.
+# This node estimates only the startup /initialpose. slam_toolbox remains the
+# continuous localization backend after the initial pose is published.
+#
+# Main changes versus the previous version:
+# - Ray tracing is enabled, so poses are penalized when beams pass through walls.
+# - The map is allowed to stabilize briefly before sampling.
+# - Global coarse search is followed by local Gaussian refinement.
+# - Best/second-best score margin is checked; ambiguous poses get larger covariance.
+# - laser_x/laser_y/laser_yaw_deg can model the /scan frame offset from base_link.
+
+lidar_initialpose_node:
+  ros__parameters:
+
+    # Topic names and output frame.
+    scan_topic: /scan
+    map_topic: /map
+    initialpose_topic: /initialpose
+    initial_pose_frame: map
+
+    # Startup timeouts and map stability.
+    wait_scan_timeout: 30.0
+    wait_map_timeout: 60.0
+    map_stable_delay: 1.5
+    map_stable_required_updates: 1
+
+    # Hint pose in the map frame. Used as the local search center and fallback.
+    initial_x: 0.0
+    initial_y: 0.0
+    initial_yaw_deg: 0.0
+
+    # /scan frame relative to base_link.
+    # If your lidar frame is exactly base_link, keep all three at 0.
+    # Otherwise set these using:
+    #   ros2 topic echo /scan --once | grep frame_id
+    #   ros2 run tf2_ros tf2_echo base_link <laser_frame>
+    laser_x: 0.115
+    laser_y: 0.0
+    laser_yaw_deg: 180.0
+
+    # Particle startup localization.
+    use_particle_filter: true
+    publish_fallback_on_failure: false
+    use_global_localization: true
+
+    # random_seed=0 means non-deterministic. Set e.g. 42 for repeatable tests.
+    random_seed: 0
+
+    # Global search. More particles are more stable but slower.
+    num_particles: 8000
+    yaw_bins: 36
+    search_range_m: 3.0
+    local_yaw_search_deg: 45.0
+    max_sampling_attempts: 40000
+
+    # Local refinement around the best coarse candidates.
+    top_k: 12
+    refinement_rounds: 2
+    refinement_particles: 1000
+    refinement_top_k: 5
+    refinement_xy_std_m: 0.35
+    refinement_yaw_std_deg: 12.0
+
+    # Laser/map scoring.
+    # For a 0.05m map, hit_threshold_m=0.08 means roughly 2 cells.
+    hit_threshold_m: 0.08
+    robot_clearance_m: 0.20
+    min_beams: 80
+    max_beams: 180
+
+    # Limit very long lidar beams for scoring speed and stability.
+    # Beams longer than this are treated as max-range/free-space beams.
+    score_max_range_m: 8.0
+    max_range_margin_m: 0.10
+
+    # Ray tracing step. Larger = faster but less strict.
+    raytrace_step_m: 0.10
+
+    # Score model:
+    #   endpoint hit near occupied cell: +hit_reward
+    #   ray crosses wall before endpoint: -wall_penalty
+    #   finite endpoint misses wall: -miss_penalty
+    #   max-range/free-space ray without early wall: +max_range_clear_reward
+    #   unknown cells along ray: -unknown_penalty * unknown_ratio
+    hit_reward: 1.0
+    miss_penalty: 0.35
+    wall_penalty: 1.0
+    unknown_penalty: 0.15
+    max_range_clear_reward: 0.05
+
+    # Because the new score includes penalties, typical good values are lower
+    # than the old endpoint-only hits/valid score.
+    min_score: 0.25
+
+    # Publish gate. Keep min_score low enough for diagnostics, but only inject
+    # a pose into slam_toolbox when the match has enough evidence.
+    enable_confidence_gate: true
+    min_publish_score: 0.55
+    min_hit_ratio: 0.62
+    max_miss_ratio: 0.25
+    max_blocked_ratio: 0.15
+
+    # Ambiguity check. If best and second-best are too close, the pose is still
+    # published by default, but with larger covariance. Set reject_ambiguous_pose
+    # to true if you prefer fallback instead.
+    check_score_margin: true
+    reject_ambiguous_pose: false
+    min_score_margin: 0.06
+    min_score_ratio: 1.12
+    distinct_peak_xy_m: 0.75
+    distinct_peak_yaw_deg: 20.0
+    ambiguous_cov_xy: 0.80
+    ambiguous_cov_yaw: 0.60
+
+    # Covariance published with a confident selected particle.
+    # These are standard deviations; the node writes variances into the message.
+    pose_cov_xy: 0.20
+    pose_cov_yaw: 0.15
+
+    # Repeat publishing can help if slam_toolbox activates slowly.
+    retry_interval: 2.0
+    max_retries: 1
+
+    scoring_workers: 6
+    scoring_chunk_size: 64
+    parallel_min_candidates: 300

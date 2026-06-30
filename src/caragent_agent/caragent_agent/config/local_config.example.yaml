@@ -1,0 +1,98 @@
+# Copy this file to caragent_agent/config/local_config.yaml and edit it locally.
+# local_config.yaml is ignored by git. Use it for machine paths, API keys,
+# personal runtime overrides, and provider/model concurrency limits.
+#
+# This template intentionally uses one generic profile. Rename it or add more
+# profiles in your own local_config.yaml if you need local/server variants.
+
+active_profile: "default"
+
+profiles:
+  default:
+    # Local log output. Use an absolute path on AutoDL/server if you want logs
+    # outside the repository, for example /root/autodl-tmp/caragent_logs.
+    log_dir: "logs"
+
+    # SceneMemory / Impression Graph paths. These are data paths, not AirSim/UE
+    # packaged scene paths. Relative paths are resolved from the repository root.
+    paths:
+      scene_memory_root: "Impression_graph/caragent_agent/pre-built_impression_graph"
+      default_scene_memory: "your_scene_name"
+      default_tasks_file: "tasks_test.json"
+      default_dataset_dir: "Impression_graph/caragent_agent/pre-built_impression_graph/your_scene_name"
+
+    # Runtime strategy. standard is the repository default and matches the
+    # expected server/evaluation behavior.
+    # Available built-ins:
+    #   standard
+    #   interactive_safe
+    #   rate_limit_safe
+    runtime_profile: "standard"
+
+    # Machine/runtime-side scheduling. These defaults mirror standard.
+    # Lower background_workers_default or enable foreground yielding if local
+    # interactive use feels sluggish.
+    runtime_profile_overrides:
+      background_start_policy: "immediate_after_plan"
+      background_workers_default: 3
+      speculative_branch_preanalysis: false
+      llm_background_yield_to_foreground: false
+      clip_search_lock_enabled: false
+
+    # API/key-side throttling. These limits are about provider/model quota and
+    # rate limits, not machine performance. The effective concurrency is capped
+    # by both provider and model limits.
+    llm_max_concurrency_per_provider:
+      default: 4
+      qwen: 2
+      deepseek: 3
+      doubao: 2
+    llm_max_concurrency_per_model:
+      default: 4
+      qwen3.6-flash: 2
+      qwen3.6-plus: 2
+      qwen3-vl-flash: 2
+      deepseek-chat: 3
+
+    # Optional model overrides. Usually keep these aligned with config.yaml.
+    # agent_core_llm_model: "qwen3.6-plus"
+    # agent_background_llm_model: "deepseek-chat"
+    # vlm_model_analyse_images: "qwen3.6-flash"
+    # llm_model_search_on_keyframe_nodes: "qwen3.6-flash"
+    # Keep Qwen thinking disabled for ReAct/tool-calling loops unless provider
+    # reasoning_content is preserved across turns.
+    # llm_qwen_enable_thinking: false
+    # llm_qwen_enable_thinking_by_role:
+    #   executor: false
+
+    # Optional workflow simulation mode for Agent/debug runs on the dev board.
+    # This keeps planner/executor/background logic real, but simulates navigation
+    # arrival after a delay without sending Nav2 goals or cmd_vel.
+    # navigation:
+    #   simulation_mode: true
+    #   simulation_navigation_delay_sec: 30.0
+    #   simulation_navigation_delay_per_meter_sec: 0.0
+    #   simulation_initial_position: [0.0, 0.0, 0.0]
+    #   simulation_initial_yaw_deg: 0.0
+
+    # Optional local API keys. Prefer environment variables when possible:
+    #   DASHSCOPE_API_KEY
+    #   DASHSCOPE_API_KEYS="sk-1,sk-2,sk-3"
+    #   DEEPSEEK_API_KEY
+    #   DOUBAO_API_KEY
+    #
+    # For offline scene-memory annotation, put the team's DashScope key pool
+    # here. The annotation tool will distribute one batch across the available
+    # keys and still respect the UI/CLI batch_size as the total concurrency cap.
+    #
+    # api_keys:
+    #   dashscope:
+    #     - "sk-xxx"
+    #     - "sk-yyy"
+    #     - "sk-zzz"
+    #   # Or group by teammate; both forms are accepted.
+    #   # dashscope:
+    #   #   teammate_a: ["sk-xxx", "sk-yyy"]
+    #   #   teammate_b: ["sk-zzz"]
+    #   deepseek: "sk-..."
+    #   doubao: "..."

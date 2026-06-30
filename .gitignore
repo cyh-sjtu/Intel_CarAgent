@@ -1,0 +1,20 @@
+# Build outputs
+build/
+install/
+log/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Local config with secrets
+**/local_config.yaml
+**/llm_api.yaml
+.env
+*.env
+
+# OS noise
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,728 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CarAgent Console</title>
+<style>
+  :root {
+    --bg:#111827; --panel:#182235; --panel2:#202b3d; --line:#334155;
+    --text:#e5e7eb; --muted:#94a3b8; --accent:#38bdf8; --ok:#22c55e;
+    --warn:#f59e0b; --bad:#ef4444; --button:#26364f;
+  }
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif}
+  header{min-height:58px;border-bottom:1px solid var(--line);background:#0f172a;display:flex;align-items:center;gap:10px;padding:8px 20px;flex-wrap:wrap}
+  h1{font-size:18px;margin:0;font-weight:650;white-space:nowrap}.pill{font-size:12px;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:5px 10px;white-space:nowrap}
+  .status-dot{width:10px;height:10px;border-radius:50%;background:var(--bad);display:inline-block;margin-right:6px}.status-dot.on{background:var(--ok)}
+  header select, header .hdr-port{width:auto;min-width:100px;padding:5px 8px;font-size:12px}
+  header .hdr-label{font-size:11px;color:var(--muted);margin-right:2px;white-space:nowrap}
+  .layout{display:grid;grid-template-columns:220px 1fr;min-height:calc(100vh - 58px)}
+  nav{border-right:1px solid var(--line);background:#101827;padding:14px}
+  nav button{width:100%;justify-content:flex-start;margin-bottom:7px}
+  main{padding:18px;max-width:1280px}
+  section{display:none}.active{display:block}
+  .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px}.card{grid-column:span 6;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:15px}
+  .wide{grid-column:span 12}.third{grid-column:span 4}
+  h2{font-size:18px;margin:0 0 14px} h3{font-size:14px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin:0 0 12px}
+  label{display:block;font-size:12px;color:var(--muted);margin:9px 0 4px}
+  input,select,textarea{width:100%;border:1px solid var(--line);background:#0f172a;color:var(--text);border-radius:6px;padding:8px 10px;font-size:14px}
+  textarea{min-height:74px;font-family:ui-monospace,Consolas,monospace}
+  button{border:1px solid var(--line);background:var(--button);color:var(--text);border-radius:6px;padding:8px 11px;display:inline-flex;align-items:center;gap:7px;cursor:pointer;font-size:14px}
+  button:hover{border-color:var(--accent)} button.primary{background:#075985;border-color:#0ea5e9} button.danger{background:#7f1d1d;border-color:#991b1b} button.ok{background:#14532d;border-color:#166534}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.muted{color:var(--muted)}.small{font-size:12px}.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+  .log{background:#050914;border:1px solid var(--line);border-radius:8px;height:390px;overflow:auto;padding:10px;font-family:ui-monospace,Consolas,monospace;font-size:12px;line-height:1.45;white-space:pre;tab-size:2}
+  .log-line{display:block;min-height:1.45em;color:#d8dee9}
+  .log-line.empty{min-height:.72em}
+  .log-line.section{margin:6px 0 3px;color:#93c5fd;font-weight:700}
+  .log-time{color:#7dd3fc}.log-proc{color:#c4b5fd}.log-node{color:#facc15}.log-stamp{color:#94a3b8}.log-msg{color:#d8dee9}
+  .log-level{font-weight:700}.log-level.info{color:#22c55e}.log-level.warn{color:#f59e0b}.log-level.error{color:#f87171}.log-level.debug{color:#60a5fa}.log-level.fatal{color:#fb7185}
+  .log-line.info .log-msg{color:#d1fae5}.log-line.warn .log-msg{color:#fde68a}.log-line.error .log-msg,.log-line.fatal .log-msg{color:#fecaca}.log-line.debug .log-msg{color:#bfdbfe}
+  .list{display:grid;gap:7px;max-height:300px;overflow:auto}.item{border:1px solid var(--line);border-radius:6px;padding:8px;background:var(--panel2)}
+  a{color:#7dd3fc}.split{display:grid;grid-template-columns:1fr 1fr;gap:10px}.hint{padding:9px;border:1px dashed var(--line);border-radius:6px;color:var(--muted)}
+  .modal-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.55);z-index:999;justify-content:center;align-items:center}.modal-overlay.show{display:flex}.modal-box{background:var(--panel);border:1px solid var(--line);border-radius:10px;width:560px;max-height:70vh;display:flex;flex-direction:column}.modal-header{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;border-bottom:1px solid var(--line)}.modal-header h2{font-size:16px;margin:0}.modal-body{overflow:auto;padding:12px 16px;flex:1}.modal-body label.kf-item{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:5px;cursor:pointer;font-size:13px;margin-bottom:2px}.modal-body label.kf-item:hover{background:rgba(56,189,248,0.08)}.modal-body label.kf-item.selected{background:rgba(56,189,248,0.18);outline:1px solid var(--accent)}.modal-body input[type=checkbox]{width:auto;accent-color:var(--accent)}.modal-footer{display:flex;gap:8px;justify-content:flex-end;padding:10px 16px;border-top:1px solid var(--line)}#kf-select-all{margin-left:16px;font-size:12px;color:var(--accent);cursor:pointer}
+  @media(max-width:900px){.layout{grid-template-columns:1fr}nav{display:flex;overflow:auto;border-right:0;border-bottom:1px solid var(--line)}nav button{min-width:128px}.card,.third{grid-column:span 12}.split{grid-template-columns:1fr}.modal-box{width:92vw}}
+</style>
+</head>
+<body>
+<header>
+  <h1>CarAgent Console</h1>
+  <span class="pill"><span id="any-running" class="status-dot"></span><span id="system-status">loading</span></span>
+  <span class="pill mono" id="workspace">workspace</span>
+  <span class="hdr-label">Laser</span><select id="global-laser" class="hdr-port"></select>
+  <span class="hdr-label">STM32</span><select id="global-stm32" class="hdr-port"></select>
+  <span class="hdr-label">Camera</span><select id="global-camera" class="hdr-port"></select>
+  <span class="hdr-label">Resolution</span><select id="global-camera-resolution" class="hdr-port">
+    <option value="3840x1200">3840x1200</option>
+    <option value="3840x1080">3840x1080</option>
+    <option value="2560x720">2560x720</option>
+    <option value="1280x480">1280x480</option>
+  </select>
+  <button onclick="loadPorts()">刷新端口</button>
+  <button onclick="refreshAll()">刷新</button>
+  <a href="/demo" target="_blank" style="color:#e5e7eb;text-decoration:none;border:1px solid var(--line);background:#14532d;border-radius:6px;padding:8px 11px;font-size:14px">展示模式</a>
+  <button class="danger" onclick="stopAll()">停止全部</button>
+</header>
+<div class="layout">
+<nav>
+  <button onclick="showTab('mapping')">建图</button>
+  <button onclick="showTab('navigation')">导航</button>
+  <button onclick="showTab('rotation')">旋转调参</button>
+  <button onclick="showTab('scene')">场景地图</button>
+  <button onclick="showTab('agent')">Agent</button>
+  <button onclick="showTab('tests')">测试工具</button>
+  <button onclick="showTab('object_dataset')">Object Dataset</button>
+  <button onclick="showTab('calib')">标定</button>
+  <button onclick="showTab('logs')">日志</button>
+</nav>
+<main>
+  <section id="mapping" class="active">
+    <h2>建图</h2>
+    <div class="grid">
+      <div class="card">
+        <h3>建图控制</h3>
+        <label>增量建图 (可选, 空=全新)</label><select id="slam-map"></select>
+        <div class="split"><div><label>初始位姿 X m</label><input id="pose-x" placeholder="0.0"></div><div><label>Y m</label><input id="pose-y" placeholder="0.0"></div><div><label>Yaw rad</label><input id="pose-yaw" placeholder="0.0"></div></div>
+        <div class="row" style="margin-top:12px">
+          <button class="primary" onclick="startSlam()">启动 SLAM + RViz</button>
+          <button class="danger" onclick="stopProcess('slam')">停止建图</button>
+          <button class="ok" onclick="setInitialPose()">设置初始位姿</button>
+          <button onclick="clearChanges()">手动清除一次</button>
+          <label style="display:inline-flex;align-items:center;gap:6px;margin-left:12px;cursor:pointer">
+            <input type="checkbox" id="auto-clear" onchange="toggleAutoClear()" style="width:auto">
+            <span style="font-size:13px">自适应清除 (每8秒)</span>
+          </label>
+        </div>
+        <p class="hint">选择已有地图 base path 可增量建图，留空则全新建图。</p>
+      </div>
+      <div class="card">
+        <h3>保存地图</h3>
+        <label>地图名称</label><input id="map-name" placeholder="map_YYYYMMDD_HHMMSS">
+        <div class="row" style="margin-top:12px"><button class="ok" onclick="saveMap()">保存 posegraph + yaml/pgm</button></div>
+        <div id="map-save-result" class="small muted" style="margin-top:10px"></div>
+      </div>
+      <div class="card wide"><h3>地图列表</h3><div id="maps-list" class="list"></div></div>
+    </div>
+  </section>
+
+  <section id="navigation">
+    <h2>导航</h2>
+    <div class="grid">
+      <div class="card">
+        <h3>启动导航</h3>
+        <label>地图 base path</label><select id="nav-map"></select>
+        <label><input id="nav-cmd" type="checkbox" style="width:auto"> 速度使能 enable_cmd_vel</label>
+        <label><input id="nav-left-only" type="checkbox" style="width:auto"> left-only 接管测试</label>
+        <label>max linear m/s</label><input id="nav-max-linear" value="0.40" type="number" min="0.20" max="0.45" step="0.01">
+        <label>pre-align 策略</label><select id="nav-pre-align-strategy">
+          <option value="direct_bearing">direct_bearing</option>
+          <option value="path_heading">path_heading</option>
+        </select>
+        <label>path heading lookahead m</label><input id="nav-path-lookahead" value="0.70" type="number" min="0.20" max="2.00" step="0.05">
+        <div class="row"><button class="primary" onclick="startNavigation()">启动导航 + RViz</button><button class="danger" onclick="stopProcess('navigation')">停止导航</button></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="rotation">
+    <h2>旋转对齐调参</h2>
+    <div class="grid">
+      <div class="card">
+        <h3>角度状态</h3>
+        <div class="item">
+          <div>当前角度：<b id="rot-current-yaw">--</b></div>
+          <div>目标角度：<b id="rot-target-yaw">--</b></div>
+          <div>剩余误差：<b id="rot-error">--</b></div>
+          <div>逆时针剩余：<b id="rot-ccw">--</b></div>
+          <div>当前角速度：<b id="rot-omega">--</b></div>
+          <div>角度来源：<b id="rot-source">--</b></div>
+          <div>状态：<b id="rot-status">--</b></div>
+        </div>
+        <p class="hint">调参控制通路与 Lite 遥控一致，发布到 /cmd_vel_nav，并同步对 /cmd_vel 发控制/停车。实验前请确认底盘速度使能已启动。</p>
+      </div>
+      <div class="card">
+        <h3>目标角度</h3>
+        <label>绝对目标角度 deg</label><input id="rot-target-deg" value="90" type="number" min="-180" max="180" step="1">
+        <label>相对旋转角度 deg</label><input id="rot-delta-deg" value="90" type="number" min="-360" max="360" step="1">
+        <div class="row" style="margin-top:12px">
+          <button class="primary" onclick="startRotationTuneAbsolute()">按绝对角开始</button>
+          <button class="ok" onclick="startRotationTuneRelative()">按相对角开始</button>
+          <button onclick="setRotationTargetFromCurrent()">填入当前角</button>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <button onclick="quickRotationDelta(45)">当前 +45°</button>
+          <button onclick="quickRotationDelta(90)">当前 +90°</button>
+          <button onclick="quickRotationDelta(180)">当前 +180°</button>
+          <button class="danger" onclick="stopRotationTune()">急停</button>
+        </div>
+      </div>
+      <div class="card wide">
+        <h3>left-only 分段参数</h3>
+        <div class="grid">
+          <div class="card third">
+            <label>高速角速度 rad/s</label><input id="rot-fast-omega" value="3.40" type="number" min="0" max="3.50" step="0.01">
+            <label>中速角速度 rad/s</label><input id="rot-mid-omega" value="2.50" type="number" min="0" max="3.50" step="0.01">
+            <label>低速角速度 rad/s</label><input id="rot-slow-omega" value="1.50" type="number" min="0" max="3.50" step="0.01">
+          </div>
+          <div class="card third">
+            <label>高速阈值 deg</label><input id="rot-fast-threshold" value="20" type="number" min="0" max="180" step="1">
+            <label>中速阈值 deg</label><input id="rot-mid-threshold" value="10" type="number" min="0" max="180" step="1">
+            <label>到达容差 deg</label><input id="rot-tolerance" value="4" type="number" min="0.1" max="30" step="0.1">
+          </div>
+          <div class="card third">
+            <label>允许小角度右转阈值 deg</label><input id="rot-right-shortcut" value="90" type="number" min="0" max="180" step="1">
+            <label>稳定等待 s</label><input id="rot-settle" value="0.20" type="number" min="0" max="5" step="0.05">
+            <label>超时 s</label><input id="rot-timeout" value="20" type="number" min="1" max="120" step="1">
+            <label>固件角速度上限 rad/s</label><input id="rot-omega-cap" value="3.50" type="number" min="0.1" max="3.50" step="0.01">
+          </div>
+        </div>
+        <div class="row" style="margin-top:12px">
+          <button class="ok" onclick="saveRotationTuneDefaults()">保存为默认参数</button>
+          <span id="rot-save-status" class="small muted"></span>
+        </div>
+        <p class="small muted">阈值逻辑与当前 left-only takeover 一致：误差大于高速阈值用高速，大于中速阈值用中速，否则用低速；若目标在右侧且小于“允许小角度右转阈值”，允许短右转。</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="scene">
+    <h2>场景地图</h2>
+    <div class="grid">
+      <div class="card">
+        <h3>采集与场景记忆</h3>
+        <label>Session 名称</label><input id="kf-session" placeholder="session_YYYYMMDD_HHMMSS">
+        <label>定位地图</label><select id="kf-map"></select>
+        <div class="row" style="margin-top:12px"><button class="primary" onclick="startKeyframes()">开始录制</button><button class="danger" onclick="stopKeyframes()">结束并生成场景记忆</button><button onclick="buildSceneMemory()">重建场景记忆</button></div>
+      </div>
+      <div class="card">
+        <h3>语义与可视化</h3>
+        <label>Session / selected</label><select id="scene-session"></select>
+        <label>Batch Size</label><input id="anno-batch" value="36" type="number" min="1" max="60">
+        <div class="row"><button onclick="visualizeScene()">生成场景地图 HTML</button><button onclick="annotateScene(false)">VLM 标注未标注帧</button><button onclick="showReannotateModal()">选择重标</button><button class="danger" onclick="showRemoveKeyframesModal()">剔除关键帧</button></div>
+        <p class="small muted">录制结束会自动筛选关键帧、生成 keyframe nodes、尝试语义标注并预构建 semantic chunk index。</p>
+      </div>
+      <div class="card wide"><h3>已有场景地图</h3><div id="sessions-list" class="list"></div></div>
+    </div>
+  </section>
+
+  <section id="agent">
+    <h2>Agent</h2>
+    <div class="grid">
+      <div class="card">
+        <h3>启动 Agent</h3>
+        <label>场景数据集 (关键帧)</label><select id="agent-session"></select>
+        <label>地图 base path</label><select id="agent-map"></select>
+        <label><input id="agent-cmd" type="checkbox" style="width:auto"> 速度使能 enable_cmd_vel</label>
+        <label>config_file <span class="muted">(高级，留空=默认)</span></label><input id="agent-config">
+        <div class="row"><button class="primary" onclick="startAgent()">启动 Agent</button><button class="danger" onclick="stopProcess('agent')">停止 Agent</button><a id="agent-link" target="_blank">打开 Agent UI</a></div>
+        <label>虚拟仿真延迟 s</label><input id="agent-sim-delay" value="8" type="number" min="1" max="60" step="1">
+        <div class="row" style="margin-top:10px"><button class="ok" onclick="startAgentSim()">启动虚拟仿真 Agent</button><button class="danger" onclick="stopProcess('agent_sim')">停止仿真</button><a id="agent-sim-link" target="_blank">打开仿真可视化</a><a id="agent-sim-lite-link" target="_blank">仿真 Lite</a></div>
+        <p class="small muted">虚拟仿真只模拟导航到达，不控制实机底盘；planner、resolver、检索、播报状态仍走真实 Agent。</p>
+      </div>
+      <div class="card">
+        <h3>SSH 隧道</h3>
+        <textarea id="ssh-tunnel" readonly></textarea>
+        <button onclick="copyText('ssh-tunnel')">复制</button>
+      </div>
+    </div>
+  </section>
+
+  <section id="tests">
+    <h2>测试工具</h2>
+    <div class="grid">
+      <div class="card third"><h3>雷达</h3><button class="primary" onclick="startProcess('lidar_test', globalPorts())">启动雷达测试</button><button class="danger" onclick="stopProcess('lidar_test')">停止</button></div>
+      <div class="card third"><h3>STM32</h3><button class="primary" onclick="startProcess('stm32_test', globalPorts())">启动 STM32 测试</button><button class="danger" onclick="stopProcess('stm32_test')">停止</button></div>
+      <div class="card third"><h3>摄像头</h3><button class="primary" onclick="startProcess('camera_test', globalPorts())">启动双目预览</button><button class="danger" onclick="stopProcess('camera_test')">停止</button></div>
+      <div class="card wide">
+        <h3>VLM 目标框选择</h3>
+        <div class="split">
+          <div>
+            <label>Session / selected</label><select id="vlm-session" onchange="refreshVlmImages()"></select>
+            <label>关键帧图片</label><select id="vlm-image"></select>
+            <div class="split"><div><label>DINO 检测词</label><input id="vlm-grounding-query" value="chair"></div><div><label>VLM 目标描述</label><input id="vlm-query" value="middle chair with a bag above"></div></div>
+            <label>输出目录</label><input id="vlm-out">
+          </div>
+          <div>
+            <div class="split"><div><label>Box Threshold</label><input id="vlm-box-threshold" value="0.25" type="number" step="0.01"></div><div><label>Text Threshold</label><input id="vlm-text-threshold" value="0.20" type="number" step="0.01"></div></div>
+            <div class="split"><div><label>Max Candidates</label><input id="vlm-max-candidates" value="8" type="number" min="1" max="20"></div><div><label>Grounding Device</label><select id="vlm-device"><option>GPU</option><option>CPU</option><option>AUTO</option></select></div></div>
+            <label>VLM Model</label><input id="vlm-model" value="qwen3-vl-plus">
+            <div class="row" style="margin-top:12px"><button class="primary" onclick="startVlmBoxSelect()">运行 VLM 选择</button><button class="danger" onclick="stopProcess('vlm_box_select')">停止</button><button onclick="refreshVlmImages()">刷新图片</button></div>
+          </div>
+        </div>
+        <p class="small muted">DINO 检测词建议用短类别词，如 chair；VLM 目标描述可以写空间和属性约束，如 middle chair with a bag above。</p>
+      </div>
+      <div class="card wide">
+        <h3>物体级 pipeline</h3>
+        <div class="split"><div><label>目标描述</label><input id="obj-target" value="chair"></div><div><label>SAM label query</label><input id="obj-label" value="chair"></div></div>
+        <div class="split"><div><label>真实距离 m</label><input id="obj-truth" placeholder="可空"></div><div><label>定位模式</label><select id="obj-mode"><option value="stereo">stereo</option><option value="stereo_primary_mono_guard">stereo_primary_mono_guard</option><option value="mono_relative_lidar">mono_relative_lidar</option><option value="mono_absolute">mono_absolute</option></select></div></div>
+        <label>输出目录</label><input id="obj-out">
+        <div class="row"><button class="primary" onclick="startObjectPipeline()">启动 live validation</button><button class="danger" onclick="stopProcess('object_pipeline')">停止</button><button onclick="refreshResults()">刷新结果</button></div>
+        <div class="row" style="margin-top:6px"><button onclick="updateLiveTarget()" style="background:#f0a030">更新检测目标</button><span style="font-size:12px;color:#888;margin-left:8px">修改上方目标描述后点击，live 窗口自动同步</span></div>
+      </div>
+      <div class="card wide">
+        <h3>物体靠近点测试</h3>
+        <div class="split">
+          <div>
+            <label>目标描述</label><input id="oa-target" value="box">
+            <label>地图 base path</label><select id="oa-map-base"></select>
+            <div class="split"><div><label>DINO query</label><input id="oa-grounding" placeholder="可空, 默认目标描述"></div><div><label>SAM query</label><input id="oa-sam" placeholder="可空"></div></div>
+            <label>VLM 选择描述</label><input id="oa-vlm" placeholder="可空, 可写空间/属性约束">
+            <div class="split"><div><label>深度后端</label><select id="oa-backend"><option value="stereo_primary_mono_guard">stereo_primary_mono_guard</option><option value="auto">auto</option><option value="stereo">stereo</option><option value="mono_relative_lidar">mono_relative_lidar</option></select></div><div><label>停止距离 m</label><input id="oa-stop" value="0.80" type="number" min="0.30" max="2.00" step="0.05"></div></div>
+            <div class="split"><div><label>输出目录</label><input id="oa-out"></div><div><label>超时 s</label><input id="oa-timeout" value="20.0" type="number" min="5" max="120" step="1"></div></div>
+          </div>
+          <div>
+            <div class="split"><div><label>left topic</label><input id="oa-left-topic" value="/stereo/left/image_raw"></div><div><label>right topic</label><input id="oa-right-topic" value="/stereo/right/image_raw"></div></div>
+            <div class="split"><div><label>scan topic</label><input id="oa-scan-topic" value="/scan"></div><div><label>map topic</label><input id="oa-map-topic" value="/global_costmap/costmap"></div></div>
+            <div class="split"><div><label>map frame</label><input id="oa-map-frame" value="map"></div><div><label>base frame</label><input id="oa-base-frame" value="base_link"></div></div>
+            <label>goal topic</label><input id="oa-goal-topic" value="/caragent/object_approach_goal">
+            <div class="row" style="margin-top:12px">
+              <button class="primary" onclick="startObjectApproachLive()">运行/刷新测试</button>
+              <button class="danger" onclick="stopProcess('object_approach_live')">停止</button>
+              <button onclick="refreshResults()">刷新结果</button>
+            </div>
+            <p class="small muted">会自动启动导航定位依赖，但速度默认不使能；只定位目标并生成靠近点，不发 Nav2。结果会写出 summary、approach_goal、approach_debug 地图标注图，并发布 PoseStamped 到 goal topic。</p>
+          </div>
+        </div>
+      </div>
+      <div class="card wide"><h3>最新结果</h3><div id="results-list" class="list"></div></div>
+    </div>
+  </section>
+
+  <section id="object_dataset">
+    <h2>Object Depth Dataset</h2>
+    <div class="grid">
+      <div class="card wide">
+        <h3>采集数据集</h3>
+        <div class="split">
+          <div>
+            <label>选择已有数据集</label><select id="od-dataset"></select>
+            <label>新建/当前数据集名称</label><input id="od-name" placeholder="object_depth_chair_door_01">
+            <div class="split"><div><label>检测 prompt</label><input id="od-target" value="chair"></div><div><label>SAM label</label><input id="od-label" value="chair"></div></div>
+            <div class="split"><div><label>标准距离 m</label><input id="od-truth" placeholder="2.00"></div><div><label>备注</label><input id="od-note" placeholder="chair 2m center"></div></div>
+            <div class="row" style="margin-top:12px">
+              <button class="primary" onclick="startObjectDepthCollect()">启动采集窗口</button>
+              <button onclick="updateObjectDepthConfig()">更新目标/距离</button>
+              <button class="danger" onclick="stopProcess('object_depth_collect')">停止采集</button>
+            </div>
+            <p class="small muted">采集窗口快捷键：v 跑 GroundingDINO + SAM 预览框和 mask，c 保存样本，q 退出。选择已有数据集后会继续追加样本。</p>
+          </div>
+          <div>
+            <h3>模型评估</h3>
+            <label>评估 run 名称</label><input id="od-run" value="baseline">
+            <label>评估模式</label><input id="od-modes" value="stereo,mono_relative_lidar">
+            <label><input id="od-force" type="checkbox" style="width:auto"> 强制重跑已缓存样本</label>
+            <div class="row" style="margin-top:12px">
+              <button class="ok" onclick="startObjectDepthEval()">启动评估</button>
+              <button class="danger" onclick="stopProcess('object_depth_eval')">停止评估</button>
+              <button onclick="refreshObjectDepthDatasets()">刷新数据集</button>
+            </div>
+            <p class="small muted">结果保存在 dataset/evaluations/run_name/summary.csv 和 summary.jsonl。默认按样本+模式+模型配置缓存，跑过的不重跑。</p>
+          </div>
+        </div>
+      </div>
+      <div class="card wide"><h3>已有 Object Depth 数据集</h3><div id="od-datasets-list" class="list"></div></div>
+    </div>
+  </section>
+
+  <section id="calib">
+    <h2>标定</h2>
+    <div class="grid">
+      <div class="card">
+        <h3>双目标定</h3>
+        <label>已有参数</label><input id="stereo-calib" readonly>
+        <label>采集输出目录</label><input id="stereo-capture-out">
+        <div class="split"><div><label>内角点列 cols</label><input id="stereo-cols" placeholder="9"></div><div><label>内角点行 rows</label><input id="stereo-rows" placeholder="6"></div><div><label>方格边长 m</label><input id="stereo-square" placeholder="0.025"></div></div>
+        <button class="primary" onclick="startStereoCalibCapture()">启动棋盘格采集</button>
+        <button class="ok" onclick="startStereoCalibRun()">运行双目标定</button>
+        <button class="danger" onclick="stopProcess('stereo_calib_capture')">停止</button>
+      </div>
+      <div class="card">
+        <h3>雷达-相机外参</h3>
+        <label>当前外参</label><input id="extrinsics-json" readonly>
+        <label>对应点 JSONL</label><input id="lidar-cam-jsonl">
+        <button class="primary" onclick="startProcess('lidar_camera_collect',{...globalPorts(),output_jsonl:$('lidar-cam-jsonl').value})">启动对应点采集</button>
+        <button class="ok" onclick="startLidarCameraCalibRun()">运行外参求解</button>
+        <button class="danger" onclick="stopProcess('lidar_camera_collect')">停止</button>
+      </div>
+    </div>
+  </section>
+
+  <section id="logs">
+    <h2>日志</h2>
+    <div class="row"><select id="log-filter"><option value="">全部</option></select><button onclick="refreshLogs()">刷新日志</button><button onclick="clearLogs()">清空显示</button><button onclick="copyLogs()">复制日志</button></div>
+    <div id="log" class="log" style="margin-top:12px"></div>
+  </section>
+</main>
+</div>
+
+<script>
+let statusCache = {};
+let rotationParamsLoaded = false;
+const $ = id => document.getElementById(id);
+const api = async (url, opts={}) => {
+  const r = await fetch(url, opts);
+  const text = await r.text();
+  let data = {};
+  try { data = text ? JSON.parse(text) : {}; } catch { data = {ok:false,error:text}; }
+  if (!r.ok) throw new Error(data.error || r.statusText);
+  return data;
+};
+function toast(msg){ console.log(msg); }
+function showTab(id){ document.querySelectorAll('main section').forEach(s=>s.classList.remove('active')); $(id).classList.add('active'); }
+function opt(sel, value, text){ const o=document.createElement('option'); o.value=value; o.textContent=text||value; sel.appendChild(o); }
+function fileLink(path, text){ return path ? `<a target="_blank" href="/api/file?path=${encodeURIComponent(path)}">${text||path.split('/').pop()}</a>` : ''; }
+function stamp(){ const d=new Date(); const p=n=>String(n).padStart(2,'0'); return `${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`; }
+function safeSessionName(value){ const cleaned=String(value||'').trim().replace(/[^A-Za-z0-9_.-]+/g,'_').replace(/^_+|_+$/g,''); return cleaned || `session_${stamp()}`; }
+function sceneBuildBody(dataset){
+  return {dataset, annotate:'auto', chunk_index:'auto', batch_size:parseInt($('anno-batch').value)||36};
+}
+function globalPorts(){ return { laser_port:$('global-laser').value, stm32_port:$('global-stm32').value, camera_device:$('global-camera').value, camera_resolution:$('global-camera-resolution').value }; }
+function degText(value){ return Number.isFinite(value) ? `${value.toFixed(1)}°` : '--'; }
+function numText(value, digits=2){ return Number.isFinite(value) ? value.toFixed(digits) : '--'; }
+async function loadPorts(){
+  const data = await api('/api/ports');
+  const serial = data.serial?.length ? data.serial : ['/dev/ttyUSB0','/dev/ttyUSB1'];
+  const cams = data.cameras?.length ? data.cameras : ['/dev/video0'];
+  for (const id of ['global-laser','global-stm32']) { const s=$(id); if(!s) continue; const old=s.value; s.innerHTML=''; serial.forEach(p=>opt(s,p)); if(serial.includes(old))s.value=old; }
+  { const s=$('global-camera'); if(s){ const old=s.value; s.innerHTML=''; cams.forEach(p=>opt(s,p)); if(cams.includes(old))s.value=old; } }
+}
+async function refreshStatus(){
+  statusCache = await api('/api/status');
+  $('workspace').textContent = statusCache.workspace || '';
+  $('ssh-tunnel').value = statusCache.ssh_tunnel || '';
+  $('agent-link').href = `http://${location.hostname}:${statusCache.agent_web_port || 8123}`;
+  $('agent-link').textContent = `http://${location.hostname}:${statusCache.agent_web_port || 8123}`;
+  $('agent-sim-link').href = `http://${location.hostname}:${statusCache.agent_sim_web_port || 8124}/sim`;
+  $('agent-sim-link').textContent = `http://${location.hostname}:${statusCache.agent_sim_web_port || 8124}/sim`;
+  $('agent-sim-lite-link').href = `http://${location.hostname}:${statusCache.agent_sim_web_port || 8124}/lite`;
+  $('agent-sim-lite-link').textContent = `http://${location.hostname}:${statusCache.agent_sim_web_port || 8124}/lite`;
+  $('agent-config').value ||= `${statusCache.workspace}/src/caragent_agent/config/config.yaml`;
+  $('obj-out').value ||= `${statusCache.workspace}/perception_outputs/scan_monodepth_validation`;
+  $('oa-out').value ||= `${statusCache.workspace}/perception_outputs/object_approach_live`;
+  $('vlm-out').value ||= `${statusCache.workspace}/perception_outputs/vlm_box_select`;
+  $('stereo-calib').value = statusCache.paths?.stereo_calib || '';
+  $('extrinsics-json').value = statusCache.paths?.extrinsics || '';
+  $('stereo-capture-out').value ||= `${statusCache.workspace}/calibration/stereo_new/capture_${new Date().toISOString().replace(/[-:T]/g,'').slice(0,15)}`;
+  $('lidar-cam-jsonl').value ||= `${statusCache.workspace}/calibration/lidar_camera/correspondences.jsonl`;
+  const procs = statusCache.processes || {};
+  const running = Object.values(procs).some(p=>p.running);
+  $('any-running').className = 'status-dot ' + (running?'on':'');
+  $('system-status').textContent = running ? 'process running' : 'idle';
+  const f=$('log-filter'); const old=f.value; f.innerHTML=''; opt(f,'','全部'); Object.keys(procs).forEach(k=>opt(f,k,k)); f.value=old;
+}
+async function refreshRotationTune(){
+  if(!$('rot-current-yaw')) return;
+  try{
+    const s = await api('/api/rotation_tune/status');
+    $('rot-current-yaw').textContent = degText(s.current_yaw_deg);
+    $('rot-target-yaw').textContent = degText(s.target_yaw_deg);
+    $('rot-error').textContent = degText(s.shortest_error_deg);
+    $('rot-ccw').textContent = degText(s.ccw_remaining_deg);
+    $('rot-omega').textContent = `${numText(s.current_omega,2)} rad/s (${s.direction || 'stop'})`;
+    $('rot-source').textContent = `${s.yaw_source || '--'}${Number.isFinite(s.yaw_age_sec)?`, ${s.yaw_age_sec.toFixed(2)}s`:''}`;
+    $('rot-status').textContent = `${s.status || '--'} ${s.message || ''}`.trim();
+    if(!rotationParamsLoaded && s.params){
+      const entries = [
+        ['rot-fast-omega','fast_omega'], ['rot-mid-omega','mid_omega'], ['rot-slow-omega','slow_omega'],
+        ['rot-fast-threshold','fast_threshold_deg'], ['rot-mid-threshold','mid_threshold_deg'],
+        ['rot-tolerance','yaw_tolerance_deg'], ['rot-right-shortcut','right_turn_shortcut_deg'],
+        ['rot-settle','settle_time_sec'], ['rot-timeout','timeout_sec'], ['rot-omega-cap','omega_cap'],
+      ];
+      for(const [id,key] of entries){
+        const el = $(id);
+        const value = s.params[key];
+        if(el && Number.isFinite(value)) el.value = String(value);
+      }
+      rotationParamsLoaded = true;
+    }
+    const saved = $('rot-save-status');
+    if(saved && s.config_saved) saved.textContent = `已加载默认参数：${s.config_path || ''}`;
+  }catch(e){
+    $('rot-status').textContent = '状态读取失败: '+e.message;
+  }
+}
+function rotationTuneBody(){
+  return {
+    fast_omega:parseFloat($('rot-fast-omega').value)||0,
+    mid_omega:parseFloat($('rot-mid-omega').value)||0,
+    slow_omega:parseFloat($('rot-slow-omega').value)||0,
+    fast_threshold_deg:parseFloat($('rot-fast-threshold').value)||20,
+    mid_threshold_deg:parseFloat($('rot-mid-threshold').value)||10,
+    yaw_tolerance_deg:parseFloat($('rot-tolerance').value)||4,
+    right_turn_shortcut_deg:parseFloat($('rot-right-shortcut').value)||90,
+    settle_time_sec:parseFloat($('rot-settle').value)||0,
+    timeout_sec:parseFloat($('rot-timeout').value)||20,
+    omega_cap:parseFloat($('rot-omega-cap').value)||3.5,
+  };
+}
+async function startRotationTuneAbsolute(){
+  const body = {...rotationTuneBody(), mode:'absolute', target_yaw_deg:parseFloat($('rot-target-deg').value)||0};
+  await api('/api/rotation_tune/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  await refreshRotationTune();
+}
+async function startRotationTuneRelative(){
+  const body = {...rotationTuneBody(), mode:'relative', relative_delta_deg:parseFloat($('rot-delta-deg').value)||0};
+  await api('/api/rotation_tune/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  await refreshRotationTune();
+}
+async function quickRotationDelta(deg){
+  $('rot-delta-deg').value = String(deg);
+  await startRotationTuneRelative();
+}
+async function stopRotationTune(){
+  await api('/api/rotation_tune/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+  await refreshRotationTune();
+}
+async function saveRotationTuneDefaults(){
+  const el = $('rot-save-status');
+  if(el) el.textContent = '保存中...';
+  try{
+    const s = await api('/api/rotation_tune/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(rotationTuneBody())});
+    rotationParamsLoaded = false;
+    if(el) el.textContent = `已保存：${s.config_path || ''}`;
+    await refreshRotationTune();
+  }catch(e){
+    if(el) el.textContent = '保存失败: '+e.message;
+  }
+}
+async function setRotationTargetFromCurrent(){
+  const s = await api('/api/rotation_tune/status');
+  if(Number.isFinite(s.current_yaw_deg)) $('rot-target-deg').value = s.current_yaw_deg.toFixed(1);
+}
+async function refreshMaps(){
+  const data = await api('/api/maps');
+  const maps = data.maps || [];
+  for (const id of ['slam-map','nav-map','kf-map','agent-map','oa-map-base']) { const s=$(id); if(!s) continue; const old=s.value; s.innerHTML=''; opt(s,'','-- 全新 --'); maps.forEach(m=>opt(s,m.base_path,m.name)); if(maps.some(m=>m.base_path===old))s.value=old; }
+  $('maps-list').innerHTML = maps.map(m=>`<div class="item"><b>${m.name}</b><div class="small muted mono">${m.base_path}</div><div>${(m.files||[]).map(p=>fileLink(p)).join(' ')}</div></div>`).join('') || '<div class="muted">暂无地图</div>';
+}
+async function refreshKeyframes(){
+  const data = await api('/api/keyframes'); const sessions=data.sessions||[];
+  const sel=$('scene-session'), asel=$('agent-session'), vsel=$('vlm-session'); const old=sel.value, aold=asel.value, vold=vsel?.value || '';
+  sel.innerHTML=''; asel.innerHTML=''; if(vsel) vsel.innerHTML='';
+  sessions.forEach(x=>{ opt(sel,x.selected_path||x.path,x.name); opt(asel,x.selected_path||x.path,x.name); if(vsel) opt(vsel,x.selected_path||x.path,x.name); });
+  if(sessions.some(x=>(x.selected_path||x.path)===old))sel.value=old;
+  if(sessions.some(x=>(x.selected_path||x.path)===aold))asel.value=aold;
+  if(vsel && sessions.some(x=>(x.selected_path||x.path)===vold))vsel.value=vold;
+  $('sessions-list').innerHTML=sessions.map(x=>`<div class="item"><b>${x.name}</b> <span class="small muted">${x.build_status||'recorded'}</span><div class="small muted mono">${x.path}</div><div>candidate=${x.candidate_frames} selected=${x.selected_frames} nodes=${x.keyframe_nodes} semantic=${x.semantic_nodes} chunks=${x.semantic_chunks||0}</div><div>${fileLink(x.review_html,'review')} ${fileLink(x.scene_html,'scene map')} ${fileLink(x.summary_json,'summary')} ${fileLink(x.manifest_json,'manifest')}</div></div>`).join('') || '<div class="muted">暂无 session</div>';
+}
+async function refreshVlmImages(){
+  const session = $('vlm-session')?.value || '';
+  const sel = $('vlm-image');
+  if(!sel) return;
+  const old = sel.value;
+  sel.innerHTML = '';
+  if(!session){ opt(sel,'','-- 无 session --'); return; }
+  const data = await api('/api/keyframe_images?dataset='+encodeURIComponent(session));
+  const images = data.images || [];
+  images.forEach(img => opt(sel, img.path, img.name));
+  if(images.some(img => img.path === old)) sel.value = old;
+  if(!images.length) opt(sel,'','-- 无图片 --');
+}
+async function refreshResults(){
+  const data=await api('/api/results'); const rows=data.results||[];
+  $('results-list').innerHTML=rows.map(r=>`<div class="item">${fileLink(r.path,r.name)} <span class="small muted">${r.kind}</span><div class="small muted mono">${r.path}</div></div>`).join('') || '<div class="muted">暂无结果</div>';
+}
+async function refreshObjectDepthDatasets(){
+  const data = await api('/api/object_depth_datasets');
+  const datasets = data.datasets || [];
+  const sel = $('od-dataset');
+  if(sel){
+    const old = sel.value;
+    sel.innerHTML = '';
+    opt(sel, '', '-- 新建 --');
+    datasets.forEach(d => opt(sel, d.name, `${d.name} (${d.sample_count})`));
+    if(datasets.some(d => d.name === old)) sel.value = old;
+    sel.onchange = () => {
+      if(sel.value) $('od-name').value = sel.value;
+    };
+  }
+  const list = $('od-datasets-list');
+  if(list){
+    list.innerHTML = datasets.map(d => {
+      const summaries = (d.summaries || []).map(p => fileLink(p, p.split('/').slice(-2).join('/'))).join(' ');
+      return `<div class="item"><b>${d.name}</b><div>samples=${d.sample_count} targets=${(d.targets||[]).join(', ') || 'n/a'}</div><div class="small muted mono">${d.path}</div><div>${summaries || '<span class="muted">no evaluation yet</span>'}</div></div>`;
+    }).join('') || '<div class="muted">暂无 object depth 数据集</div>';
+  }
+}
+async function refreshLogs(){
+  const p=$('log-filter').value; const data=await api('/api/logs'+(p?`?process=${encodeURIComponent(p)}`:''));
+  let lines = data.logs || [];
+  if(!p && data.process_logs){ for(const [name,ls] of Object.entries(data.process_logs)){ lines.push('', `--- ${name} ---`, ...ls); } }
+  renderLogs(lines);
+}
+async function startProcess(kind, body={}){ try{ await api('/api/process/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind,...body})}); await refreshAll(); showTab('logs'); $('log-filter').value=kind; refreshLogs(); }catch(e){ alert(e.message); } }
+async function stopProcess(kind){ await api('/api/process/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind})}); await refreshAll(); }
+async function stopAll(){ await api('/api/process/stop_all',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}); await refreshAll(); }
+async function clearLogs(){ await api('/api/logs/clear',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({process:$('log-filter').value})}); refreshLogs(); }
+async function saveMap(){ const rdiv=$('map-save-result'); rdiv.textContent='保存中...'; try{ const name=$('map-name').value; const r=await api('/api/map/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})}); rdiv.innerHTML=(r.files||[]).map(p=>fileLink(p)).join(' ') || r.error || 'done'; refreshMaps(); }catch(e){ rdiv.textContent='保存失败: '+e.message; } }
+async function setInitialPose(){ const mapBase=$('slam-map').value; if(!mapBase){ alert('请先选择增量地图'); return; } const x=parseFloat($('pose-x').value)||0; const y=parseFloat($('pose-y').value)||0; const yaw=parseFloat($('pose-yaw').value)||0; try{ const r=await api('/api/slam/initial_pose',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({map_base:mapBase,x,y,yaw})}); alert(r.ok?('初始位姿已设置: x='+x+' y='+y+' yaw='+yaw):('失败: '+(r.error||'unknown'))); }catch(e){ alert(e.message); } }
+async function clearChanges(){ try{ const r=await api('/api/slam/clear_changes',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}); alert(r.ok?('clear_changes OK: '+(r.output||'')):('失败: '+(r.error||'unknown'))); }catch(e){ alert(e.message); } }
+async function toggleAutoClear(){ const enable=$('auto-clear').checked; const r=await api('/api/slam/auto_clear',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enable})}); if(!r.ok){ alert(r.error); $('auto-clear').checked=false; } }
+function startSlam(){ startProcess('slam',{...globalPorts(), map_base:$('slam-map').value}); }
+function startNavigation(){ startProcess('navigation',{...globalPorts(), map_base:$('nav-map').value, enable_cmd_vel:$('nav-cmd').checked, enable_left_only_goal_proxy:$('nav-left-only').checked, max_linear_mps:$('nav-max-linear').value, pre_align_strategy:$('nav-pre-align-strategy').value, path_heading_lookahead_m:$('nav-path-lookahead').value}); }
+function startKeyframes(){ const session=safeSessionName($('kf-session').value); $('kf-session').value=session; startProcess('keyframe_record',{...globalPorts(), session_name:session, map_base:$('kf-map').value}); }
+async function stopKeyframes(){
+  const session=$('kf-session').value.trim();
+  const workspace=statusCache.workspace || '';
+  const dataset=(session && workspace) ? `${workspace}/keyframes/${session}` : '';
+  const body={kind:'keyframe_record', build_scene_memory:true, session_name:session, ...sceneBuildBody(dataset)};
+  await api('/api/process/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  await refreshAll();
+  showTab('logs'); $('log-filter').value='keyframe_build'; refreshLogs();
+}
+async function buildSceneMemory(){
+  const chosen=$('scene-session').value;
+  if(!chosen){ alert('请先选择 Session'); return; }
+  const dataset=chosen.endsWith('/selected') ? chosen.slice(0,-9) : chosen;
+  const body=sceneBuildBody(dataset);
+  body.adopt_existing = false;
+  await api('/api/keyframes/select',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  showTab('logs'); $('log-filter').value='keyframe_build'; refreshLogs();
+}
+async function selectKeyframes(){ await buildSceneMemory(); }
+async function visualizeScene(){ const r=await api('/api/keyframes/visualize',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dataset:$('scene-session').value})}); await refreshKeyframes(); if(r.path) window.open('/api/file?path='+encodeURIComponent(r.path),'_blank'); }
+async function annotateScene(force){ const body={dataset:$('scene-session').value,force,batch_size:parseInt($('anno-batch').value)||36}; await api('/api/keyframes/annotate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); showTab('logs'); $('log-filter').value='keyframe_annotate'; refreshLogs(); }
+let kfNodesCache=[],kfSelected= new Set(),kfModalMode='annotate';
+async function openKeyframeModal(mode){ const dataset=$('scene-session').value; if(!dataset){ alert('请先选择 Session'); return; } try{ const r=await api('/api/keyframes/nodes',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dataset})}); kfModalMode=mode;kfNodesCache=r.nodes||[];kfSelected=new Set(); renderKfList(); $('kf-modal-title').textContent=mode==='remove'?'选择要剔除的关键帧':'选择要重标的关键帧'; $('kf-modal-submit').textContent=mode==='remove'?'剔除所选':'标注所选'; $('kf-modal-submit').className=mode==='remove'?'danger':'ok'; $('reannotate-modal').classList.add('show'); }catch(e){ alert('加载关键帧失败: '+e.message); } }
+async function showReannotateModal(){ await openKeyframeModal('annotate'); }
+async function showRemoveKeyframesModal(){ await openKeyframeModal('remove'); }
+function closeModal(){ $('reannotate-modal').classList.remove('show'); }
+function renderKfList(){ const list=$('reannotate-list'); list.innerHTML=kfNodesCache.map(n=>`<label class="kf-item${kfSelected.has(n.kf_id)?' selected':''}" onclick="toggleKf(${n.kf_id},this)"><input type="checkbox" ${kfSelected.has(n.kf_id)?'checked':''} style="pointer-events:none"><span>kf_${n.kf_id}</span><span class="muted" style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${n.semantic||'(无标注)'}</span><span class="muted small">x=${n.x.toFixed(1)} y=${n.y.toFixed(1)}</span></label>`).join(''); }
+function toggleKf(id,el){ if(kfSelected.has(id)){ kfSelected.delete(id); el.classList.remove('selected'); }else{ kfSelected.add(id); el.classList.add('selected'); } }
+function toggleSelectAll(){ if(kfSelected.size===kfNodesCache.length){ kfSelected.clear(); }else{ kfNodesCache.forEach(n=>kfSelected.add(n.kf_id)); } renderKfList(); }
+async function submitKeyframeModal(){ if(kfSelected.size===0){ alert('请至少选择一个关键帧'); return; } const ids=Array.from(kfSelected).sort((a,b)=>a-b).join(','); if(kfModalMode==='remove' && !confirm(`确认从当前 selected 场景记忆中剔除这些关键帧？\n${ids}\n\n原始采集数据会保留，selected 索引和网页会刷新。`)) return; closeModal(); if(kfModalMode==='remove'){ const r=await api('/api/keyframes/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dataset:$('scene-session').value,ids})}); alert(`已剔除 ${r.removed||0} 个关键帧，当前 selected=${r.selected_frames||0}`); await refreshKeyframes(); }else{ const body={dataset:$('scene-session').value,ids,batch_size:parseInt($('anno-batch').value)||36}; await api('/api/keyframes/annotate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); showTab('logs'); $('log-filter').value='keyframe_annotate'; refreshLogs(); } }
+async function submitReannotate(){ await submitKeyframeModal(); }
+function startAgent(){ startProcess('agent',{...globalPorts(), dataset_dir:$('agent-session').value,config_file:$('agent-config').value,map_base:$('agent-map').value,enable_cmd_vel:$('agent-cmd').checked}); }
+function startAgentSim(){ startProcess('agent_sim',{dataset_dir:$('agent-session').value,config_file:$('agent-config').value,web_port:statusCache.agent_sim_web_port || 8124,delay_sec:parseFloat($('agent-sim-delay').value)||8}); }
+function startObjectPipeline(){ startProcess('object_pipeline',{...globalPorts(), target:$('obj-target').value,label_query:$('obj-label').value,truth_distance_m:$('obj-truth').value,localization_mode:$('obj-mode').value,output_dir:$('obj-out').value}); }
+function startObjectApproachLive(){
+  startProcess('object_approach_live',{
+    ...globalPorts(),
+    target:$('oa-target').value || 'box',
+    map_base:$('oa-map-base').value,
+    enable_cmd_vel:false,
+    enable_left_only_goal_proxy:true,
+    grounding_query:$('oa-grounding').value,
+    vlm_query:$('oa-vlm').value,
+    sam_query:$('oa-sam').value,
+    depth_backend:$('oa-backend').value || 'stereo_primary_mono_guard',
+    stop_distance_m:$('oa-stop').value || '0.80',
+    output_root:$('oa-out').value,
+    timeout_sec:$('oa-timeout').value || '20.0',
+    left_topic:$('oa-left-topic').value || '/stereo/left/image_raw',
+    right_topic:$('oa-right-topic').value || '/stereo/right/image_raw',
+    scan_topic:$('oa-scan-topic').value || '/scan',
+    map_topic:$('oa-map-topic').value || '/global_costmap/costmap',
+    goal_topic:$('oa-goal-topic').value || '/caragent/object_approach_goal',
+    map_frame:$('oa-map-frame').value || 'map',
+    base_frame:$('oa-base-frame').value || 'base_link',
+  });
+}
+function stereoCalibParams(){ return {cols:$('stereo-cols').value,rows:$('stereo-rows').value,square_size_m:$('stereo-square').value}; }
+function startStereoCalibCapture(){ startProcess('stereo_calib_capture',{...globalPorts(),output_dir:$('stereo-capture-out').value,...stereoCalibParams()}); }
+function startStereoCalibRun(){ const imageDir=$('stereo-capture-out').value.replace(/\/$/,''); if(!imageDir){ alert('请先填写采集输出目录'); return; } startProcess('stereo_calib_run',{image_dir:imageDir,output:imageDir+'/stereo_calibration.npz',...stereoCalibParams()}); }
+function startVlmBoxSelect(){
+  const image = $('vlm-image').value;
+  const query = $('vlm-query').value.trim();
+  const groundingQuery = $('vlm-grounding-query').value.trim() || query;
+  if(!image){ alert('请选择关键帧图片'); return; }
+  if(!query){ alert('请输入 VLM 目标描述'); return; }
+  startProcess('vlm_box_select',{
+    image,
+    query,
+    grounding_query: groundingQuery,
+    output_dir:$('vlm-out').value,
+    box_threshold:$('vlm-box-threshold').value || '0.25',
+    text_threshold:$('vlm-text-threshold').value || '0.20',
+    max_candidates:$('vlm-max-candidates').value || '8',
+    grounding_device:$('vlm-device').value || 'GPU',
+    vlm_model:$('vlm-model').value || 'qwen3-vl-plus',
+  });
+}
+async function updateLiveTarget(){ try{ let output_dir=$('obj-out').value; let truth=$('obj-truth').value.trim(); let body={output_dir,target:$('obj-target').value,label_query:$('obj-label').value}; if(truth) body.truth_distance_m=parseFloat(truth); await api('/api/live_config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); alert('已更新检测目标: '+body.target); }catch(e){ alert(e.message); } }
+function selectedObjectDatasetName(){
+  return ($('od-name').value || $('od-dataset').value || `object_depth_${new Date().toISOString().replace(/[-:T]/g,'').slice(0,15)}`).trim();
+}
+function objectDepthBody(){
+  const truth = $('od-truth').value.trim();
+  const body = {
+    ...globalPorts(),
+    dataset_name: selectedObjectDatasetName(),
+    target: $('od-target').value || 'chair',
+    label_query: $('od-label').value || $('od-target').value || 'chair',
+    note: $('od-note').value || '',
+  };
+  if(truth) body.truth_distance_m = parseFloat(truth);
+  return body;
+}
+async function updateObjectDepthConfig(){
+  try{
+    const body = objectDepthBody();
+    await api('/api/object_depth_dataset/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    await refreshObjectDepthDatasets();
+    alert('已更新采集配置: '+body.dataset_name);
+  }catch(e){ alert(e.message); }
+}
+async function startObjectDepthCollect(){
+  const body = objectDepthBody();
+  await api('/api/object_depth_dataset/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  await startProcess('object_depth_collect', body);
+}
+function startObjectDepthEval(){
+  const name = selectedObjectDatasetName();
+  startProcess('object_depth_eval',{
+    dataset_name: name,
+    dataset_dir: `${statusCache.workspace}/perception_datasets/object_depth/${name}`,
+    run_name: $('od-run').value || 'baseline',
+    modes: $('od-modes').value || 'stereo,mono_relative_lidar',
+    force: $('od-force').checked,
+  });
+}
+function startLidarCameraCalibRun(){
+  startProcess('lidar_camera_calib_run',{
+    ...globalPorts(),
+    samples_jsonl: $('lidar-cam-jsonl').value,
+    calib_file: $('stereo-calib').value,
+    output_json: $('extrinsics-json').value,
+  });
+}
+function copyText(id){ navigator.clipboard.writeText($(id).value || $(id).textContent || ''); }
+function copyLogs(){ navigator.clipboard.writeText($('log').textContent); }
+function escapeHtml(value){
+  return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+function splitLogLines(lines){
+  return (lines || []).flatMap(line => String(line ?? '').replace(/\r\n?/g, '\n').replace(/\\n/g, '\n').split('\n'));
+}
+function renderLogLine(raw){
+  const line = String(raw ?? '');
+  if(line === '') return '<span class="log-line empty"></span>';
+  if(/^--- .+ ---$/.test(line)) return `<span class="log-line section">${escapeHtml(line)}</span>`;
+  const ros = line.match(/^(\[[^\]]+\])\s+(?:\[(.*?)\]\s+)?\[(INFO|WARN|WARNING|ERROR|DEBUG|FATAL)\]\s+(\[[^\]]+\])\s+\[([^\]]+)\]:\s*(.*)$/);
+  if(ros){
+    const level = (ros[3] === 'WARNING' ? 'WARN' : ros[3]).toLowerCase();
+    const proc = ros[2] ? `<span class="log-proc">[${escapeHtml(ros[2])}]</span> ` : '';
+    return `<span class="log-line ${level}"><span class="log-time">${escapeHtml(ros[1])}</span> ${proc}<span class="log-level ${level}">[${escapeHtml(ros[3])}]</span> <span class="log-stamp">${escapeHtml(ros[4])}</span> <span class="log-node">[${escapeHtml(ros[5])}]</span>: <span class="log-msg">${escapeHtml(ros[6])}</span></span>`;
+  }
+  const plainLevel = line.match(/\b(INFO|WARN|WARNING|ERROR|DEBUG|FATAL)\b/i);
+  const level = plainLevel ? (plainLevel[1].toUpperCase() === 'WARNING' ? 'warn' : plainLevel[1].toLowerCase()) : 'info';
+  const html = escapeHtml(line)
+    .replace(/^(\[[^\]]+\])/, '<span class="log-time">$1</span>')
+    .replace(/\[(INFO|WARN|WARNING|ERROR|DEBUG|FATAL)\]/i, (_m,l)=>`<span class="log-level ${(l.toUpperCase()==='WARNING'?'warn':l.toLowerCase())}">[${l}]</span>`);
+  return `<span class="log-line ${level}">${html}</span>`;
+}
+function renderLogs(lines){
+  const normalized = splitLogLines(lines);
+  $('log').innerHTML = normalized.map(renderLogLine).join('');
+  $('log').scrollTop = $('log').scrollHeight;
+}
+async function refreshAll(){ await loadPorts(); await refreshStatus(); await refreshMaps(); await refreshKeyframes(); await refreshVlmImages(); await refreshResults(); await refreshObjectDepthDatasets(); await refreshLogs(); }
+refreshAll(); setInterval(()=>{refreshStatus(); refreshLogs(); loadPorts();},2500); setInterval(refreshRotationTune,300);
+</script>
+<div class="modal-overlay" id="reannotate-modal">
+<div class="modal-box">
+<div class="modal-header"><h2 id="kf-modal-title">选择要重标的关键帧</h2><span id="kf-select-all" onclick="toggleSelectAll()">全选/取消</span><button onclick="closeModal()" style="border:none;background:none;font-size:18px;cursor:pointer">&times;</button></div>
+<div class="modal-body" id="reannotate-list"></div>
+<div class="modal-footer"><button onclick="closeModal()">取消</button><button class="ok" id="kf-modal-submit" onclick="submitKeyframeModal()">标注所选</button></div>
+</div></div>
+</body>
+</html>
