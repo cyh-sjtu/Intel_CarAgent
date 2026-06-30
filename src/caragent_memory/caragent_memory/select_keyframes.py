@@ -70,6 +70,19 @@ def _is_manual(record: FrameRecord) -> bool:
     return bool(record.meta.get("manual", False))
 
 
+def _normalize_openvino_device(device: str | None, *, default: str = "AUTO") -> str:
+    normalized = str(device or default).strip()
+    if not normalized:
+        normalized = default
+    aliases = {
+        "auto": "AUTO",
+        "cpu": "CPU",
+        "gpu": "GPU",
+        "npu": "NPU",
+    }
+    return aliases.get(normalized.lower(), normalized)
+
+
 def _pose_for_node(record: FrameRecord) -> tuple[list[float], list[float]]:
     pose = record.pose
     return (
@@ -82,6 +95,57 @@ def _relative(path: Path, root: Path) -> str:
     return path.resolve().relative_to(root.resolve()).as_posix()
 
 
+def _load_existing_node_payloads(output_root: Path) -> dict[str, dict]:
+    """Load previous selected node payloads so incremental rebuilds keep semantics."""
+
+    node_dir = output_root / "constructed_memory" / "keyframe_nodes"
+    if not node_dir.exists():
+        return {}
+    payloads: dict[str, dict] = {}
+    for path in sorted(node_dir.glob("kf_*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        frame_id = str(data.get("source_frame_id") or data.get("name") or path.stem.replace("kf_", "")).strip()
+        if frame_id:
+            payloads[frame_id] = data
+        try:
+            kf_id = int(data.get("kf_id"))
+            payloads[f"{kf_id:06d}"] = data
+        except Exception:
+            pass
+    return payloads
+
+
+def _preserved_semantic_fields(existing_node: dict | None) -> dict:
+    if not isinstance(existing_node, dict):
+        return {"semantic": "", "semantic_clip_encoding": None}
+    semantic = str(existing_node.get("semantic") or "").strip()
+    semantic_clip_encoding = existing_node.get("semantic_clip_encoding")
+    return {
+        "semantic": semantic,
+        "semantic_clip_encoding": semantic_clip_encoding if semantic else None,
+    }
+
+
+def _existing_embeddings(existing_node: dict | None) -> FrameEmbeddings | None:
+    if not isinstance(existing_node, dict):
+        return None
+    try:
+        clip = np.asarray(existing_node.get("clip_encoding"), dtype=np.float32).reshape(-1)
+        dinov2 = np.asarray(existing_node.get("dinov2_encoding"), dtype=np.float32).reshape(-1)
+    except Exception:
+        return None
+    if clip.size == 0 or dinov2.size == 0:
+        return None
+    if not np.isfinite(clip).all() or not np.isfinite(dinov2).all():
+        return None
+    return FrameEmbeddings(clip=clip, dinov2=dinov2)
+
+
 def _copy_selected_record(
     *,
     record: FrameRecord,
@@ -92,6 +156,7 @@ def _copy_selected_record(
     max_similarity: Optional[float],
     nearest_distance_m: Optional[float],
     dedupe_backend: str,
+    existing_nodes: dict[str, dict] | None = None,
 ) -> dict:
     copied = copy_record_assets(record, output_root)
 
@@ -109,6 +174,7 @@ def _copy_selected_record(
     node_dir = output_root / "constructed_memory" / "keyframe_nodes"
     node_dir.mkdir(parents=True, exist_ok=True)
     position, orientation = _pose_for_node(record)
+    preserved = _preserved_semantic_fields((existing_nodes or {}).get(str(record.frame_id)))
     node_payload = {
         "kf_id": int(record.frame_id),
         "name": record.frame_id,
@@ -117,10 +183,10 @@ def _copy_selected_record(
         "orientation": orientation,
         "intrinsic": [],
         "timestamp": record.pose.get("timestamp"),
-        "semantic": "",
+        "semantic": preserved["semantic"],
         "clip_encoding": embeddings.clip.astype(float).tolist(),
         "dinov2_encoding": embeddings.dinov2.astype(float).tolist(),
-        "semantic_clip_encoding": None,
+        "semantic_clip_encoding": preserved["semantic_clip_encoding"],
         "visual_similarity_backend": dedupe_backend,
         "rgb_path": copied["left_path"],
         "raw_path": copied["raw_path"],
@@ -197,9 +263,12 @@ def select_keyframes(
     dinov2_backend = str(dinov2_backend).lower()
     if dinov2_backend not in {"openvino", "torch"}:
         raise ValueError("--dinov2-backend must be either 'openvino' or 'torch'")
-    resolved_clip_device = str(clip_device or device or "NPU")
+    resolved_clip_device = _normalize_openvino_device(clip_device or device or "NPU")
+    if dinov2_backend == "openvino":
+        dinov2_device = _normalize_openvino_device(dinov2_device, default="NPU")
 
     records = list(iter_frame_records(dataset))
+    existing_nodes = _load_existing_node_payloads(output)
     if output.exists():
         shutil.rmtree(output)
     output.mkdir(parents=True, exist_ok=True)
@@ -232,10 +301,12 @@ def select_keyframes(
             rejected.append(_reject_record(record, "quality", None, None))
             continue
 
-        embeddings = FrameEmbeddings(
-            clip=clip_encoder.encode_path(record.left_path),
-            dinov2=dinov2_encoder.encode_path(record.left_path),
-        )
+        embeddings = _existing_embeddings(existing_nodes.get(str(record.frame_id)))
+        if embeddings is None:
+            embeddings = FrameEmbeddings(
+                clip=clip_encoder.encode_path(record.left_path),
+                dinov2=dinov2_encoder.encode_path(record.left_path),
+            )
         dedupe_embedding = _dedupe_embedding(embeddings, dedupe_backend)
         nearest_distance = _nearest_distance(record, selected)
         if not selected:
@@ -248,6 +319,7 @@ def select_keyframes(
                 max_similarity=None,
                 nearest_distance_m=nearest_distance,
                 dedupe_backend=dedupe_backend,
+                existing_nodes=existing_nodes,
             )
             selected.append(_make_selected_record(record, embeddings, manifest))
             append_jsonl(output / "selected_manifest.jsonl", manifest)
@@ -264,6 +336,7 @@ def select_keyframes(
                 max_similarity=None,
                 nearest_distance_m=nearest_distance,
                 dedupe_backend=dedupe_backend,
+                existing_nodes=existing_nodes,
             )
             selected.append(_make_selected_record(record, embeddings, manifest))
             append_jsonl(output / "selected_manifest.jsonl", manifest)
@@ -309,6 +382,7 @@ def select_keyframes(
                 max_similarity=max_similarity,
                 nearest_distance_m=nearest_distance,
                 dedupe_backend=dedupe_backend,
+                existing_nodes=existing_nodes,
             )
             selected.append(_make_selected_record(record, embeddings, manifest))
             append_jsonl(output / "selected_manifest.jsonl", manifest)
@@ -395,7 +469,9 @@ def _write_review_html(output: Path, selected: list[SelectedRecord], rejected: l
         manifest = item.manifest
         # Use absolute path via /api/file so images work regardless of how the HTML is served
         left_abs = str((output / manifest["left_path"]).resolve())
+        node_abs = str((output / "constructed_memory" / "keyframe_nodes" / f"kf_{manifest['frame_id']}.json").resolve())
         img_src = html.escape(f"/api/file?path={left_abs}")
+        node_href = html.escape(f"/api/file?path={node_abs}")
         quality = "ok" if manifest["quality_ok"] else "manual-low-quality"
         sim = manifest["max_similarity"]
         sim_text = "" if sim is None else f" sim={sim:.3f}"
@@ -405,6 +481,7 @@ def _write_review_html(output: Path, selected: list[SelectedRecord], rejected: l
             f"<h2>#{html.escape(manifest['frame_id'])} {html.escape(manifest['selected_reason'])}</h2>"
             f"<p>x={manifest['x']:.2f} y={manifest['y']:.2f} yaw={math.degrees(manifest['yaw']):.1f} deg</p>"
             f"<p>{quality}{html.escape(sim_text)}</p>"
+            f"<p><a href='{node_href}' target='_blank'>查看关键帧 JSON</a></p>"
             "</article>"
         )
 

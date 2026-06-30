@@ -79,18 +79,83 @@ def _text_box(draw: ImageDraw.ImageDraw, xy: tuple[int, int], text: str, font: I
         return xy[0], xy[1], xy[0] + w, xy[1] + h
 
 
+def _box_area(box: list[int]) -> int:
+    return max(0, box[2] - box[0]) * max(0, box[3] - box[1])
+
+
+def _box_iou(a: list[int], b: list[int]) -> float:
+    ix1 = max(a[0], b[0])
+    iy1 = max(a[1], b[1])
+    ix2 = min(a[2], b[2])
+    iy2 = min(a[3], b[3])
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    if inter <= 0:
+        return 0.0
+    union = _box_area(a) + _box_area(b) - inter
+    return float(inter) / float(union) if union > 0 else 0.0
+
+
+def _rect_overlaps(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
+    return not (a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1])
+
+
+def _place_label_rect(
+    *,
+    image_size: tuple[int, int],
+    box: list[int],
+    label_size: tuple[int, int],
+    occupied: list[tuple[int, int, int, int]],
+) -> tuple[int, int, int, int]:
+    width, height = image_size
+    x1, y1, x2, y2 = box
+    label_w, label_h = label_size
+    pad = 4
+    candidates = [
+        (x1, y1 - label_h - pad),
+        (x1, y1 + pad),
+        (x1, y2 + pad),
+        (x2 - label_w, y1 - label_h - pad),
+        (x2 + pad, y1),
+        (x1 - label_w - pad, y1),
+    ]
+    for raw_x, raw_y in candidates:
+        lx = max(0, min(width - label_w, raw_x))
+        ly = max(0, min(height - label_h, raw_y))
+        rect = (lx, ly, lx + label_w, ly + label_h)
+        if not any(_rect_overlaps(rect, item) for item in occupied):
+            return rect
+    lx = max(0, min(width - label_w, x1))
+    ly = max(0, min(height - label_h, y1))
+    return (lx, ly, lx + label_w, ly + label_h)
+
+
 def prepare_candidates(
     detections: list[dict[str, Any]],
     *,
     image_size: tuple[int, int],
     max_candidates: int,
+    nms_iou_threshold: float | None = 0.85,
+    max_area_ratio: float | None = 0.70,
 ) -> list[dict[str, Any]]:
     width, height = image_size
     ranked = sorted(detections, key=lambda d: float(d.get("score", 0.0)), reverse=True)
     candidates: list[dict[str, Any]] = []
-    for idx, det in enumerate(ranked[:max_candidates], start=1):
+    kept: list[tuple[dict[str, Any], list[int]]] = []
+    for det in ranked:
         raw_box = det.get("box_int") or det.get("box") or [0, 0, 0, 0]
         box_int = _clamp_box(raw_box, width, height)
+        if _box_area(box_int) <= 0:
+            continue
+        if max_area_ratio is not None and _box_area(box_int) / float(max(1, width * height)) > max_area_ratio:
+            continue
+        if nms_iou_threshold is not None and any(
+            _box_iou(box_int, kept_box) >= nms_iou_threshold for _, kept_box in kept
+        ):
+            continue
+        kept.append((det, box_int))
+        if len(kept) >= max_candidates:
+            break
+    for idx, (det, box_int) in enumerate(kept, start=1):
         x1, y1, x2, y2 = box_int
         box_w = max(0, x2 - x1)
         box_h = max(0, y2 - y1)
@@ -112,22 +177,29 @@ def prepare_candidates(
 def draw_candidate_overlay(image_path: Path, candidates: list[dict[str, Any]], output_path: Path) -> None:
     image = Image.open(image_path).convert("RGB")
     draw = ImageDraw.Draw(image)
-    font = _load_font(16)
+    font = _load_font(14)
     small_font = _load_font(14)
+    occupied_labels: list[tuple[int, int, int, int]] = []
     if not candidates:
         draw.rectangle([10, 10, 230, 42], fill=(17, 24, 39), outline=(239, 68, 68), width=2)
         draw.text((18, 18), "No GroundingDINO candidates", fill=(255, 255, 255), font=small_font)
     for idx, candidate in enumerate(candidates):
         color = COLORS[idx % len(COLORS)]
         x1, y1, x2, y2 = candidate["box_int"]
-        label = f"#{candidate['id']} {candidate['label']} {candidate['score']:.2f}"
+        label = f"#{candidate['id']} {candidate['score']:.2f}"
         draw.rectangle([x1, y1, x2, y2], outline=color, width=4)
         left, top, right, bottom = _text_box(draw, (x1, y1), label, font)
-        text_w = right - left
-        text_h = bottom - top
-        bg_y1 = max(0, y1 - text_h - 8)
-        draw.rectangle([x1, bg_y1, min(image.width - 1, x1 + text_w + 10), bg_y1 + text_h + 8], fill=color)
-        draw.text((x1 + 5, bg_y1 + 4), label, fill=(0, 0, 0), font=font)
+        text_w = right - left + 10
+        text_h = bottom - top + 8
+        label_rect = _place_label_rect(
+            image_size=image.size,
+            box=[x1, y1, x2, y2],
+            label_size=(text_w, text_h),
+            occupied=occupied_labels,
+        )
+        occupied_labels.append(label_rect)
+        draw.rectangle(label_rect, fill=color)
+        draw.text((label_rect[0] + 5, label_rect[1] + 4), label, fill=(0, 0, 0), font=font)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     image.save(output_path)
 
@@ -411,7 +483,17 @@ def run_selection(args: argparse.Namespace) -> dict[str, Any]:
     grounding["vlm_candidates_path"] = str(candidates_png)
     grounding["candidate_crops_path"] = str(crops_png)
     grounding_json.write_text(json.dumps(grounding, indent=2, ensure_ascii=False), encoding="utf-8")
-    draw_candidate_overlay(image_path, prepare_candidates(grounding.get("detections", []), image_size=image.size, max_candidates=999), grounding_png)
+    draw_candidate_overlay(
+        image_path,
+        prepare_candidates(
+            grounding.get("detections", []),
+            image_size=image.size,
+            max_candidates=999,
+            nms_iou_threshold=None,
+            max_area_ratio=None,
+        ),
+        grounding_png,
+    )
     draw_candidate_overlay(image_path, candidates, candidates_png)
     make_crop_grid(image_path, candidates, crops_png)
 

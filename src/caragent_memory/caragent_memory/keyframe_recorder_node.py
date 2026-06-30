@@ -41,6 +41,33 @@ def _relative(path: Path, root: Path) -> str:
     return path.resolve().relative_to(root.resolve()).as_posix()
 
 
+def _read_json_object(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _max_existing_frame_id(root: Path) -> int:
+    manifest = root / "manifest.jsonl"
+    max_id = 0
+    if not manifest.exists():
+        return max_id
+    with manifest.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+                max_id = max(max_id, int(str(item.get("frame_id") or "0")))
+            except Exception:
+                continue
+    return max_id
+
+
 class KeyframeRecorderNode(Node):
     """Record side-by-side stereo candidate frames with pose and scan metadata."""
 
@@ -52,6 +79,7 @@ class KeyframeRecorderNode(Node):
         self.declare_parameter("odom_topic", "/odom")
         self.declare_parameter("map_frame", "map")
         self.declare_parameter("base_frame", "base_link")
+        self.declare_parameter("map_file_name", "")
         self.declare_parameter("session_name", "")
         self.declare_parameter("output_root", "~/caragent_ws/keyframes")
         self.declare_parameter("left_width", 1920)
@@ -59,13 +87,18 @@ class KeyframeRecorderNode(Node):
         self.declare_parameter("min_time_sec", 1.5)
         self.declare_parameter("min_distance_m", 0.65)
         self.declare_parameter("min_yaw_deg", 30.0)
+        self.declare_parameter("manual_only", False)
         self.declare_parameter("init_pose_delay_sec", 3.0)
+        self.declare_parameter("localization_ready_mode", "initialpose_or_stable_tf")
+        self.declare_parameter("localization_stable_sec", 2.5)
+        self.declare_parameter("localization_stable_max_delta_m", 0.08)
+        self.declare_parameter("localization_stable_max_yaw_deg", 5.0)
         self.declare_parameter("max_tf_age_sec", 0.5)
         self.declare_parameter("enforce_tf_age", False)
         self.declare_parameter("use_latest_tf_on_failure", True)
         self.declare_parameter("pose_jump_max_m", 1.5)
         self.declare_parameter("pose_jump_window_sec", 1.0)
-        self.declare_parameter("blur_min", 80.0)
+        self.declare_parameter("blur_min", 300.0)
         self.declare_parameter("brightness_min", 35.0)
         self.declare_parameter("brightness_max", 235.0)
         self.declare_parameter("contrast_min", 15.0)
@@ -76,13 +109,17 @@ class KeyframeRecorderNode(Node):
         output_root = Path(str(self.get_parameter("output_root").value)).expanduser()
         self.dataset_root = output_root / session_name
         ensure_candidate_dataset(self.dataset_root)
+        existing_session = _read_json_object(self.dataset_root / "session.json")
 
-        self.session = {
+        self.session = dict(existing_session) if existing_session else {
             "session_name": session_name,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "node": self.get_name(),
-            "parameters": self._parameter_snapshot(),
         }
+        self.session["session_name"] = session_name
+        self.session["node"] = self.get_name()
+        self.session["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        self.session["parameters"] = self._parameter_snapshot()
         write_json(self.dataset_root / "session.json", self.session)
 
         self.bridge = CvBridge()
@@ -93,12 +130,16 @@ class KeyframeRecorderNode(Node):
         self.latest_odom_msg: Optional[Odometry] = None
         self.pending_manual_capture = False
 
-        self.saved_count = 0
+        self.saved_count = _max_existing_frame_id(self.dataset_root)
         self.last_saved_wall_time: Optional[float] = None
         self.last_saved_pose: Optional[dict] = None
         self.last_pose_seen: Optional[dict] = None
         self.last_pose_seen_time: Optional[float] = None
         self._init_pose_time: Optional[float] = None
+        self._localization_reference_pose: Optional[dict] = None
+        self._localization_stable_since: Optional[float] = None
+        self._localization_ready = False
+        self._localization_ready_logged = False
 
         image_topic = str(self.get_parameter("image_topic").value)
         scan_topic = str(self.get_parameter("scan_topic").value)
@@ -112,6 +153,8 @@ class KeyframeRecorderNode(Node):
         self.get_logger().info(
             f"keyframe recorder ready: dataset={self.dataset_root} image_topic={image_topic}"
         )
+        if self.saved_count > 0:
+            self.get_logger().info(f"append mode: next keyframe id starts after {self.saved_count:06d}")
 
     def _parameter_snapshot(self) -> dict:
         names = [
@@ -120,13 +163,19 @@ class KeyframeRecorderNode(Node):
             "odom_topic",
             "map_frame",
             "base_frame",
+            "map_file_name",
             "output_root",
             "left_width",
             "right_width",
             "min_time_sec",
             "min_distance_m",
             "min_yaw_deg",
+            "manual_only",
             "init_pose_delay_sec",
+            "localization_ready_mode",
+            "localization_stable_sec",
+            "localization_stable_max_delta_m",
+            "localization_stable_max_yaw_deg",
             "max_tf_age_sec",
             "enforce_tf_age",
             "use_latest_tf_on_failure",
@@ -259,27 +308,92 @@ class KeyframeRecorderNode(Node):
             "window_sec": window,
         }
 
+    def _reset_localization_gate(self) -> None:
+        self._localization_reference_pose = None
+        self._localization_stable_since = None
+        self._localization_ready = False
+        self._localization_ready_logged = False
+        self.last_pose_seen = None
+        self.last_pose_seen_time = None
+        self.last_saved_pose = None
+        self.last_saved_wall_time = None
+
     def _handle_initialpose(self, msg: PoseWithCovarianceStamped) -> None:
         stamp_sec = _stamp_to_float(msg.header.stamp)
         if stamp_sec <= 0.0:
             stamp_sec = self.get_clock().now().nanoseconds * 1e-9
         self._init_pose_time = stamp_sec
+        self._reset_localization_gate()
         delay = float(self.get_parameter("init_pose_delay_sec").value)
         self.get_logger().info(
             f"initial pose received at t={stamp_sec:.1f}, "
-            f"keyframe recording enabled after {delay:.1f}s delay"
+            f"keyframe recording waits {delay:.1f}s and then requires stable localization"
         )
+
+    def _localization_gate_check(self, pose: dict, now_sec: float) -> dict:
+        mode = str(self.get_parameter("localization_ready_mode").value or "").strip().lower()
+        if mode in {"off", "false", "disabled", "none"}:
+            return {"ready": True, "reason": "disabled"}
+
+        delay = float(self.get_parameter("init_pose_delay_sec").value)
+        if self._init_pose_time is not None and now_sec - self._init_pose_time < delay:
+            return {
+                "ready": False,
+                "reason": "init_pose_delay",
+                "remaining_sec": max(0.0, delay - (now_sec - self._init_pose_time)),
+            }
+        if mode in {"require_initialpose", "initialpose"} and self._init_pose_time is None:
+            return {"ready": False, "reason": "no_initial_pose"}
+
+        if self._localization_ready:
+            return {"ready": True, "reason": "ready"}
+
+        stable_sec = float(self.get_parameter("localization_stable_sec").value)
+        max_delta = float(self.get_parameter("localization_stable_max_delta_m").value)
+        max_yaw = float(self.get_parameter("localization_stable_max_yaw_deg").value)
+        if self._localization_reference_pose is None or self._localization_stable_since is None:
+            self._localization_reference_pose = pose
+            self._localization_stable_since = now_sec
+            return {"ready": False, "reason": "stabilizing", "stable_for_sec": 0.0}
+
+        distance = planar_distance(pose, self._localization_reference_pose)
+        yaw_delta = yaw_difference_deg(pose["yaw"], self._localization_reference_pose["yaw"])
+        if distance > max_delta or yaw_delta > max_yaw:
+            self._localization_reference_pose = pose
+            self._localization_stable_since = now_sec
+            return {
+                "ready": False,
+                "reason": "localization_unstable",
+                "distance_m": float(distance),
+                "yaw_delta_deg": float(yaw_delta),
+                "stable_for_sec": 0.0,
+            }
+
+        stable_for = now_sec - self._localization_stable_since
+        if stable_for < stable_sec:
+            return {
+                "ready": False,
+                "reason": "stabilizing",
+                "stable_for_sec": float(stable_for),
+                "required_sec": stable_sec,
+            }
+
+        self._localization_ready = True
+        if not self._localization_ready_logged:
+            self.get_logger().info(
+                "localization stable; keyframe recording is enabled "
+                f"(stable_for={stable_for:.1f}s)"
+            )
+            self._localization_ready_logged = True
+        return {"ready": True, "reason": "stable", "stable_for_sec": float(stable_for)}
 
     def _should_save(self, pose: dict, now_sec: float, manual: bool, quality_ok: bool) -> tuple[bool, str]:
         if manual:
             return True, "manual"
+        if bool(self.get_parameter("manual_only").value):
+            return False, "manual_only"
         if not quality_ok:
             return False, "quality"
-        if self._init_pose_time is None:
-            return False, "no_initial_pose"
-        delay = float(self.get_parameter("init_pose_delay_sec").value)
-        if now_sec - self._init_pose_time < delay:
-            return False, "init_pose_delay"
         if self.last_saved_pose is None or self.last_saved_wall_time is None:
             return True, "first"
 
@@ -340,10 +454,16 @@ class KeyframeRecorderNode(Node):
 
         pose, tf_status = self._lookup_pose(msg.header.stamp)
         if pose is None:
-            if manual:
-                self.pending_manual_capture = False
             self.get_logger().warn(
                 f"skip keyframe: {tf_status.get('reason', 'tf_failed')}",
+                throttle_duration_sec=2.0,
+            )
+            return
+
+        localization_gate = self._localization_gate_check(pose, now_sec)
+        if not localization_gate["ready"]:
+            self.get_logger().warn(
+                "skip keyframe: localization not ready (%s)" % localization_gate.get("reason", "unknown"),
                 throttle_duration_sec=2.0,
             )
             return
@@ -395,6 +515,7 @@ class KeyframeRecorderNode(Node):
             quality=quality.to_dict(),
             tf_status=tf_status,
             pose_jump=pose_jump,
+            localization_gate=localization_gate,
             trigger_reason=reason,
             manual=manual,
         )
@@ -420,6 +541,7 @@ class KeyframeRecorderNode(Node):
         quality: dict,
         tf_status: dict,
         pose_jump: dict,
+        localization_gate: dict,
         trigger_reason: str,
         manual: bool,
     ) -> None:
@@ -460,6 +582,7 @@ class KeyframeRecorderNode(Node):
             "quality": quality,
             "tf_status": tf_status,
             "pose_jump": pose_jump,
+            "localization_gate": localization_gate,
             "scan_summary": scan_summary,
             "odom_covariance": self._odom_covariance(),
             "image": {

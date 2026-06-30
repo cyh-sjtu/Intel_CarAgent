@@ -301,6 +301,8 @@ class ApproachObjectInCurrentViewTool(ToolBase):
     ) -> dict[str, Any]:
         target = str(target_description or "").strip()
         target_source = str(kwargs.get("target_source") or "").strip().lower()
+        runtime_context = get_runtime_tool_context()
+        arrival_verification = bool(runtime_context.get("arrival_verification"))
         if not target:
             return self.blocked(
                 "Object approach needs a target description.",
@@ -336,7 +338,11 @@ class ApproachObjectInCurrentViewTool(ToolBase):
             )
             return tool_result
 
-        use_historical_preanalysis = self._use_historical_preanalysis_policy(target_source)
+        use_historical_preanalysis = (
+            False
+            if arrival_verification
+            else self._use_historical_preanalysis_policy(target_source)
+        )
         if use_historical_preanalysis:
             background_result = self._wait_for_background_object_preanalysis(
                 target,
@@ -355,12 +361,14 @@ class ApproachObjectInCurrentViewTool(ToolBase):
                     phase="background_preanalysis_unavailable",
                 )
 
-        duplicate_result = self._cached_attempt_if_same_call(
-            target,
-            task_cache_key,
-            attempt_record,
-            call_signature,
-        )
+        duplicate_result = None
+        if not arrival_verification:
+            duplicate_result = self._cached_attempt_if_same_call(
+                target,
+                task_cache_key,
+                attempt_record,
+                call_signature,
+            )
         if duplicate_result is not None:
             return duplicate_result
 
@@ -651,15 +659,21 @@ class ApproachObjectInCurrentViewTool(ToolBase):
         if not _task_is_historical_object_preanalysis_candidate(current_task):
             return False
         status = str(attempt_record.get("background_status") or "").strip().lower()
+        if status in {"timeout", "no_record", "failed", "completed_without_destination"}:
+            policy = self._budgeted_live_after_arrival_policy()
+            live_attempt_count = int(attempt_record.get("live_attempt_count") or 0)
+            max_attempts = int(policy.get("max_live_attempts_per_task") or 1)
+            if bool(policy.get("enabled")) and live_attempt_count < max_attempts:
+                return False
         return status not in {"not_applicable", ""}
 
     def _use_historical_preanalysis_policy(self, target_source: str) -> bool:
         """Gate costly live localization after staged historical object tasks.
 
-        The resolver may ask for arrived-scene live localization, but the object
-        pipeline is still heavy enough that failed historical preanalysis should
-        remain a default safety stop until an explicit, bounded live retry policy
-        is introduced.
+        Staged object tasks first wait for historical keyframe preanalysis.  When
+        that background job is unavailable, the bounded live-after-arrival policy
+        below decides whether the foreground may spend one live localization
+        attempt instead of turning the task into a false completion.
         """
 
         normalized = str(target_source or "").strip().lower()
@@ -667,12 +681,7 @@ class ApproachObjectInCurrentViewTool(ToolBase):
             return False
         agent_cfg = config.get("agent") if isinstance(config.get("agent"), dict) else {}
         if normalized in {"arrived_scene", "upstream_result"}:
-            return not bool(
-                agent_cfg.get(
-                    "object_approach_force_live_after_arrival_preanalysis_failure",
-                    False,
-                )
-            )
+            return True
         return True
 
     def _configured_depth_backend(self) -> str:
@@ -930,7 +939,7 @@ class ApproachObjectInCurrentViewTool(ToolBase):
                 or 1
             ),
             "auto_retry": False,
-            "runs_in_foreground": False,
+            "runs_in_foreground": enabled,
             "reason": (
                 "budgeted_live_after_arrival_disabled"
                 if not enabled

@@ -6,6 +6,7 @@ from typing import Any, Callable, Optional
 
 from ..execution.support import apply_turn_response
 from ..execution.support import normalize_turn_response_items
+from ..guidance import navigation_arrival_text, navigation_waiting_text, plan_finished_text
 from ..runtime.types import AsyncAgentState, TaskItem
 
 
@@ -33,6 +34,7 @@ def collect_navigation_route_facts(
         navigation_steps.append(
             {
                 "task_id": task_id,
+                "task": task,
                 "description": task.get("description"),
                 "destination_label": task_destination_label(task),
                 "navigation_state": navigation_state_for_task(task),
@@ -60,6 +62,7 @@ def collect_navigation_route_facts(
         "navigation_task_count": len(navigation_steps),
         "route_status": route_status,
         "current_destination": current_step.get("destination_label"),
+        "current_task": current_step.get("task"),
         "completed_destinations": [
             step["destination_label"]
             for step in navigation_steps
@@ -101,17 +104,16 @@ def fallback_navigation_user_facing_response(
         return ""
 
     route_status = route_facts.get("route_status")
-    step_count = int(route_facts.get("navigation_task_count", 0) or 0)
-
+    current_task = (
+        route_facts.get("current_task")
+        if isinstance(route_facts.get("current_task"), dict)
+        else None
+    )
     if route_status == "in_progress":
-        if step_count > 1:
-            return f"The tour is in progress. The robot is now on its way to {destination}."
-        return f"The robot is now on its way to {destination}."
+        return navigation_waiting_text(current_task or {"description": destination})
 
     if route_status == "completed":
-        if step_count > 1:
-            return f"My tour has been completed. I am now at {destination}."
-        return f"I have arrived at {destination}."
+        return navigation_arrival_text(current_task or {"description": destination})
 
     return ""
 
@@ -158,7 +160,7 @@ def finish_plan_without_user_response(
         return result_state
     return apply_turn_response(
         result_state,
-        response_text="The plan is complete.",
+        response_text=plan_finished_text(),
         response_type="progress",
         source_event_type="plan_finished",
     )

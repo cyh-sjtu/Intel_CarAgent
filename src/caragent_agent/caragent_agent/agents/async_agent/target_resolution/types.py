@@ -49,6 +49,8 @@ class TargetRef(TypedDict):
     source: TargetSource
     description: str
     query: NotRequired[str]
+    display_label: NotRequired[str]
+    user_query: NotRequired[str]
     inputs_from: NotRequired[Any]
     stop_distance_m: NotRequired[float]
     image_refs: NotRequired[Any]

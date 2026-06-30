@@ -40,6 +40,10 @@ from caragent_agent.agents.async_agent.execution.support import (
     navigation_waiting_summary,
     tool_content_indicates_error,
 )
+from caragent_agent.agents.async_agent.guidance import (
+    append_guidance,
+    navigation_waiting_text,
+)
 from caragent_agent.agents.async_agent.execution.runtime_tool_context import (
     runtime_tool_context,
 )
@@ -55,7 +59,11 @@ from caragent_agent.agents.async_agent.orchestration.node_common import (
     _record_run_memory_event,
     _strip_ignored_state_fields,
 )
-from caragent_agent.agents.async_agent.orchestration.runtime import new_structured_id, now_iso
+from caragent_agent.agents.async_agent.orchestration.runtime import (
+    build_pending_navigation_snapshot,
+    new_structured_id,
+    now_iso,
+)
 from caragent_agent.agents.async_agent.planning.prompting import AGENT_PROMPTS
 from caragent_agent.agents.async_agent.planning.task_graph import get_task_progress_context
 from caragent_agent.agents.async_agent.runtime.control import (
@@ -88,6 +96,17 @@ SEMANTIC_GROUNDING_TOOL_NAMES = {
     "approach_object_in_current_view",
     "preanalyze_object_on_keyframe",
 }
+
+
+def _navigation_guidance_dedupe_key(task: Optional[TaskItem], task_id: Optional[int]) -> str:
+    """Return a plan-scoped guidance key for navigation start events."""
+
+    plan_id = ""
+    if isinstance(task, dict):
+        plan_id = str(task.get("plan_id") or "").strip()
+    if not plan_id:
+        plan_id = "no-plan"
+    return f"navigation_start:{plan_id}:{task_id}"
 
 
 def _task_outputs_signal(current_task: Optional[TaskItem], signal_name: str) -> bool:
@@ -167,6 +186,56 @@ def _latest_tool_result_payload(tool_trace: dict[str, Any], tool_name: str) -> O
     return None
 
 
+def _destination_from_keyframe_search_trace(tool_trace: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Promote deterministic scene-memory search output into a reusable destination."""
+
+    payload = _latest_tool_result_payload(tool_trace, "search_requirement_on_keyframe_nodes")
+    if not isinstance(payload, dict):
+        return None
+    status = str(payload.get("status") or "").strip().lower()
+    if status and status not in {"ok", "success", "succeeded"}:
+        return None
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    resolution_status = str(data.get("resolution_status") or "").strip().lower()
+    if resolution_status and resolution_status != "resolved":
+        return None
+    keyframe_id = None
+    for key in ("recommended_keyframe_id", "keyframe_id", "target_keyframe_id"):
+        if data.get(key) is None:
+            continue
+        try:
+            keyframe_id = int(data.get(key))
+            break
+        except Exception:
+            continue
+    if keyframe_id is None:
+        destination = data.get("recommended_destination") or data.get("destination")
+        if isinstance(destination, dict):
+            for key in ("keyframe_id", "keyframe_node_id", "target_keyframe_id"):
+                if destination.get(key) is None:
+                    continue
+                try:
+                    keyframe_id = int(destination.get(key))
+                    break
+                except Exception:
+                    continue
+    if keyframe_id is None:
+        return None
+    result: dict[str, Any] = {"type": "keyframe", "keyframe_id": keyframe_id}
+    for source_key, dest_key in (
+        ("position", "position"),
+        ("recommended_position", "position"),
+        ("target_position", "position"),
+        ("display_label", "display_label"),
+        ("user_query", "user_query"),
+        ("requirement", "query"),
+    ):
+        value = data.get(source_key)
+        if value not in (None, "", [], {}):
+            result[dest_key] = value
+    return result
+
+
 def _record_session_anchors_from_tool_trace(
     *,
     shared_runtime_control: Optional[dict[str, Any]],
@@ -236,6 +305,14 @@ def _task_signal_from_trace(tool_trace: dict[str, Any], signal_name: str) -> Opt
     if isinstance(value, dict):
         return value
     return _compact_task_signal(tool_trace, signal_name)
+
+
+def _task_text_signal_from_trace(tool_trace: dict[str, Any], signal_name: str) -> str:
+    """Extract one submitted string task-output signal."""
+
+    submitted = _submitted_task_result_data(tool_trace)
+    value = submitted.get(signal_name)
+    return str(value or "").strip()
 
 
 def _compact_background_object_preanalysis(value: Any) -> dict[str, Any] | None:
@@ -801,6 +878,7 @@ def create_execute_node(
             "background_result": execute_inputs.get("background_result"),
             "selected_execution_context_packet": selected_packet_for_tools,
             "logger": logger,
+            "navigation_start_callback": execute_inputs.get("navigation_start_callback"),
         }
         with execute_tool_budget_context(), runtime_tool_context(tool_context):
             deterministic_outcome = _try_dispatch_structured_navigation_action(
@@ -1082,11 +1160,79 @@ def create_execute_node(
                 "plan_context": "Task plan context unavailable.",
             }
 
+        def navigation_start_callback(event: dict[str, Any]) -> None:
+            """Publish a UI guidance event as soon as a navigation tool dispatches."""
+
+            nonlocal state, tasks
+            if not isinstance(event, dict):
+                return
+            text = str(event.get("text") or "").strip()
+            if not text:
+                return
+            raw_task_id = event.get("task_id")
+            try:
+                callback_task_id = int(raw_task_id)
+            except Exception:
+                callback_task_id = current_task_id
+            state = append_guidance(
+                {**state, "tasks": tasks},
+                event_type="navigation_start",
+                text=text,
+                priority="normal",
+                interrupt=False,
+                dedupe_key=str(event.get("dedupe_key") or f"navigation_start:{callback_task_id}"),
+                task_id=callback_task_id,
+                payload={
+                    "tool_name": event.get("tool_name"),
+                    "nav_args": event.get("nav_args"),
+                    "dispatch_timing": "tool_dispatch_start",
+                },
+            )
+            tasks = state.get("tasks", tasks)
+            if callable(on_update):
+                try:
+                    on_update(
+                        {
+                            "node_name": "execute",
+                            "node_state": {
+                                "guidance_events": list(state.get("guidance_events") or []),
+                                "tasks": tasks,
+                            },
+                            "step_summary": {
+                                "node": "execute",
+                                "latest_event": {
+                                    "type": "navigation_start",
+                                    "task_id": callback_task_id,
+                                    "summary": text,
+                                },
+                            },
+                            "visited_nodes": ["execute"],
+                            "step_trace": [],
+                            "state": state,
+                        }
+                    )
+                except Exception:
+                    pass
+
+        execute_inputs["navigation_start_callback"] = navigation_start_callback
+
         task_ref = None
         if current_task_id is not None and current_task_id in tasks:
             task_ref = tasks[current_task_id]
             task_ref["status"] = "running"
             task_ref["updated_at"] = now_iso()
+            if is_navigation_action(task_ref):
+                state = append_guidance(
+                    {**state, "tasks": tasks},
+                    event_type="navigation_start",
+                    text=navigation_waiting_text(task_ref),
+                    priority="normal",
+                    interrupt=False,
+                    dedupe_key=_navigation_guidance_dedupe_key(task_ref, current_task_id),
+                    task_id=int(current_task_id),
+                )
+                tasks = state.get("tasks", tasks)
+                task_ref = tasks[current_task_id]
 
         execute_run = run_execute_agent(execute_inputs)
         classified_result = classify_execute_result(execute_inputs, execute_run)
@@ -1107,6 +1253,12 @@ def create_execute_node(
 
         raw_output = json.dumps(tool_trace, ensure_ascii=False)
         task_destination = _task_signal_from_trace(tool_trace, "destination")
+        if task_destination is None and _has_submitted_task_result(tool_trace):
+            task_destination = _destination_from_keyframe_search_trace(tool_trace)
+        task_destination_description = _task_text_signal_from_trace(
+            tool_trace,
+            "destination_description",
+        )
         task_selected_object = _task_signal_from_trace(tool_trace, "selected_object")
         task_visual_observation = _task_signal_from_trace(tool_trace, "visual_observation")
         task_current_place_context = _task_signal_from_trace(tool_trace, "current_place_context")
@@ -1137,6 +1289,7 @@ def create_execute_node(
                 raw_output=raw_output,
                 tool_name=primary_tool_name,
                 destination=task_destination,
+                destination_description=task_destination_description,
                 selected_object=task_selected_object,
                 visual_observation=task_visual_observation,
                 current_place_context=task_current_place_context,
@@ -1196,9 +1349,9 @@ def create_execute_node(
                 "tool_name": primary_tool_name,
             },
         }
-        if user_facing_response:
+        if user_facing_response and event_type != "task_waiting":
             execution_event["payload"]["user_facing_response"] = user_facing_response
-        if turn_response_type:
+        if turn_response_type and event_type != "task_waiting":
             execution_event["payload"]["turn_response_type"] = turn_response_type
         if task_ref and task_ref.get("user_input_id"):
             execution_event["user_input_id"] = task_ref["user_input_id"]
@@ -1208,6 +1361,18 @@ def create_execute_node(
             stage="execute",
         )
 
+        active_navigation_snapshot = None
+        if (
+            task_ref is not None
+            and event_type == "task_waiting"
+            and str(primary_tool_name or "") in {"go_to_keyframe", "go_to_position"}
+        ):
+            active_navigation_snapshot = build_pending_navigation_snapshot(
+                task_ref,
+                task_id=int(current_task_id),
+                created_at=str(execution_event.get("created_at") or ""),
+            )
+
         result_state: AsyncAgentState = {
             **state,
             "tasks": tasks,
@@ -1215,6 +1380,11 @@ def create_execute_node(
             "next_action": {"type": "idle"},
             "messages": state["messages"] + agent_messages,
         }
+        if active_navigation_snapshot is not None:
+            result_state["active_navigation"] = active_navigation_snapshot
+            result_state["pending_navigation"] = active_navigation_snapshot
+        if event_type == "task_waiting":
+            return result_state
         return apply_user_facing_response(
             result_state,
             user_facing_response,

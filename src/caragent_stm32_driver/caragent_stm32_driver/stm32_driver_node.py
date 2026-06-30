@@ -61,7 +61,7 @@ class Stm32DriverNode(Node):
         self.declare_parameter("cmd_send_rate_hz", 20.0)
         self.declare_parameter("cmd_timeout_sec", 0.3)
         self.declare_parameter("max_linear_mps", 0.12)
-        self.declare_parameter("max_angular_radps", 0.8)
+        self.declare_parameter("max_angular_radps", 3.5)
         self.declare_parameter("log_cmd_serial", False)
         self.declare_parameter("log_pc_debug", False)
 

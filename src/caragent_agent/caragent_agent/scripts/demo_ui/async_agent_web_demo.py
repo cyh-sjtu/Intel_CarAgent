@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import errno
 import json
 import mimetypes
 import re
@@ -46,6 +47,28 @@ from caragent_agent.io_adapters import (
     prepare_user_message_for_agent,
 )
 
+
+CLIENT_DISCONNECT_ERRNOS = {
+    errno.EPIPE,
+    errno.ECONNRESET,
+    getattr(errno, "ECONNABORTED", 103),
+    10053,
+    10054,
+}
+
+
+def _is_client_disconnect_error(exc: BaseException) -> bool:
+    """Return True for normal browser disconnects during HTTP writes."""
+
+    if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+        return True
+    raw_errno = getattr(exc, "errno", None)
+    try:
+        return int(raw_errno) in CLIENT_DISCONNECT_ERRNOS
+    except Exception:
+        return False
+from caragent_agent.agents.async_agent.guidance import get_interaction_profile
+
 DEFAULT_DATASET_DIR = get_default_scene_dataset_dir()
 LOG_ENTRY_START_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\]")
 CHECKPOINT_SCHEMA_VERSION = 1
@@ -61,6 +84,7 @@ CHECKPOINT_STATE_KEYS = (
     "active_navigation",
     "pending_navigation",
     "navigation_arrival_receipts",
+    "guidance_events",
     "turn_response_items",
     "turn_response_type",
     "turn_response_text",
@@ -214,6 +238,7 @@ def _clear_resumed_runtime_state(state: dict[str, Any]) -> dict[str, Any]:
         "active_navigation": {},
         "pending_navigation": {},
         "navigation_arrival_receipts": [],
+        "guidance_events": [],
         "next_action": {"type": "idle"},
         "turn_response_items": [],
         "turn_response_type": "none",
@@ -285,6 +310,7 @@ def _run_memory_state_for_checkpoint(data: dict[str, Any], thread_id: str) -> di
         "active_navigation": {},
         "pending_navigation": {},
         "navigation_arrival_receipts": [],
+        "guidance_events": state_excerpt.get("guidance_events") or [],
         "next_action": state_excerpt.get("next_action") or {"type": "idle"},
         "turn_response_items": state_excerpt.get("turn_response_items") or [],
         "turn_response_type": state_excerpt.get("turn_response_type") or "none",
@@ -555,6 +581,53 @@ APP_HTML = """<!doctype html>
       font-size: 18px;
       font-weight: 700;
       word-break: break-word;
+    }
+
+    .guide-panel {
+      margin: 14px 18px 0;
+      padding: 14px;
+      border-radius: 14px;
+      background: linear-gradient(135deg, rgba(242,250,246,0.96), rgba(255,255,255,0.86));
+      border: 1px solid rgba(47, 125, 77, 0.18);
+      display: grid;
+      gap: 12px;
+    }
+
+    .guide-panel-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+    }
+
+    .guide-title {
+      font-weight: 700;
+      color: var(--ok);
+    }
+
+    .guide-status {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .guide-latest {
+      min-height: 42px;
+      padding: 12px;
+      border-radius: 10px;
+      background: rgba(255,255,255,0.82);
+      border: 1px solid rgba(47, 125, 77, 0.12);
+      font-size: 15px;
+      line-height: 1.45;
+    }
+
+    .guide-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .guide-actions .btn {
+      min-height: 40px;
     }
 
     .history {
@@ -1399,6 +1472,8 @@ APP_HTML = """<!doctype html>
       .hero { padding: 18px; }
       .summary-grid { grid-template-columns: repeat(2, minmax(120px, 1fr)); }
       .composer-top { grid-template-columns: 1fr 1fr; }
+      .guide-panel-head { align-items: flex-start; flex-direction: column; }
+      .guide-actions { display: grid; grid-template-columns: 1fr; }
       .session-choice { align-items: stretch; flex-direction: column; }
       .session-choice-actions { justify-content: stretch; }
       .session-choice-actions .btn { flex: 1; }
@@ -1409,13 +1484,13 @@ APP_HTML = """<!doctype html>
   <div class="shell">
     <section class="hero">
       <div>
-        <h1>CarAgent Plan Console</h1>
-        <p>Send messages on the left and watch the live plan, task progress, and colored console logs on the right.</p>
+        <h1>CarAgent 导引控制台</h1>
+        <p>在左侧发送指令，右侧查看实时计划、任务进度和运行日志。</p>
       </div>
       <div class="meta-chip-row">
-        <div class="meta-chip">Thread: <span id="thread-id">-</span></div>
-        <div class="meta-chip">Updated: <span id="updated-at">-</span></div>
-        <div class="meta-chip">Memory: <span id="checkpoint-status">-</span></div>
+        <div class="meta-chip">会话: <span id="thread-id">-</span></div>
+        <div class="meta-chip">更新: <span id="updated-at">-</span></div>
+        <div class="meta-chip">记忆: <span id="checkpoint-status">-</span></div>
       </div>
     </section>
 
@@ -1424,25 +1499,39 @@ APP_HTML = """<!doctype html>
         <div>
           <div class="panel-head">
             <div>
-              <h2>Session</h2>
-              <div class="sub">User input, controller updates, and agent replies appear here.</div>
+              <h2>对话</h2>
+              <div class="sub">用户指令、控制器事件和 Agent 回复会显示在这里。</div>
             </div>
           </div>
           <div class="summary-grid">
-            <div class="summary-card"><div class="k">Current Plan</div><div class="v" id="summary-plan">-</div></div>
-            <div class="summary-card"><div class="k">Current Task</div><div class="v" id="summary-task">-</div></div>
-            <div class="summary-card"><div class="k">Next Action</div><div class="v" id="summary-next-action">idle</div></div>
-            <div class="summary-card"><div class="k">Visible Tasks</div><div class="v" id="summary-task-count">0</div></div>
+            <div class="summary-card"><div class="k">当前计划</div><div class="v" id="summary-plan">-</div></div>
+            <div class="summary-card"><div class="k">当前任务</div><div class="v" id="summary-task">-</div></div>
+            <div class="summary-card"><div class="k">下一动作</div><div class="v" id="summary-next-action">idle</div></div>
+            <div class="summary-card"><div class="k">任务数量</div><div class="v" id="summary-task-count">0</div></div>
+          </div>
+          <div class="guide-panel" aria-live="polite">
+            <div class="guide-panel-head">
+              <div>
+                <div class="guide-title">语音播报</div>
+                <div class="guide-status" id="guide-status">语音会按配置自动启用，也可以手动静音。</div>
+              </div>
+              <div class="guide-actions">
+                <button class="btn btn-primary" type="button" id="guide-enable-btn">启用语音</button>
+                <button class="btn btn-secondary" type="button" id="guide-mute-btn">静音</button>
+                <button class="btn btn-secondary" type="button" id="guide-replay-btn">重播</button>
+              </div>
+            </div>
+            <div class="guide-latest" id="guide-latest">暂无播报内容。</div>
           </div>
           <div class="session-choice" id="session-choice">
             <div class="session-choice-main">
-              <strong>Saved session found</strong>
-              <span id="session-choice-detail">Choose how to open this console.</span>
+              <strong>发现已保存会话</strong>
+              <span id="session-choice-detail">请选择继续旧会话还是开启新会话。</span>
               <select class="session-resume-select" id="session-resume-select"></select>
             </div>
             <div class="session-choice-actions">
-              <button class="btn btn-primary" type="button" id="resume-session-btn">Resume</button>
-              <button class="btn btn-secondary" type="button" id="new-session-btn">New session</button>
+              <button class="btn btn-primary" type="button" id="resume-session-btn">继续会话</button>
+              <button class="btn btn-secondary" type="button" id="new-session-btn">新会话</button>
             </div>
           </div>
         </div>
@@ -1452,31 +1541,31 @@ APP_HTML = """<!doctype html>
 
         <form class="composer" id="composer">
           <div class="composer-top">
-            <div class="meta-chip">Send user message</div>
-            <button class="btn btn-secondary" type="button" id="clear-btn">Clear</button>
-            <button class="btn btn-secondary" type="button" id="refresh-btn">Refresh</button>
-            <button class="btn btn-primary" type="submit" id="send-btn">Send</button>
+            <div class="meta-chip">发送用户指令</div>
+            <button class="btn btn-secondary" type="button" id="clear-btn">清空</button>
+            <button class="btn btn-secondary" type="button" id="refresh-btn">刷新</button>
+            <button class="btn btn-primary" type="submit" id="send-btn">发送</button>
           </div>
           <div class="composer-note ready" id="composer-note">
-            <strong>Ready for input</strong>
-            <span>Send a new instruction. Controller arrivals are handled automatically by the watchdog.</span>
+            <strong>可以输入</strong>
+            <span>发送新的指令即可，控制器到达事件会自动处理。</span>
           </div>
           <div class="io-toolbar">
-            <label>Input
+            <label>输入
               <select id="input-language">
                 <option value="zh">中文</option>
                 <option value="en">English</option>
               </select>
             </label>
-            <label>Reply
+            <label>回复
               <select id="output-language">
                 <option value="zh">中文</option>
                 <option value="en">English</option>
               </select>
             </label>
-            <button class="btn btn-secondary" type="button" id="capture-btn">Capture</button>
+            <button class="btn btn-secondary" type="button" id="capture-btn">拍照</button>
             <input type="file" id="image-upload" accept="image/*">
-            <button class="btn btn-secondary" type="button" id="describe-image-btn">Describe Image</button>
+            <button class="btn btn-secondary" type="button" id="describe-image-btn">描述图片</button>
           </div>
           <div class="image-preview" id="image-preview">
             <img id="image-preview-img" alt="Selected or captured frame">
@@ -1486,8 +1575,8 @@ APP_HTML = """<!doctype html>
             </div>
             <div class="image-preview-actions">
               <button class="mini-btn icon-btn" type="button" id="clear-image-btn" title="Clear image preview">×</button>
-              <button class="mini-btn" type="button" id="attach-image-btn" disabled>Attach</button>
-              <button class="mini-btn" type="button" id="download-image-btn" disabled>Download</button>
+              <button class="mini-btn" type="button" id="attach-image-btn" disabled>附加</button>
+              <button class="mini-btn" type="button" id="download-image-btn" disabled>下载</button>
             </div>
           </div>
           <div class="agent-capture-preview" id="agent-capture-preview">
@@ -1497,11 +1586,11 @@ APP_HTML = """<!doctype html>
               <div class="image-preview-text" id="agent-capture-text"></div>
             </div>
             <div class="image-preview-actions">
-              <button class="mini-btn" type="button" id="use-agent-capture-btn" disabled>Use as input</button>
-              <button class="mini-btn" type="button" id="download-agent-capture-btn" disabled>Download</button>
+              <button class="mini-btn" type="button" id="use-agent-capture-btn" disabled>作为输入</button>
+              <button class="mini-btn" type="button" id="download-agent-capture-btn" disabled>下载</button>
             </div>
           </div>
-          <textarea id="message-input" placeholder="Enter a user instruction. Controller arrivals are handled automatically."></textarea>
+          <textarea id="message-input" placeholder="输入用户指令。控制器到达事件会自动处理。"></textarea>
         </form>
       </section>
 
@@ -1509,17 +1598,17 @@ APP_HTML = """<!doctype html>
         <div class="panel">
           <div class="panel-head">
             <div>
-              <h2>Plan Snapshot</h2>
-              <div class="sub">Current plan, active task, wait states, and post-edit task ordering.</div>
+              <h2>计划快照</h2>
+              <div class="sub">当前计划、活动任务、等待状态和任务顺序。</div>
             </div>
           </div>
           <div class="status-strip" id="status-strip"></div>
           <div class="plan-toolbar">
             <div class="view-toggle" aria-label="Plan view mode">
-              <button class="active" type="button" id="plan-view-list">List</button>
-              <button type="button" id="plan-view-graph">Graph</button>
+              <button class="active" type="button" id="plan-view-list">列表</button>
+              <button type="button" id="plan-view-graph">图</button>
             </div>
-            <div class="plan-toolbar-note">Graph mode uses the read-only PlanGraph adapter.</div>
+            <div class="plan-toolbar-note">图模式只用于查看任务依赖。</div>
           </div>
           <div class="tasks" id="tasks"></div>
           <div class="plan-graph" id="plan-graph"></div>
@@ -1528,15 +1617,15 @@ APP_HTML = """<!doctype html>
         <div class="panel">
           <div class="panel-head">
             <div>
-              <h2>Live Console</h2>
-              <div class="sub">Merged workflow, tool, and controller logs with color coding for easier demos.</div>
+              <h2>实时日志</h2>
+              <div class="sub">汇总工作流、工具和控制器日志。</div>
             </div>
           </div>
           <div class="console-toolbar">
-            <div>Auto-follow only stays on while the console is near the bottom.</div>
+            <div>滚动条靠近底部时会自动跟随最新日志。</div>
             <div class="console-actions">
-              <span class="console-indicator" id="console-follow-indicator">Following latest</span>
-              <button class="mini-btn" type="button" id="console-jump-btn">Jump to latest</button>
+              <span class="console-indicator" id="console-follow-indicator">跟随最新</span>
+              <button class="mini-btn" type="button" id="console-jump-btn">跳到最新</button>
             </div>
           </div>
           <div class="logs" id="logs"></div>
@@ -1584,6 +1673,11 @@ APP_HTML = """<!doctype html>
     const agentCaptureTextEl = document.getElementById("agent-capture-text");
     const useAgentCaptureBtnEl = document.getElementById("use-agent-capture-btn");
     const downloadAgentCaptureBtnEl = document.getElementById("download-agent-capture-btn");
+    const guideStatusEl = document.getElementById("guide-status");
+    const guideLatestEl = document.getElementById("guide-latest");
+    const guideEnableBtnEl = document.getElementById("guide-enable-btn");
+    const guideMuteBtnEl = document.getElementById("guide-mute-btn");
+    const guideReplayBtnEl = document.getElementById("guide-replay-btn");
     let refreshTimer = null;
     let refreshInFlight = false;
     let logAutoFollow = true;
@@ -1597,6 +1691,15 @@ APP_HTML = """<!doctype html>
     let latestAgentCapture = null;
     let languageInitialized = false;
     let sessionChoiceRequired = false;
+    let guideVoiceEnabled = false;
+    let guideMuted = false;
+    let guideLastEvent = null;
+    let guideLastSpokenText = "";
+    let guideInitializedFromProfile = false;
+    let guidanceHistoryInitialized = false;
+    let responseSpeechHistoryInitialized = false;
+    const spokenGuidanceIds = new Set();
+    const spokenResponseIds = new Set();
 
     function escapeHtml(text) {
       const normalized = text === null || text === undefined ? "" : String(text);
@@ -1624,7 +1727,7 @@ APP_HTML = """<!doctype html>
     }
 
     function updateConsoleFollowIndicator() {
-      consoleFollowIndicatorEl.textContent = logAutoFollow ? "Following latest" : "Scroll locked";
+      consoleFollowIndicatorEl.textContent = logAutoFollow ? "跟随最新" : "滚动锁定";
     }
 
     function scheduleRefresh(delayMs) {
@@ -1646,6 +1749,159 @@ APP_HTML = """<!doctype html>
         throw new Error(data.error || "Request failed");
       }
       return data;
+    }
+
+    function speechSupported() {
+      return "speechSynthesis" in window && "SpeechSynthesisUtterance" in window;
+    }
+
+    function updateGuideControls() {
+      if (!speechSupported()) {
+        guideStatusEl.textContent = "当前浏览器不支持语音合成，回复仍会以文字显示。";
+        guideEnableBtnEl.disabled = true;
+        guideMuteBtnEl.disabled = true;
+        guideReplayBtnEl.disabled = !guideLastEvent;
+        return;
+      }
+      if (!guideVoiceEnabled) {
+        guideStatusEl.textContent = "语音当前关闭。需要播报时请点击启用语音。";
+      } else if (guideMuted) {
+        guideStatusEl.textContent = "语音已静音，回复仍会以文字显示。";
+      } else {
+        guideStatusEl.textContent = "语音已启用。Agent 回复和关键导引信息会播报。";
+      }
+      guideEnableBtnEl.textContent = guideVoiceEnabled ? "测试语音" : "启用语音";
+      guideEnableBtnEl.disabled = false;
+      guideMuteBtnEl.textContent = guideMuted ? "取消静音" : "静音";
+      guideReplayBtnEl.disabled = !guideLastEvent;
+    }
+
+    function initializeGuideProfile(state) {
+      if (guideInitializedFromProfile) {
+        return;
+      }
+      const profile = state && state.interaction_profile ? state.interaction_profile : {};
+      guideVoiceEnabled = Boolean(profile.voice_enabled_default);
+      guideMuted = false;
+      guideInitializedFromProfile = true;
+      updateGuideControls();
+    }
+
+    function speakGuidance(text, options = {}) {
+      const cleanText = String(text || "").trim();
+      if (!cleanText || !speechSupported() || !guideVoiceEnabled || guideMuted) {
+        return;
+      }
+      if (options.interrupt) {
+        window.speechSynthesis.cancel();
+      }
+      const utterance = new SpeechSynthesisUtterance(cleanText);
+      utterance.lang = "zh-CN";
+      utterance.rate = 0.95;
+      utterance.pitch = 1.0;
+      window.speechSynthesis.speak(utterance);
+    }
+
+    function renderGuidance(guidanceEvents) {
+      const events = Array.isArray(guidanceEvents) ? guidanceEvents : [];
+      const profile = (window.__carAgentLatestState || {}).interaction_profile || {};
+      const speakGuidanceEvents = profile.speak_guidance_events === true;
+      const requiredSpeechEvents = new Set([
+        "request_received",
+        "plan_created",
+        "plan_updated",
+        "navigation_start",
+        "arrival",
+        "arrival_verification",
+        "failed",
+        "cancelled",
+        "stuck",
+      ]);
+      if (!events.length) {
+        guideLatestEl.textContent = "暂无播报内容。";
+        guidanceHistoryInitialized = true;
+        updateGuideControls();
+        return;
+      }
+      const latest = events[events.length - 1];
+      guideLastEvent = latest;
+      guideLatestEl.textContent = latest.text || "暂无播报内容。";
+      const newEvents = events.filter((event) => {
+        const eventId = String(event.event_id || "");
+        return eventId && !spokenGuidanceIds.has(eventId);
+      });
+      newEvents.forEach((event) => {
+        spokenGuidanceIds.add(String(event.event_id || ""));
+        const eventType = String(event.event_type || "");
+        const mustSpeak = requiredSpeechEvents.has(eventType);
+        if (!guidanceHistoryInitialized || (!speakGuidanceEvents && !mustSpeak)) {
+          return;
+        }
+        const priority = String(event.priority || "normal");
+        speakGuidance(event.text || "", {
+          interrupt: Boolean(event.interrupt) || priority === "high" || priority === "critical",
+        });
+      });
+      guidanceHistoryInitialized = true;
+      updateGuideControls();
+    }
+
+    function visibleResponseItemsForSpeech(turns) {
+      const items = [];
+      const profile = (window.__carAgentLatestState || {}).interaction_profile || {};
+      if (profile.speak_agent_replies === false) {
+        return items;
+      }
+      (Array.isArray(turns) ? turns : []).forEach((turn) => {
+        if (turn.status && turn.status !== "completed") {
+          return;
+        }
+        const responseItems = Array.isArray(turn.response_items) ? turn.response_items : [];
+        responseItems.forEach((item, index) => {
+          if (String(item.response_type || "") === "progress") {
+            return;
+          }
+          const text = String(item.response_text || "").trim();
+          if (!text) {
+            return;
+          }
+          const responseId = String(
+            item.response_id
+            || [turn.turn_id, item.response_type || "reply", index, text].join(":")
+          );
+          items.push({
+            id: responseId,
+            text,
+            type: String(item.response_type || "result"),
+          });
+        });
+      });
+      return items;
+    }
+
+    function speakNewResponseItems(turns) {
+      const items = visibleResponseItemsForSpeech(turns);
+      items.forEach((item) => {
+        if (spokenResponseIds.has(item.id)) {
+          return;
+        }
+        spokenResponseIds.add(item.id);
+        guideLastSpokenText = item.text;
+        guideLastEvent = {
+          event_id: item.id,
+          event_type: "agent_reply",
+          text: item.text,
+          priority: item.type === "error" ? "high" : "normal",
+        };
+        guideLatestEl.textContent = item.text;
+        if (!responseSpeechHistoryInitialized) {
+          return;
+        }
+        speakGuidance(item.text, {
+          interrupt: item.type === "error",
+        });
+      });
+      responseSpeechHistoryInitialized = true;
     }
 
     function renderStepTrace(stepTrace) {
@@ -1684,11 +1940,13 @@ APP_HTML = """<!doctype html>
 
     function renderHistory(turns) {
       if (!turns.length) {
-        historyEl.innerHTML = '<div class="empty">No messages yet.</div>';
+        historyEl.innerHTML = '<div class="empty">暂无消息。</div>';
+        responseSpeechHistoryInitialized = true;
         return;
       }
       const shouldStick = historyAutoFollow || isNearBottom(historyEl, 36);
       historyEl.innerHTML = turns.map((turn) => renderTurn(turn)).join("");
+      speakNewResponseItems(turns);
       if (shouldStick) {
         historyEl.scrollTop = historyEl.scrollHeight;
       }
@@ -1721,24 +1979,24 @@ APP_HTML = """<!doctype html>
         : responseItems;
       const responseHtml = legacyResponse.map((item, index) => {
         const labelMap = {
-          result: "Assistant Result",
-          progress: "Assistant Progress",
-          error: "Assistant Error",
+          result: "CarAgent 回复",
+          progress: "CarAgent 进展",
+          error: "CarAgent 提醒",
         };
         const itemType = item.response_type || "result";
-        const itemLabel = labelMap[itemType] || "Assistant Reply";
+        const itemLabel = labelMap[itemType] || "CarAgent 回复";
         const suffix = legacyResponse.length > 1 ? " #" + (index + 1) : "";
         return '<div class="turn-answer"><strong>' + escapeHtml(itemLabel + suffix) + '</strong>' + escapeHtml(item.response_text || "") + "</div>";
       }).join("");
       const traceHtml = renderStepTrace(turn.step_trace || []);
       const noteHtml = !legacyResponse.length && status === "running"
-        ? '<div class="turn-note">The workflow is still running. Plan and task state will refresh live as nodes finish.</div>'
+        ? '<div class="turn-note">任务仍在执行中，页面会自动刷新进展。</div>'
         : "";
       const errorHtml = turn.error
         ? '<div class="turn-note error">' + escapeHtml(turn.error) + "</div>"
         : "";
       const agentMessageHtml = turn.agent_message
-        ? '<div class="turn-note"><strong>Agent input</strong><span>' + escapeHtml(turn.agent_message) + "</span></div>"
+        ? '<div class="turn-note"><strong>Agent 输入</strong><span>' + escapeHtml(turn.agent_message) + "</span></div>"
         : "";
       const traceHtmlForTurn = isSystemStatusTurn(turn) ? "" : traceHtml;
 
@@ -2319,12 +2577,12 @@ APP_HTML = """<!doctype html>
       const locked = Boolean(inputWindow.locked) || blockedBySessionChoice;
       const mode = inputWindow.mode || "ready";
       const noteTitle = blockedBySessionChoice
-        ? "Choose session"
-        : inputWindow.title || "Ready for input";
+        ? "选择会话"
+        : inputWindow.title || "可以输入";
       const noteDetail = blockedBySessionChoice
-        ? "Resume the saved session or start a new one before sending commands."
-        : inputWindow.detail || "Send a new instruction when ready.";
-      const placeholder = "Enter a user instruction. Controller arrivals are handled automatically.";
+        ? "请先继续已保存会话，或开启一个新会话。"
+        : inputWindow.detail || "准备好后可以发送新的指令。";
+      const placeholder = "输入用户指令。控制器到达事件会自动处理。";
 
       window.__carAgentLatestState = state;
       composerNoteEl.className = "composer-note " + escapeHtml(blockedBySessionChoice ? "waiting" : mode);
@@ -2341,8 +2599,11 @@ APP_HTML = """<!doctype html>
 
     function renderPayload(payload) {
       const state = payload.state || {};
+      window.__carAgentLatestState = state;
+      initializeGuideProfile(state);
       renderSummary(state, payload);
       renderStatusStrip(state);
+      renderGuidance(state.guidance_events || []);
       renderHistory(payload.conversation_history || payload.turn_history || []);
       renderTasks(state.tasks || []);
       renderPlanGraph(state.plan_graph || {});
@@ -2498,8 +2759,8 @@ APP_HTML = """<!doctype html>
           throw new Error(payload.error || "Current image is unavailable");
         }
         const sourceText = payload.path
-          ? `Captured current robot camera frame for preview only.\nSaved on board: ${payload.path}`
-          : "Captured current robot camera frame for preview only.";
+          ? `已拍摄当前机器人画面，暂未附加到消息。\n板端保存位置：${payload.path}`
+          : "已拍摄当前机器人画面，暂未附加到消息。";
         const captureName = payload.path ? payload.path.split("/").pop() : "";
         selectedImageDataUrl = "";
         showImagePreview(payload.image_data_url, sourceText, false, captureName);
@@ -2623,8 +2884,8 @@ APP_HTML = """<!doctype html>
       showImagePreview(
         latestAgentCapture.image_data_url,
         latestAgentCapture.path
-          ? `Agent capture attached to the next message.\nSaved on board: ${latestAgentCapture.path}`
-          : "Agent capture attached to the next message.",
+          ? `Agent 拍摄画面已附加到下一条消息。\n板端保存位置：${latestAgentCapture.path}`
+          : "Agent 拍摄画面已附加到下一条消息。",
         true,
         latestAgentCapture.name || "agent_capture.jpg"
       );
@@ -2636,7 +2897,7 @@ APP_HTML = """<!doctype html>
         const dataUrl = await readSelectedImageAsDataUrl();
         if (dataUrl) {
           const file = imageUploadEl.files && imageUploadEl.files[0];
-          showImagePreview(dataUrl, "Image attached. Type a message and click Send, or use Describe Image to search by this image.", true, file ? file.name : "");
+          showImagePreview(dataUrl, "图片已附加。输入指令后点击发送，或点击描述图片。", true, file ? file.name : "");
           const latestState = window.__carAgentLatestState || {
             input_window: { locked: false, mode: "ready" },
             processing: false,
@@ -2652,8 +2913,8 @@ APP_HTML = """<!doctype html>
       const latestState = window.__carAgentLatestState || {
         input_window: {
           mode: "ready",
-          title: "Ready for input",
-          detail: "Send a new instruction when ready.",
+          title: "可以输入",
+          detail: "可以发送新的指令。",
           locked: false,
         },
         processing: false,
@@ -2699,6 +2960,28 @@ APP_HTML = """<!doctype html>
     resumeSessionBtnEl.addEventListener("click", () => chooseSessionMode("resume"));
     newSessionBtnEl.addEventListener("click", () => chooseSessionMode("new"));
 
+    guideEnableBtnEl.addEventListener("click", () => {
+      guideVoiceEnabled = true;
+      guideMuted = false;
+      speakGuidance("语音播报已就绪。", { interrupt: true });
+      updateGuideControls();
+    });
+
+    guideMuteBtnEl.addEventListener("click", () => {
+      guideMuted = !guideMuted;
+      if (guideMuted && speechSupported()) {
+        window.speechSynthesis.cancel();
+      }
+      updateGuideControls();
+    });
+
+    guideReplayBtnEl.addEventListener("click", () => {
+      if (guideLastSpokenText || guideLastEvent) {
+        speakGuidance(guideLastSpokenText || guideLastEvent.text || "", { interrupt: true });
+      }
+      updateGuideControls();
+    });
+
     planViewListBtnEl.addEventListener("click", () => {
       planViewMode = "list";
       applyPlanViewMode();
@@ -2729,12 +3012,232 @@ APP_HTML = """<!doctype html>
     });
     window.__carAgentLatestState = null;
     updateConsoleFollowIndicator();
+    updateGuideControls();
     applyPlanViewMode();
     refreshState();
   </script>
 </body>
 </html>
 """
+
+
+LITE_APP_HTML = """<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CarAgent 导引助手</title>
+<style>
+  :root{--bg:#eef2f7;--panel:#fff;--ink:#172033;--muted:#64748b;--line:#d7dde8;--blue:#1f6fd1}
+  *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif}
+  .shell{height:100vh;display:grid;grid-template-rows:auto 1fr auto;max-width:860px;margin:0 auto;background:var(--panel);border-left:1px solid var(--line);border-right:1px solid var(--line)}
+  header{padding:14px 18px;background:#102033;color:white;display:flex;align-items:center;gap:12px}h1{font-size:19px;margin:0}.status{font-size:13px;color:#dbeafe;margin-left:auto}
+  .chat{overflow:auto;padding:18px;display:flex;flex-direction:column;gap:12px;background:linear-gradient(#f8fafc,#eef2f7)}
+  .bubble{max-width:78%;border-radius:16px;padding:12px 14px;line-height:1.55;box-shadow:0 4px 14px rgba(15,23,42,.06);white-space:pre-wrap}
+  .user{align-self:flex-end;background:#dbeafe}.agent{align-self:flex-start;background:white;border:1px solid var(--line)}.event{align-self:center;background:#fff7ed;color:#8a4b0a;font-size:13px;padding:7px 12px;border-radius:999px}
+  .composer{border-top:1px solid var(--line);padding:12px;background:white}.preview{display:none;margin-bottom:8px}.preview.show{display:flex;gap:8px;align-items:center}.preview img{width:88px;height:66px;object-fit:cover;border-radius:8px;border:1px solid var(--line)}
+  textarea{width:100%;min-height:70px;resize:vertical;border:1px solid var(--line);border-radius:10px;padding:10px;font-size:16px}
+  .teleop{border-top:1px solid var(--line);padding:12px;background:#f8fafc;display:grid;grid-template-columns:96px 1fr 88px;gap:14px;align-items:center}
+  .teleop label{font-size:13px;color:var(--muted);display:block;margin-bottom:8px}
+  .stick{display:flex;flex-direction:column;align-items:center;gap:6px}.stick input{width:160px;accent-color:var(--blue);touch-action:none}
+  .stick.vertical input{transform:rotate(-90deg);margin:48px 0}
+  .teleop-actions{display:flex;flex-direction:column;gap:8px}.teleop .danger{background:#fee2e2;border-color:#fecaca;color:#991b1b;font-weight:700}.teleop .active{background:#dcfce7;border-color:#86efac;color:#14532d}
+  .row{display:flex;gap:8px;align-items:center;margin-top:8px}button,label.btn{border:1px solid var(--line);background:#eef2f7;border-radius:8px;padding:9px 12px;font-size:15px;cursor:pointer}button.primary{background:var(--blue);border-color:var(--blue);color:white}.voice{color:var(--muted);font-size:13px}.spacer{flex:1}input[type=file]{display:none}
+  @media(max-width:640px){.shell{border:0}.bubble{max-width:88%}}
+</style>
+</head>
+<body>
+<div class="shell">
+  <header><h1>CarAgent 导引助手</h1><div class="status" id="status">准备就绪</div></header>
+  <main class="chat" id="chat"></main>
+  <section class="teleop" aria-label="手动遥控">
+    <div class="stick vertical"><label>前后</label><input id="teleop-linear" type="range" min="-100" max="100" value="0" step="1"></div>
+    <div class="stick"><label>左右转向</label><input id="teleop-angular" type="range" min="-100" max="100" value="0" step="1"><div class="voice" id="teleop-status">遥控松手即停</div></div>
+    <div class="teleop-actions"><button type="button" id="speed-btn">低速</button><button type="button" class="danger" id="estop-btn">急停</button></div>
+  </section>
+  <form class="composer" id="form">
+    <div class="preview" id="preview"><img id="preview-img" alt="待发送图片"><span id="preview-name"></span><button type="button" onclick="clearImage()">移除</button></div>
+    <textarea id="message" placeholder="请输入你的问题或导引需求"></textarea>
+    <div class="row">
+      <label class="btn" for="image">选择图片</label><input id="image" type="file" accept="image/*">
+      <button type="button" id="voice-btn">测试语音</button>
+      <button type="button" id="mute-btn">静音</button>
+      <button type="button" id="replay-btn">重播</button>
+      <span class="spacer"></span>
+      <button class="primary" type="submit">发送</button>
+    </div>
+    <div class="voice" id="voice-status">语音默认开启；浏览器可能需要先点击“测试语音”。</div>
+  </form>
+</div>
+<script>
+const $=(id)=>document.getElementById(id);
+let imageDataUrl="", imageName="", seenTurnIds=new Set(), seenResponses=new Set(), seenEvents=new Set();
+let voiceEnabled=true, muted=false, voiceUnlocked=false, pendingSpeech="", lastSpoken="", firstLoad=true;
+let teleopMode="normal", teleopTimer=null, teleopActive=false, teleopInFlight=false, teleopQueued=false, teleopQueuedStop=false;
+let liteRefreshTimer=null, liteRefreshInFlight=false, fastRefreshUntil=0;
+let spokenTexts=[], spokenGuidanceEvents=[];
+function speechSupported(){return "speechSynthesis" in window && "SpeechSynthesisUtterance" in window}
+function setVoiceStatus(text){$("voice-status").textContent=text}
+function pickZhVoice(){const voices=speechSupported()?speechSynthesis.getVoices():[]; return voices.find(v=>/zh|cmn|mandarin|chinese/i.test(`${v.lang} ${v.name}`))||voices[0]||null}
+function makeUtterance(text){const u=new SpeechSynthesisUtterance(text); u.lang="zh-CN"; const v=pickZhVoice(); if(v)u.voice=v; u.rate=.95; u.pitch=1; u.onstart=()=>setVoiceStatus("正在播报"); u.onend=()=>setVoiceStatus("语音已启用"); u.onerror=(ev)=>setVoiceStatus(`语音播报失败：${ev.error||"浏览器拦截"}`); return u}
+function unlockSpeech(playTest=true){if(!speechSupported()){setVoiceStatus("当前浏览器不支持语音合成，请换用手机 Chrome、Edge 或 Safari。"); return false} voiceEnabled=true; muted=false; voiceUnlocked=true; speechSynthesis.resume(); if(playTest){speechSynthesis.cancel(); speechSynthesis.speak(makeUtterance("语音播报已就绪。")); lastSpoken="语音播报已就绪。"} if(pendingSpeech){const text=pendingSpeech; pendingSpeech=""; setTimeout(()=>speak(text,true),160)} $("mute-btn").textContent="静音"; return true}
+function normalizedSpeechText(text){return String(text||"").replace(/[“”"'‘’。！？!?,，、；;：:\\s]/g,"").trim()}
+function recentlySpokenSimilar(text){const n=normalizedSpeechText(text); if(!n)return true; return spokenTexts.some(item=>{const old=normalizedSpeechText(item.text); if(!old)return false; return n===old||n.includes(old)||old.includes(n)})}
+function rememberSpoken(text){spokenTexts.push({text:String(text||""),at:Date.now()}); const cutoff=Date.now()-45000; spokenTexts=spokenTexts.filter(item=>item.at>=cutoff).slice(-24)}
+function speak(text, interrupt=false, force=false){const t=String(text||"").trim(); if(!t||!voiceEnabled||muted)return; if(!force&&recentlySpokenSimilar(t))return; if(!speechSupported()){setVoiceStatus("当前浏览器不支持语音合成。"); return} if(!voiceUnlocked){pendingSpeech=t; setVoiceStatus("手机浏览器需要先点击“测试语音”解锁播报。"); return} speechSynthesis.resume(); if(interrupt) speechSynthesis.cancel(); speechSynthesis.speak(makeUtterance(t)); lastSpoken=t; rememberSpoken(t)}
+function bubble(cls,text){const el=document.createElement("div"); el.className="bubble "+cls; el.textContent=text; $("chat").appendChild(el); $("chat").scrollTop=$("chat").scrollHeight}
+function eventBubble(text){const el=document.createElement("div"); el.className="event"; el.textContent=text; $("chat").appendChild(el); $("chat").scrollTop=$("chat").scrollHeight}
+async function request(path, options={}){const r=await fetch(path,{headers:{"Content-Type":"application/json"},...options}); const d=await r.json(); if(!r.ok) throw new Error(d.error||"请求失败"); return d}
+function teleopLimits(){return teleopMode==="slow"?{linear:.06,angular:.20}:{linear:.18,angular:.50}}
+function teleopPayload(stop=false){const lim=teleopLimits(); const linear=stop?0:(Number($("teleop-linear").value||0)/100)*lim.linear; const angular=stop?0:-(Number($("teleop-angular").value||0)/100)*lim.angular; return stop?{command:"stop"}:{linear,angular,mode:teleopMode}}
+function dashboardTeleopUrl(){return `${location.protocol}//${location.hostname}:8234/api/teleop`}
+async function postTeleop(payload){const body=JSON.stringify(payload); try{const r=await fetch(dashboardTeleopUrl(),{method:"POST",headers:{"Content-Type":"application/json"},body}); const d=await r.json(); if(!r.ok) throw new Error(d.error||"遥控请求失败"); return d}catch(_){const r=await fetch("/api/teleop",{method:"POST",headers:{"Content-Type":"application/json"},body}); const d=await r.json(); if(!r.ok) throw new Error(d.error||"遥控请求失败"); return d}}
+function queueTeleop(stop=false){teleopQueued=true; teleopQueuedStop=!!stop; if(!teleopInFlight) flushTeleop()}
+async function flushTeleop(){if(!teleopQueued)return; teleopInFlight=true; const stop=teleopQueuedStop; teleopQueued=false; teleopQueuedStop=false; try{await postTeleop(teleopPayload(stop)); $("teleop-status").textContent=stop?"已停车":"手动遥控中"}catch(e){$("teleop-status").textContent=e.message||String(e)} finally{teleopInFlight=false; if(teleopQueued || (teleopActive&&!teleopTimer)) flushTeleop()}}
+function startTeleopLoop(ev){if(ev&&ev.preventDefault)ev.preventDefault(); if(ev&&ev.currentTarget&&ev.currentTarget.setPointerCapture&&ev.pointerId!==undefined){try{ev.currentTarget.setPointerCapture(ev.pointerId)}catch(_){}} teleopActive=true; queueTeleop(false); if(!teleopTimer)teleopTimer=setInterval(()=>queueTeleop(false),80)}
+function stopTeleopLoop(ev){if(ev&&ev.preventDefault)ev.preventDefault(); teleopActive=false; if(teleopTimer){clearInterval(teleopTimer); teleopTimer=null} $("teleop-linear").value=0; $("teleop-angular").value=0; queueTeleop(true)}
+function handleTeleopInput(){const moving=Math.abs(Number($("teleop-linear").value||0))+Math.abs(Number($("teleop-angular").value||0))>0; if(moving){if(!teleopActive)startTeleopLoop(); else queueTeleop(false)}else if(teleopActive){stopTeleopLoop()}}
+function requiredEvent(type){return ["request_received","plan_created","plan_updated","navigation_start","arrival","arrival_verification","failed","cancelled","stuck"].includes(type)}
+function navigationEventType(type){return ["navigation_start","arrival","arrival_verification","failed","cancelled","stuck"].includes(String(type||""))}
+function rememberGuidanceEvent(type,text){spokenGuidanceEvents.push({type:String(type||""),text:String(text||""),at:Date.now()}); const cutoff=Date.now()-20000; spokenGuidanceEvents=spokenGuidanceEvents.filter(item=>item.at>=cutoff).slice(-24)}
+function guidanceTextSimilarToFinal(text){const n=normalizedSpeechText(text); if(!n)return false; const cutoff=Date.now()-20000; return spokenGuidanceEvents.some(item=>{if(item.at<cutoff||!navigationEventType(item.type))return false; const old=normalizedSpeechText(item.text); if(!old)return false; return n===old||n.includes(old)||old.includes(n)})}
+function hasCjk(text){return /[\u3400-\u9fff]/.test(String(text||""))}
+function wantsChinese(payload, turn){return String((turn&&turn.output_language)||payload.output_language||"zh").toLowerCase().startsWith("zh")}
+function finalTurnText(payload, t){const completed=String(t.status||"")==="completed"; if(!completed)return ""; const responseItems=Array.isArray(t.response_items)?t.response_items:[]; const visibleItems=responseItems.filter(item=>!["progress"].includes(String(item.response_type||""))); const finalText=String(t.response||t.turn_response_text||"").trim(); if(finalText&&visibleItems.length)return finalText; const fallback=visibleItems.length?String(visibleItems[visibleItems.length-1].response_text||"").trim():""; if(wantsChinese(payload,t)&&fallback&&!hasCjk(fallback))return ""; return fallback}
+function render(payload){
+  const state=payload.state||{};
+  $("status").textContent=state.processing?"正在处理":"准备就绪";
+  const pendingFinals=[];
+  const turns=payload.conversation_history||[];
+  turns.forEach(t=>{
+    const tid=String(t.turn_id||"");
+    if(tid&&!seenTurnIds.has(tid)){
+      seenTurnIds.add(tid);
+      if(t.role==="user") bubble("user", t.content||"");
+    }
+    const txt=finalTurnText(payload,t);
+    const id=String(t.response_id||t.turn_response_id||`${tid}:final:${txt}`);
+    if(txt&&!seenResponses.has(id)){
+      seenResponses.add(id);
+      pendingFinals.push({text:txt,isError:String(t.turn_response_type||"")==="error"});
+    }
+  });
+  (state.guidance_events||[]).forEach(ev=>{
+    const id=String(ev.event_id||"");
+    if(id&&seenEvents.has(id))return;
+    const type=String(ev.event_type||"");
+    const text=String(ev.text||"").trim();
+    if(!text||!requiredEvent(type))return;
+    if(String(payload.output_language||"zh").toLowerCase().startsWith("zh")&&!hasCjk(text))return;
+    if(id)seenEvents.add(id);
+    eventBubble(text);
+    if(!firstLoad){
+      speak(text,["failed","cancelled","stuck"].includes(type),true);
+      rememberGuidanceEvent(type,text);
+    }
+  });
+  pendingFinals.forEach(item=>{
+    const suppressNavFinal=!item.isError&&guidanceTextSimilarToFinal(item.text);
+    if(suppressNavFinal)return;
+    bubble("agent",item.text);
+    if(!firstLoad)speak(item.text,item.isError);
+  });
+  firstLoad=false;
+}
+function requestFastRefresh(ms=8000){fastRefreshUntil=Math.max(fastRefreshUntil,Date.now()+ms); scheduleLiteRefresh(120)}
+function nextRefreshDelay(payload){const state=(payload&&payload.state)||{}; const inputWindow=state.input_window||{}; if(Date.now()<fastRefreshUntil)return 200; return state.processing?350:(inputWindow.mode==="waiting"?600:1200)}
+function scheduleLiteRefresh(delayMs){if(liteRefreshTimer)clearTimeout(liteRefreshTimer); liteRefreshTimer=setTimeout(()=>refresh(),Math.max(200,Number(delayMs)||1200))}
+async function refresh(){if(liteRefreshInFlight){scheduleLiteRefresh(250); return} liteRefreshInFlight=true; try{const payload=await request("/api/lite-state"); render(payload); scheduleLiteRefresh(nextRefreshDelay(payload))}catch(e){$("status").textContent=e.message||String(e); scheduleLiteRefresh(1800)}finally{liteRefreshInFlight=false}}
+async function startLite(){try{let payload=await request("/api/lite-state"); render(payload); const checkpoint=payload.checkpoint||{}; if(checkpoint.choice_required){payload=await request("/api/session",{method:"POST",body:JSON.stringify({mode:"new"})}); render(payload)} scheduleLiteRefresh(450)}catch(e){$("status").textContent=e.message||String(e); scheduleLiteRefresh(1800)}}
+function clearImage(){imageDataUrl=""; imageName=""; $("preview").classList.remove("show"); $("image").value=""}
+$("image").addEventListener("change",()=>{const f=$("image").files&&$("image").files[0]; if(!f)return; const reader=new FileReader(); reader.onload=()=>{imageDataUrl=String(reader.result||""); imageName=f.name; $("preview-img").src=imageDataUrl; $("preview-name").textContent=f.name; $("preview").classList.add("show")}; reader.readAsDataURL(f)});
+$("form").addEventListener("submit",async(ev)=>{ev.preventDefault(); const msg=$("message").value.trim(); if(!msg&&!imageDataUrl)return; const imagePayload=imageDataUrl; speak("已收到你的指令。",true,true); $("message").value=""; clearImage(); requestFastRefresh(20000); try{const payload=await request("/api/message",{method:"POST",body:JSON.stringify({message:msg,input_language:"zh",output_language:"zh",image_data_url:imagePayload})}); render(payload); requestFastRefresh(12000)}catch(e){bubble("agent",e.message||String(e)); speak(e.message||String(e),true); scheduleLiteRefresh(1200)}});
+$("voice-btn").onclick=()=>unlockSpeech(true);
+$("mute-btn").onclick=()=>{muted=!muted; $("mute-btn").textContent=muted?"取消静音":"静音"; setVoiceStatus(muted?"语音已静音":"语音已启用"); if(muted&&speechSupported()) speechSynthesis.cancel()};
+$("replay-btn").onclick=()=>{unlockSpeech(false); speak(lastSpoken||pendingSpeech,true)};
+if(speechSupported()){speechSynthesis.onvoiceschanged=()=>pickZhVoice()}
+$("speed-btn").onclick=()=>{teleopMode=teleopMode==="slow"?"normal":"slow"; $("speed-btn").textContent=teleopMode==="slow"?"更低速":"低速"; $("speed-btn").classList.toggle("active",teleopMode==="slow")};
+$("estop-btn").onclick=()=>stopTeleopLoop();
+["teleop-linear","teleop-angular"].forEach(id=>{const el=$(id); if(window.PointerEvent){el.addEventListener("pointerdown",startTeleopLoop); el.addEventListener("pointerup",stopTeleopLoop); el.addEventListener("pointercancel",stopTeleopLoop)}else{el.addEventListener("touchstart",startTeleopLoop,{passive:false}); el.addEventListener("touchend",stopTeleopLoop,{passive:false}); el.addEventListener("mousedown",startTeleopLoop); window.addEventListener("mouseup",stopTeleopLoop)} el.addEventListener("input",handleTeleopInput); el.addEventListener("change",handleTeleopInput)});
+window.addEventListener("blur",()=>{if(teleopActive)stopTeleopLoop()});
+startLite();
+</script>
+</body>
+</html>"""
+
+
+SIM_VIEW_HTML = """<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>CarAgent 仿真可视化</title>
+<style>
+:root{color-scheme:light;--bg:#f7f8fb;--panel:#fff;--ink:#172033;--muted:#69758a;--line:#d9dfeb;--blue:#2563eb;--green:#16a34a;--red:#dc2626;--amber:#d97706}
+*{box-sizing:border-box}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",Arial,sans-serif;background:var(--bg);color:var(--ink)}
+.app{min-height:100vh;display:grid;grid-template-rows:auto 1fr}
+header{display:flex;gap:12px;align-items:center;justify-content:space-between;padding:12px 16px;background:#fff;border-bottom:1px solid var(--line)}
+h1{font-size:18px;margin:0;font-weight:700}.meta{font-size:13px;color:var(--muted)}
+.actions{display:flex;gap:8px;align-items:center}a,button{border:1px solid var(--line);background:#fff;border-radius:8px;color:var(--ink);padding:8px 12px;text-decoration:none;font:inherit;cursor:pointer}button.primary{background:var(--blue);border-color:var(--blue);color:#fff}
+main{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:12px;padding:12px;min-height:0}
+.map-panel,.side{background:var(--panel);border:1px solid var(--line);border-radius:10px;min-height:0}
+.map-panel{display:grid;grid-template-rows:auto 1fr;overflow:hidden}.toolbar{display:flex;gap:8px;align-items:center;padding:10px;border-bottom:1px solid var(--line)}
+.toolbar input{flex:1;min-width:120px;border:1px solid var(--line);border-radius:8px;padding:10px 12px;font:inherit}
+.stage{position:relative;min-height:360px}.stage canvas{width:100%;height:100%;display:block;background:#fbfcff}
+.legend{position:absolute;left:12px;bottom:12px;background:rgba(255,255,255,.92);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:12px;color:var(--muted);display:flex;gap:12px;flex-wrap:wrap}.dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px;vertical-align:-1px}.dot.kf{background:#94a3b8}.dot.robot{background:var(--blue)}.dot.dest{background:var(--red)}.dot.path{background:var(--green)}
+.side{display:grid;grid-template-rows:auto auto 1fr;overflow:hidden}.card{padding:12px;border-bottom:1px solid var(--line)}.label{font-size:12px;color:var(--muted);margin-bottom:5px}.value{font-size:15px;line-height:1.45}.status{font-weight:700}.events{overflow:auto;padding:8px 12px}.event{padding:9px 0;border-bottom:1px solid #eef2f7}.event .type{font-size:12px;color:var(--muted)}.event .text{font-size:14px;line-height:1.4}
+@media(max-width:860px){main{grid-template-columns:1fr;grid-template-rows:60vh minmax(320px,40vh)}.side{min-height:320px}header{align-items:flex-start;flex-direction:column}.actions{width:100%;justify-content:space-between}.stage{min-height:0}}
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div><h1>CarAgent 仿真可视化</h1><div class="meta" id="meta">连接中...</div></div>
+    <div class="actions"><a href="/lite" target="_blank">Lite UI</a><button id="reset-view">重置视图</button></div>
+  </header>
+  <main>
+    <section class="map-panel">
+      <div class="toolbar">
+        <input id="command" placeholder="输入仿真指令" autocomplete="off" />
+        <button class="primary" id="send">发送</button>
+      </div>
+      <div class="stage">
+        <canvas id="map"></canvas>
+        <div class="legend">
+          <span><i class="dot kf"></i>关键帧</span>
+          <span><i class="dot robot"></i>小车</span>
+          <span><i class="dot dest"></i>目标</span>
+          <span><i class="dot path"></i>轨迹</span>
+        </div>
+      </div>
+    </section>
+    <aside class="side">
+      <div class="card"><div class="label">状态</div><div class="value status" id="status">-</div></div>
+      <div class="card"><div class="label">导航</div><div class="value" id="nav">-</div></div>
+      <div class="events" id="events"></div>
+    </aside>
+  </main>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const canvas=$("map"), ctx=canvas.getContext("2d");
+let latest=null, trail=[], lastRobot=null, viewBounds=null, manualBounds=false, sending=false;
+function req(path,opt){return fetch(path,Object.assign({headers:{"Content-Type":"application/json"}},opt||{})).then(r=>{if(!r.ok)throw new Error(r.status+" "+r.statusText);return r.json()})}
+function pos2(p){return Array.isArray(p)&&p.length>=2?[Number(p[0]),Number(p[1])]:null}
+function dist(a,b){return Math.hypot(a[0]-b[0],a[1]-b[1])}
+function resize(){const box=canvas.parentElement.getBoundingClientRect();const dpr=window.devicePixelRatio||1;canvas.width=Math.max(320,Math.floor(box.width*dpr));canvas.height=Math.max(260,Math.floor(box.height*dpr));canvas.style.width=box.width+"px";canvas.style.height=box.height+"px";ctx.setTransform(dpr,0,0,dpr,0,0);draw()}
+function computeBounds(data){const pts=[];(data.keyframes||[]).forEach(k=>{const p=pos2(k.position);if(p)pts.push(p)});const rp=pos2(data.robot&&data.robot.position);if(rp)pts.push(rp);const dp=pos2(data.navigation&&data.navigation.destination_position);if(dp)pts.push(dp);trail.forEach(p=>pts.push(p));if(!pts.length)return {minX:-2,maxX:2,minY:-2,maxY:2};let minX=pts[0][0],maxX=pts[0][0],minY=pts[0][1],maxY=pts[0][1];pts.forEach(p=>{minX=Math.min(minX,p[0]);maxX=Math.max(maxX,p[0]);minY=Math.min(minY,p[1]);maxY=Math.max(maxY,p[1])});const pad=Math.max(0.8,(maxX-minX+maxY-minY)*0.06);return {minX:minX-pad,maxX:maxX+pad,minY:minY-pad,maxY:maxY+pad}}
+function project(p,b){const w=canvas.clientWidth,h=canvas.clientHeight;const sx=w/Math.max(.1,b.maxX-b.minX),sy=h/Math.max(.1,b.maxY-b.minY);const s=Math.min(sx,sy)*0.9;const cx=(b.minX+b.maxX)/2,cy=(b.minY+b.maxY)/2;return [w/2+(p[0]-cx)*s,h/2-(p[1]-cy)*s]}
+function line(points,b,color,width){if(points.length<2)return;ctx.beginPath();points.forEach((p,i)=>{const q=project(p,b);if(i)ctx.lineTo(q[0],q[1]);else ctx.moveTo(q[0],q[1])});ctx.strokeStyle=color;ctx.lineWidth=width;ctx.lineJoin="round";ctx.lineCap="round";ctx.stroke()}
+function dot(p,b,r,color,stroke,label){const q=project(p,b);ctx.beginPath();ctx.arc(q[0],q[1],r,0,Math.PI*2);ctx.fillStyle=color;ctx.fill();if(stroke){ctx.strokeStyle=stroke;ctx.lineWidth=2;ctx.stroke()}if(label){ctx.fillStyle="#344054";ctx.font="12px sans-serif";ctx.fillText(label,q[0]+r+4,q[1]-r-2)}}
+function draw(){ctx.clearRect(0,0,canvas.clientWidth,canvas.clientHeight);if(!latest)return;const b=manualBounds&&viewBounds?viewBounds:computeBounds(latest);if(!manualBounds)viewBounds=b;ctx.strokeStyle="#e5eaf3";ctx.lineWidth=1;for(let i=0;i<8;i++){const x=canvas.clientWidth*i/7;ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,canvas.clientHeight);ctx.stroke();const y=canvas.clientHeight*i/7;ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(canvas.clientWidth,y);ctx.stroke()}line(trail,b,"#16a34a",3);(latest.keyframes||[]).forEach(k=>{const p=pos2(k.position);if(p)dot(p,b,3.5,"#94a3b8",null,String(k.kf_id))});const nav=latest.navigation||{};const dp=pos2(nav.destination_position);if(dp){if(lastRobot)line([lastRobot,dp],b,"#dc2626",2);dot(dp,b,8,"#dc2626","#fff","目标")}const rp=pos2(latest.robot&&latest.robot.position);if(rp){dot(rp,b,9,"#2563eb","#fff","小车")}}
+function render(data){latest=data;const rp=pos2(data.robot&&data.robot.position);if(rp){if(!lastRobot||dist(lastRobot,rp)>0.02){trail.push(rp);trail=trail.slice(-80);lastRobot=rp}}$("meta").textContent=`${data.updated_at||""} · ${data.simulation_mode?"虚拟导航":"实机/非仿真"} · ${data.keyframes.length} 个关键帧`;$("status").textContent=(data.robot&&data.robot.status)||data.agent_status||"-";const nav=data.navigation||{};$("nav").textContent=nav.active?`${nav.kind||"导航"} -> ${nav.label||nav.description||"目标"}`:"暂无导航";const box=$("events");box.innerHTML=(data.guidance_events||[]).slice(-14).reverse().map(e=>`<div class="event"><div class="type">${e.event_type||""}</div><div class="text">${e.text||""}</div></div>`).join("")||'<div class="event"><div class="text">暂无事件</div></div>';draw()}
+async function refresh(){try{const data=await req("/api/sim-state");render(data)}catch(e){$("status").textContent=e.message||String(e)}setTimeout(refresh,650)}
+async function send(){const msg=$("command").value.trim();if(!msg||sending)return;sending=true;$("command").value="";try{await req("/api/message",{method:"POST",body:JSON.stringify({message:msg,input_language:"zh",output_language:"zh"})})}catch(e){$("status").textContent=e.message||String(e)}finally{sending=false;setTimeout(refresh,250)}}
+$("send").onclick=send;$("command").addEventListener("keydown",e=>{if(e.key==="Enter")send()});$("reset-view").onclick=()=>{manualBounds=false;viewBounds=null;trail=[];lastRobot=null;draw()};window.addEventListener("resize",resize);resize();refresh();
+</script>
+</body>
+</html>"""
 
 
 def _now_display() -> str:
@@ -3486,40 +3989,44 @@ class AsyncAgentWebApp:
             return {
                 "locked": True,
                 "mode": "busy",
-                "title": "Agent is processing the latest turn",
-                "detail": "Planning and execution updates are streaming live. Input will reopen when this turn settles.",
+                "title": "正在处理",
+                "detail": "我正在理解并执行你的指令，完成当前步骤后会继续接收输入。",
             }
 
         if current_task and current_task.get("status") == "waiting":
             wait_for_event = current_task.get("wait_for_event") or "external_event"
+            if wait_for_event == "navigation_arrived":
+                detail = "正在导航，等待小车到达。"
+            else:
+                detail = "正在等待外部事件。"
             return {
                 "locked": False,
                 "mode": "waiting",
-                "title": "Awaiting external event",
-                "detail": f"Current task is waiting for {wait_for_event}. Controller arrivals are handled automatically.",
+                "title": "正在等待",
+                "detail": detail,
             }
 
         if next_action_type in {"plan", "execute"}:
             return {
                 "locked": True,
                 "mode": "settling",
-                "title": "State is settling",
-                "detail": "The workflow is transitioning between nodes. The composer will reopen automatically in a moment.",
+                "title": "正在切换步骤",
+                "detail": "我正在进入下一步，很快可以继续输入。",
             }
 
         if state.get("current_plan_id"):
             return {
                 "locked": False,
                 "mode": "active_plan",
-                "title": "Plan is active",
-                "detail": "You can send a follow-up instruction. The planner may insert, replace, or cancel future work.",
+                "title": "任务进行中",
+                "detail": "可以继续补充指令，我会根据当前任务调整后续安排。",
             }
 
         return {
             "locked": False,
             "mode": "ready",
-            "title": "Ready for input",
-            "detail": "Send a new instruction. Controller arrivals are handled automatically.",
+            "title": "可以输入",
+            "detail": "可以发送新的指令，控制器到达事件会自动处理。",
         }
 
     def _get_state_snapshot_locked(
@@ -3871,6 +4378,7 @@ class AsyncAgentWebApp:
                 self.thread_id,
                 role,
                 on_update=lambda update: self._handle_turn_update(turn_id, update),
+                original_message=message,
             )
             turn_result["original_message"] = message
             turn_result["agent_message"] = agent_message
@@ -3976,6 +4484,8 @@ class AsyncAgentWebApp:
             "agent_status_detail": input_window["detail"],
             "user_facing_response": state.get("user_facing_response"),
             "turn_response_items": state.get("turn_response_items", []),
+            "guidance_events": list(state.get("guidance_events") or [])[-80:],
+            "interaction_profile": get_interaction_profile(),
             "visible_task_count": len(tasks),
             "tasks": tasks,
             "plan_graph": plan_graph,
@@ -3985,12 +4495,51 @@ class AsyncAgentWebApp:
     def _filter_user_turn_response_items(
         self,
         turn: dict[str, Any],
+        *,
+        lite: bool = False,
     ) -> list[dict[str, Any]]:
         """Keep user-facing answers focused on final replies, not every progress tick."""
+
+        if str(turn.get("status") or "") != "completed":
+            return []
 
         response_items = normalize_turn_response_items(turn.get("response_items"))
         if not response_items:
             return []
+
+        if lite:
+            original_items = list(response_items)
+            guidance_backed_events = {
+                "plan_created",
+                "plan_edited",
+                "plan_updated",
+                "task_waiting",
+                "navigation_arrived",
+                "task_failed",
+                "task_cancelled",
+            }
+            response_items = [
+                item
+                for item in response_items
+                if str(item.get("source_event_type") or "").strip()
+                not in guidance_backed_events
+            ]
+            if not response_items:
+                fallback_text = str(turn.get("response") or "").strip()
+                if fallback_text:
+                    if not any(
+                        str(item.get("response_text") or "").strip() == fallback_text
+                        for item in original_items
+                    ):
+                        return [
+                            {
+                                "response_id": f"{turn.get('turn_id')}:final",
+                                "response_type": str(
+                                    turn.get("turn_response_type") or "result"
+                                ),
+                                "response_text": fallback_text,
+                            }
+                        ]
 
         return list(response_items)
 
@@ -4034,7 +4583,58 @@ class AsyncAgentWebApp:
             "turn_response_type": str(turn.get("turn_response_type") or "result"),
         }
 
-    def _build_conversation_history(self) -> list[dict[str, Any]]:
+    def _build_lite_controller_result_notice(
+        self,
+        turn: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Expose real controller-arrival answers in lite while hiding progress chatter."""
+
+        response_type = str(turn.get("turn_response_type") or "").strip()
+        if response_type not in {"result", "error"}:
+            return None
+
+        response_items = normalize_turn_response_items(turn.get("response_items"))
+        result_items = [
+            item
+            for item in response_items
+            if str(item.get("response_type") or "").strip() in {"result", "error"}
+            and str(item.get("response_text") or "").strip()
+        ]
+        response_text = str(turn.get("response") or "").strip()
+        if result_items:
+            response_text = str(result_items[-1].get("response_text") or "").strip()
+        if not response_text:
+            return None
+
+        if not result_items:
+            result_items = [
+                {
+                    "response_id": f"{turn.get('turn_id')}:controller-result",
+                    "response_type": response_type or "result",
+                    "response_text": response_text,
+                }
+            ]
+
+        return {
+            "turn_id": turn.get("turn_id"),
+            "role": "system",
+            "role_label": "CarAgent 回复",
+            "source": str(turn.get("source") or "controller-watchdog"),
+            "content": str(turn.get("content") or ""),
+            "response": response_text,
+            "response_items": [dict(item) for item in result_items],
+            "created_at": turn.get("created_at"),
+            "updated_at": turn.get("updated_at"),
+            "finished_at": turn.get("finished_at"),
+            "visited_nodes": list(turn.get("visited_nodes", []) or []),
+            "step_trace": list(turn.get("step_trace", []) or [])[-24:],
+            "status": "completed",
+            "live_node": "",
+            "turn_response_type": response_type or "result",
+            "output_language": str(turn.get("output_language") or ""),
+        }
+
+    def _build_conversation_history(self, *, lite: bool = False) -> list[dict[str, Any]]:
         """Build the clean chat timeline shown in the browser conversation panel."""
 
         conversation: list[dict[str, Any]] = []
@@ -4044,6 +4644,11 @@ class AsyncAgentWebApp:
             role = str(turn.get("role") or "")
 
             if source in {"controller", "controller-watchdog"}:
+                if lite:
+                    notice = self._build_lite_controller_result_notice(turn)
+                    if notice is not None:
+                        conversation.append(notice)
+                    continue
                 notice = self._build_route_completion_notice(turn)
                 if notice is not None:
                     conversation.append(notice)
@@ -4055,12 +4660,18 @@ class AsyncAgentWebApp:
 
             visible_turn = dict(turn)
             if role == "user":
-                response_items = self._filter_user_turn_response_items(turn)
+                response_items = self._filter_user_turn_response_items(turn, lite=lite)
                 visible_turn["response_items"] = response_items
-                if response_items:
+                if str(turn.get("status") or "") != "completed":
+                    visible_turn["response"] = ""
+                elif response_items:
                     visible_turn["response"] = str(
                         response_items[-1].get("response_text") or ""
                     )
+                elif lite:
+                    visible_turn["response"] = ""
+                elif turn.get("response"):
+                    visible_turn["response"] = str(turn.get("response") or "")
             conversation.append(visible_turn)
 
         return conversation[-80:]
@@ -4121,6 +4732,125 @@ class AsyncAgentWebApp:
 
         with self.lock:
             return self._build_payload_locked()
+
+    def get_lite_payload(self) -> dict[str, Any]:
+        """Return a compact polling payload for the phone-friendly lite UI."""
+
+        with self.lock:
+            state = self._get_state_snapshot_locked()
+            input_window = self._build_input_window_view(state)
+            state_view = {
+                "processing": self.processing_turn_id is not None,
+                "processing_turn_id": self.processing_turn_id,
+                "input_window": input_window,
+                "agent_status": input_window["title"],
+                "agent_status_detail": input_window["detail"],
+                "user_facing_response": state.get("user_facing_response"),
+                "guidance_events": list(state.get("guidance_events") or [])[-40:],
+                "interaction_profile": get_interaction_profile(),
+            }
+            self.updated_at = _now_display()
+            return {
+                "thread_id": self.thread_id,
+                "updated_at": self.updated_at,
+                "latest_error": self.latest_error,
+                "conversation_history": self._build_conversation_history(lite=True),
+                "input_language": self.last_input_language,
+                "output_language": self.last_output_language,
+                "state": state_view,
+                "checkpoint": self._checkpoint_view(),
+            }
+
+    def get_sim_payload(self) -> dict[str, Any]:
+        """Return a compact, read-only snapshot for the simulation map view."""
+
+        with self.lock:
+            state = self._get_state_snapshot_locked()
+            input_window = self._build_input_window_view(state)
+            controller = getattr(self.agent, "controller", None)
+            robot_state: dict[str, Any] = {}
+            if controller is not None:
+                get_current_state = getattr(controller, "get_current_state", None)
+                if callable(get_current_state):
+                    try:
+                        current = get_current_state()
+                        if isinstance(current, dict):
+                            robot_state = dict(current)
+                    except Exception as exc:
+                        robot_state = {"status": "controller_state_error", "error": str(exc)}
+            scene_memory = getattr(self.agent, "scene_memory", None)
+            keyframes: list[dict[str, Any]] = []
+            nodes = getattr(scene_memory, "keyframe_nodes", {}) if scene_memory is not None else {}
+            if isinstance(nodes, dict):
+                for node_id, node in sorted(nodes.items(), key=lambda item: int(item[0])):
+                    try:
+                        position = getattr(node, "position", None)
+                        pos_list = position.astype(float).tolist() if hasattr(position, "astype") else list(position or [])
+                        keyframes.append(
+                            {
+                                "kf_id": int(getattr(node, "kf_id", node_id)),
+                                "name": str(getattr(node, "name", node_id)),
+                                "position": pos_list[:3],
+                                "semantic_excerpt": str(getattr(node, "semantic", "") or "")[:160],
+                            }
+                        )
+                    except Exception:
+                        continue
+            active_navigation = state.get("active_navigation")
+            pending_navigation = state.get("pending_navigation")
+            navigation = active_navigation if isinstance(active_navigation, dict) else pending_navigation
+            navigation_view: dict[str, Any] = {"active": False}
+            if isinstance(navigation, dict):
+                target = navigation.get("target") if isinstance(navigation.get("target"), dict) else {}
+                label = (
+                    target.get("display_label")
+                    or target.get("user_query")
+                    or target.get("query")
+                    or target.get("object_description")
+                    or navigation.get("description")
+                    or "目标"
+                )
+                target_type = str(target.get("type") or "")
+                navigation_view = {
+                    "active": True,
+                    "task_id": navigation.get("task_id"),
+                    "plan_id": navigation.get("plan_id"),
+                    "token": navigation.get("navigation_token"),
+                    "description": navigation.get("description"),
+                    "label": str(label),
+                    "target_type": target_type,
+                    "kind": "目标物体" if target_type == "semantic_object" else "目标关键帧",
+                    "destination_position": navigation.get("destination_position"),
+                    "destination_keyframe_id": navigation.get("destination_keyframe_id"),
+                    "created_at": navigation.get("created_at"),
+                    "waiting_summary": navigation.get("waiting_summary"),
+                }
+            guidance_events = [
+                {
+                    "event_type": item.get("event_type"),
+                    "text": item.get("text"),
+                    "created_at": item.get("created_at"),
+                    "dedupe_key": item.get("dedupe_key"),
+                    "task_id": item.get("task_id"),
+                }
+                for item in list(state.get("guidance_events") or [])[-40:]
+                if isinstance(item, dict)
+            ]
+            self.updated_at = _now_display()
+            sim_meta = robot_state.get("simulation") if isinstance(robot_state.get("simulation"), dict) else {}
+            return {
+                "thread_id": self.thread_id,
+                "updated_at": self.updated_at,
+                "agent_status": input_window["title"],
+                "agent_status_detail": input_window["detail"],
+                "processing": self.processing_turn_id is not None,
+                "simulation_mode": bool(sim_meta) or str(robot_state.get("source") or "") == "simulation",
+                "robot": robot_state,
+                "navigation": navigation_view,
+                "keyframes": keyframes,
+                "guidance_events": guidance_events,
+                "latest_error": self.latest_error,
+            }
 
     def submit_message(
         self,
@@ -4210,6 +4940,41 @@ class AsyncAgentWebApp:
             "source": "robot-camera",
         }
 
+    def teleop(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Apply one manual teleop command through the attached controller."""
+
+        controller = getattr(self.agent, "controller", None)
+        if controller is None:
+            return {"status": "blocked", "error": "当前控制器不可用，暂时不能遥控小车。"}
+        command = str(payload.get("command") or "").strip().lower()
+        if command in {"stop", "emergency_stop", "zero"}:
+            stop = getattr(controller, "manual_stop", None)
+            if callable(stop):
+                result = stop(cancel_navigation=True)
+            else:
+                cancel = getattr(controller, "cancel_navigation", None)
+                if callable(cancel):
+                    cancel()
+                result = {"status": "ok", "summary": "已请求停车。"}
+        else:
+            teleop = getattr(controller, "manual_teleop", None)
+            if not callable(teleop):
+                return {"status": "blocked", "error": "当前控制器不支持网页遥控。"}
+            result = teleop(
+                linear=float(payload.get("linear") or 0.0),
+                angular=float(payload.get("angular") or 0.0),
+                mode=str(payload.get("mode") or "normal"),
+                cancel_navigation=True,
+            )
+        with self.lock:
+            self.latest_error = None
+            self.updated_at = _now_display()
+        response = {"status": "ok", "teleop": result}
+        if bool(payload.get("include_ui")):
+            with self.lock:
+                response["ui"] = self._build_payload_locked()
+        return response
+
     def _save_robot_capture_image(self, image) -> Path:
         """Persist a robot-camera snapshot so remote browser captures are auditable."""
 
@@ -4283,21 +5048,31 @@ class AsyncAgentWebHandler(BaseHTTPRequestHandler):
         """Write one JSON response with UTF-8 encoding."""
 
         encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(encoded)))
-        self.end_headers()
-        self.wfile.write(encoded)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+        except Exception as exc:
+            if _is_client_disconnect_error(exc):
+                return
+            raise
 
     def _send_html(self, html: str) -> None:
         """Write the embedded application shell as the root HTML response."""
 
         encoded = html.encode("utf-8")
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(encoded)))
-        self.end_headers()
-        self.wfile.write(encoded)
+        try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+        except Exception as exc:
+            if _is_client_disconnect_error(exc):
+                return
+            raise
 
     def _read_json_body(self) -> dict[str, Any]:
         """Decode the request body as JSON when the client sends one."""
@@ -4313,17 +5088,34 @@ class AsyncAgentWebHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         """Serve either the app shell or the latest state snapshot."""
 
-        parsed = urlparse(self.path)
-        if parsed.path == "/":
-            self._send_html(APP_HTML)
-            return
-        if parsed.path == "/api/state":
-            self._send_json(self.app.get_payload())
-            return
-        if parsed.path == "/api/current-image":
-            self._send_json(self.app.current_image_payload())
-            return
-        self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
+        try:
+            parsed = urlparse(self.path)
+            if parsed.path == "/":
+                self._send_html(APP_HTML)
+                return
+            if parsed.path in {"/lite", "/chat"}:
+                self._send_html(LITE_APP_HTML)
+                return
+            if parsed.path in {"/sim", "/simulation"}:
+                self._send_html(SIM_VIEW_HTML)
+                return
+            if parsed.path == "/api/state":
+                self._send_json(self.app.get_payload())
+                return
+            if parsed.path == "/api/lite-state":
+                self._send_json(self.app.get_lite_payload())
+                return
+            if parsed.path == "/api/sim-state":
+                self._send_json(self.app.get_sim_payload())
+                return
+            if parsed.path == "/api/current-image":
+                self._send_json(self.app.current_image_payload())
+                return
+            self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
+        except Exception as exc:
+            if _is_client_disconnect_error(exc):
+                return
+            raise
 
     def do_POST(self) -> None:
         """Handle message submission and history-clear requests."""
@@ -4355,6 +5147,10 @@ class AsyncAgentWebHandler(BaseHTTPRequestHandler):
                     )
                 )
                 return
+            if parsed.path == "/api/teleop":
+                payload = self._read_json_body()
+                self._send_json(self.app.teleop(payload))
+                return
             if parsed.path == "/api/clear":
                 self._send_json(self.app.clear_history())
                 return
@@ -4369,8 +5165,15 @@ class AsyncAgentWebHandler(BaseHTTPRequestHandler):
                 return
             self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
         except Exception as exc:
+            if _is_client_disconnect_error(exc):
+                return
             self.app.latest_error = str(exc)
-            self._send_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+            try:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+            except Exception as write_exc:
+                if _is_client_disconnect_error(write_exc):
+                    return
+                raise
 
 
 def _load_scene_memory(dataset_dir: Path) -> SceneMemory:
@@ -4436,6 +5239,58 @@ class WebDemoController:
 
     def get_status(self) -> str:
         return self._status
+
+    def cancel_navigation(self) -> None:
+        self._status = "cancelled"
+        self._latest_msg = "Navigation cancelled."
+
+    def manual_teleop(
+        self,
+        *,
+        linear: float = 0.0,
+        angular: float = 0.0,
+        mode: str = "normal",
+        cancel_navigation: bool = True,
+    ) -> dict[str, Any]:
+        if cancel_navigation:
+            self.cancel_navigation()
+        nav_cfg = config.get("navigation") if isinstance(config.get("navigation"), dict) else {}
+        slow = str(mode or "normal").strip().lower() in {"slow", "extra_slow", "safer"}
+        linear_limit = float(
+            nav_cfg.get(
+                "teleop_slow_linear_limit_mps" if slow else "teleop_linear_limit_mps",
+                0.06 if slow else 0.12,
+            )
+            or (0.06 if slow else 0.12)
+        )
+        angular_limit = float(
+            nav_cfg.get(
+                "teleop_slow_angular_limit_radps" if slow else "teleop_angular_limit_radps",
+                0.20 if slow else 0.35,
+            )
+            or (0.20 if slow else 0.35)
+        )
+        linear_cmd = max(-abs(linear_limit), min(abs(linear_limit), float(linear or 0.0)))
+        angular_cmd = max(-abs(angular_limit), min(abs(angular_limit), float(angular or 0.0)))
+        self._status = "manual_teleop"
+        self._latest_msg = (
+            f"遥控模拟：线速度 {linear_cmd:.2f}，角速度 {angular_cmd:.2f}，"
+            f"模式 {'更低速' if slow else '低速'}。"
+        )
+        return {
+            "status": "ok",
+            "linear": linear_cmd,
+            "angular": angular_cmd,
+            "mode": "slow" if slow else "normal",
+            "dry_run": True,
+        }
+
+    def manual_stop(self, *, cancel_navigation: bool = True) -> dict[str, Any]:
+        if cancel_navigation:
+            self.cancel_navigation()
+        self._status = "manual_stop"
+        self._latest_msg = "遥控模拟：已停车。"
+        return {"status": "ok", "summary": "遥控模拟：已停车。", "dry_run": True}
 
     def _nearest_keyframe_image_path(self) -> Path | None:
         if self._scene_memory is None:

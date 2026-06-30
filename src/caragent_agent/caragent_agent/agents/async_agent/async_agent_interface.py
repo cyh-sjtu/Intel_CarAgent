@@ -3,6 +3,7 @@
 import ast
 import inspect
 import json
+import math
 import os
 import re
 import select
@@ -19,6 +20,9 @@ from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import BaseModel, Field, create_model
 
 from caragent_agent.agents.async_agent.async_agent_graph import create_async_agent
+from caragent_agent.agents.async_agent.arrival_verification import (
+    build_arrival_verification,
+)
 from caragent_agent.agents.async_agent.execution.support import (
     derive_headline_turn_response,
     normalize_turn_response_items,
@@ -129,6 +133,7 @@ class AsyncAgent(BaseAgent):
         self._bind_runtime_references_to_tools()
 
         self._create_langgraph_agent()
+        self._start_session_initial_pose_recorder()
 
     def _resolve_background_worker_count(self, explicit_workers: int | None) -> int:
         """Use explicit worker count when provided, otherwise runtime profile default."""
@@ -146,6 +151,93 @@ class AsyncAgent(BaseAgent):
             )
         except Exception:
             return 0
+
+    def _start_session_initial_pose_recorder(self) -> None:
+        """Record the first valid map-frame robot pose as the session route start."""
+
+        if not self.is_navigation_mode:
+            return
+        if not getattr(self, "controller", None) or not getattr(self, "run_memory", None):
+            return
+        get_state = getattr(self.controller, "get_current_state", None)
+        if not callable(get_state):
+            return
+
+        thread = threading.Thread(
+            target=self._record_session_initial_pose_when_available,
+            name="caragent-session-initial-pose",
+            daemon=True,
+        )
+        thread.start()
+
+    def _record_session_initial_pose_when_available(self) -> None:
+        """Poll briefly after startup until localization exposes a stable map pose."""
+
+        deadline = time.monotonic() + 120.0
+        attempt = 0
+        while time.monotonic() < deadline:
+            attempt += 1
+            try:
+                state = self.controller.get_current_state()
+            except Exception as exc:
+                state = {"source": "unavailable", "error": str(exc)}
+
+            if isinstance(state, dict):
+                source = str(state.get("source") or "").strip()
+                position = state.get("position")
+                if source in {"tf", "simulation"} and self._is_valid_pose_position(position):
+                    details = {
+                        "controller_status": state.get("status"),
+                        "state_source": source,
+                        "record_attempt": attempt,
+                    }
+                    if state.get("yaw_deg") is not None:
+                        details["yaw_deg"] = state.get("yaw_deg")
+                    recorded = self.run_memory.record_session_initial_pose(
+                        position=[
+                            float(position[0]),
+                            float(position[1]),
+                            float(position[2]) if len(position) >= 3 else 0.0,
+                        ],
+                        orientation=state.get("orientation"),
+                        source=source,
+                        details=details,
+                    )
+                    if recorded and hasattr(self, "logger") and self.logger:
+                        try:
+                            self.logger.log_foreground(
+                                "RunMemory: Session initial pose recorded: "
+                                f"[{float(position[0]):.3f}, {float(position[1]):.3f}, "
+                                f"{float(position[2]) if len(position) >= 3 else 0.0:.3f}] "
+                                f"source={source}"
+                            )
+                        except Exception:
+                            pass
+                    return
+
+            time.sleep(1.0)
+
+        if hasattr(self, "logger") and self.logger:
+            try:
+                self.logger.log_foreground(
+                    "RunMemory: Session initial pose was not recorded because no map-frame pose became available."
+                )
+            except Exception:
+                pass
+
+    @staticmethod
+    def _is_valid_pose_position(position: Any) -> bool:
+        if not isinstance(position, (list, tuple)) or len(position) < 2:
+            return False
+        try:
+            values = [
+                float(position[0]),
+                float(position[1]),
+                float(position[2]) if len(position) >= 3 else 0.0,
+            ]
+        except Exception:
+            return False
+        return all(math.isfinite(value) for value in values)
 
     def _qwen_enable_thinking_for_role(self, role: str | None) -> bool:
         """Return whether DashScope/Qwen thinking mode should be enabled.
@@ -608,9 +700,17 @@ class AsyncAgent(BaseAgent):
         message: str,
         state: dict[str, Any],
         *,
-        tolerance_m: float = 0.5,
+        tolerance_m: float | None = None,
     ) -> bool:
         """Reject stale controller arrival messages from a previous navigation leg."""
+
+        if tolerance_m is None:
+            nav_cfg = config.get("navigation") if isinstance(config.get("navigation"), dict) else {}
+            try:
+                tolerance_m = float(nav_cfg.get("controller_arrival_match_tolerance_m", 2.0))
+            except Exception:
+                tolerance_m = 2.0
+        tolerance_m = max(0.5, float(tolerance_m))
 
         if not isinstance(state, dict):
             return False
@@ -646,7 +746,7 @@ class AsyncAgent(BaseAgent):
         except Exception:
             return True
 
-        return (dx * dx + dy * dy) ** 0.5 <= float(tolerance_m)
+        return (dx * dx + dy * dy) ** 0.5 <= tolerance_m
 
     def _resolve_navigation_arrival_task_id(
         self,
@@ -716,6 +816,45 @@ class AsyncAgent(BaseAgent):
         content = str(message or "").strip()
         active_navigation = state.get("active_navigation") if isinstance(state, dict) else None
 
+        def attach_arrival_verification(event: dict[str, Any]) -> dict[str, Any]:
+            if event.get("type") != "navigation_arrived":
+                return event
+            payload = event.setdefault("payload", {})
+            if not isinstance(payload, dict):
+                return event
+            tasks = state.get("tasks") if isinstance(state, dict) else {}
+            if not isinstance(tasks, dict):
+                return event
+            task_id = event.get("task_id")
+            arrived_task = tasks.get(task_id) if task_id is not None else None
+            if not isinstance(arrived_task, dict):
+                return event
+            try:
+                verification = build_arrival_verification(
+                    arrived_task=arrived_task,
+                    tasks=tasks,
+                    tools=self._get_langchain_tools(),
+                    event_payload=payload,
+                )
+            except Exception as exc:
+                verification = {
+                    "type": "arrival_verification",
+                    "target_label": str(arrived_task.get("description") or "目标").strip(),
+                    "target_type": "unknown",
+                    "seen": None,
+                    "confidence": "error",
+                    "reason": str(exc),
+                    "message": "",
+                }
+            if verification:
+                payload["arrival_verification"] = verification
+                if self.enable_logging and self.logger:
+                    self.logger.log_foreground(
+                        "arrival_verification: "
+                        + json.dumps(verification, ensure_ascii=False, default=str)
+                    )
+            return event
+
         def attach_arrival_capture(event: dict[str, Any]) -> dict[str, Any]:
             payload = event.setdefault("payload", {})
             if not isinstance(payload, dict):
@@ -724,7 +863,7 @@ class AsyncAgent(BaseAgent):
                 return event
             agent_cfg = config.get("agent") if isinstance(config.get("agent"), dict) else {}
             if not bool(agent_cfg.get("capture_view_on_navigation_arrival", True)):
-                return event
+                return attach_arrival_verification(event)
             image_format = str(agent_cfg.get("arrival_capture_image_format") or "jpg").strip() or "jpg"
             note_parts = ["navigation_arrived"]
             if payload.get("destination_description"):
@@ -746,7 +885,7 @@ class AsyncAgent(BaseAgent):
                         "arrival_current_view_capture_failed: "
                         + json.dumps(payload["arrival_capture_error"], ensure_ascii=False, default=str)
                     )
-                return event
+                return attach_arrival_verification(event)
             data = (
                 capture_result.get("data")
                 if isinstance(capture_result, dict) and isinstance(capture_result.get("data"), dict)
@@ -787,9 +926,16 @@ class AsyncAgent(BaseAgent):
                         "arrival_current_view_capture_failed: "
                         + json.dumps(payload["arrival_capture_error"], ensure_ascii=False, default=str)
                     )
-            return event
+            return attach_arrival_verification(event)
 
         if isinstance(active_navigation, dict):
+            nav_cfg = config.get("navigation") if isinstance(config.get("navigation"), dict) else {}
+            try:
+                arrival_match_tolerance = float(
+                    nav_cfg.get("controller_arrival_match_tolerance_m", 2.0)
+                )
+            except Exception:
+                arrival_match_tolerance = 2.0
             event = build_navigation_arrival_event(
                 ToolMessage(content=content, tool_call_id=new_structured_id("controller_message")),
                 messages=list(state.get("messages") or []),
@@ -797,7 +943,7 @@ class AsyncAgent(BaseAgent):
                 current_task_id=state.get("current_task_id"),
                 current_plan_id=state.get("current_plan_id"),
                 active_navigation=active_navigation,
-                match_tolerance_meters=0.5,
+                match_tolerance_meters=max(0.5, arrival_match_tolerance),
             )
             event["message_id"] = new_structured_id("controller_message")
             payload = event.setdefault("payload", {})
@@ -1667,6 +1813,7 @@ class AsyncAgent(BaseAgent):
         role: str,
         *,
         on_update: Any = None,
+        original_message: str | None = None,
     ) -> dict[str, Any]:
         """Run one message turn and return structured results for UI or CLI callers."""
 
@@ -1689,8 +1836,15 @@ class AsyncAgent(BaseAgent):
             baseline_turn_responses = self._extract_turn_response_items(
                 self.get_thread_state(thread_id)
             )
+            message_payload: dict[str, Any] = {"role": role, "content": message}
+            clean_original_message = str(original_message or "").strip()
+            if clean_original_message and clean_original_message != str(message or "").strip():
+                message_payload["additional_kwargs"] = {
+                    "original_content": clean_original_message,
+                    "agent_content": str(message or ""),
+                }
             for chunk in self.agent.stream(
-                {"messages": [{"role": role, "content": message}]},
+                {"messages": [message_payload]},
                 config_dict,
                 stream_mode="updates",
             ):

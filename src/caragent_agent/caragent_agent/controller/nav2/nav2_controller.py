@@ -6,6 +6,7 @@ import json
 import math
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -95,9 +96,11 @@ class Nav2Controller(Base_Controller):
         final_align_enabled: bool = True,
         yaw_tolerance_deg: float = 4.0,
         settle_time_sec: float = 0.7,
-        fast_omega: float = 1.45,
-        mid_omega: float = 0.95,
-        slow_omega: float = 0.40,
+        fast_omega: float = 3.40,
+        mid_omega: float = 2.50,
+        slow_omega: float = 1.50,
+        fast_threshold_deg: float = 20.0,
+        mid_threshold_deg: float = 10.0,
         rotation_timeout_sec: float = 15.0,
         rotation_loop_rate_hz: float = 20.0,
         right_turn_shortcut_deg: float = 90.0,
@@ -128,6 +131,8 @@ class Nav2Controller(Base_Controller):
         self._fast_omega = max(0.0, float(fast_omega))
         self._mid_omega = max(0.0, float(mid_omega))
         self._slow_omega = max(0.0, float(slow_omega))
+        self._fast_threshold_rad = math.radians(max(0.0, float(fast_threshold_deg)))
+        self._mid_threshold_rad = math.radians(max(0.0, float(mid_threshold_deg)))
         self._rotation_timeout_sec = max(0.5, float(rotation_timeout_sec))
         self._rotation_loop_period_sec = 1.0 / max(1.0, float(rotation_loop_rate_hz))
         self._right_turn_shortcut_rad = math.radians(
@@ -175,7 +180,46 @@ class Nav2Controller(Base_Controller):
         self._sim_image_cache: tuple[int, PILImage.Image] | None = None
         self._sim_right_image_cache: tuple[int, PILImage.Image] | None = None
         self._sim_image_metadata: dict[str, Any] | None = None
+        nav_cfg = config.get("navigation") if isinstance(config.get("navigation"), dict) else {}
         self._cmd_vel_pub = node.create_publisher(Twist, "/cmd_vel", 10)
+        self._teleop_cmd_vel_topic = str(nav_cfg.get("teleop_cmd_vel_topic") or "/cmd_vel_nav").strip() or "/cmd_vel_nav"
+        self._teleop_cmd_vel_pub = (
+            self._cmd_vel_pub
+            if self._teleop_cmd_vel_topic == "/cmd_vel"
+            else node.create_publisher(Twist, self._teleop_cmd_vel_topic, 10)
+        )
+        stop_topics = nav_cfg.get("teleop_stop_topics")
+        if not isinstance(stop_topics, list) or not stop_topics:
+            stop_topics = ["/cmd_vel", self._teleop_cmd_vel_topic]
+        self._teleop_stop_publishers = []
+        seen_stop_topics: set[str] = set()
+        for topic in stop_topics:
+            topic_name = str(topic or "").strip()
+            if not topic_name or topic_name in seen_stop_topics:
+                continue
+            seen_stop_topics.add(topic_name)
+            publisher = self._cmd_vel_pub if topic_name == "/cmd_vel" else node.create_publisher(Twist, topic_name, 10)
+            self._teleop_stop_publishers.append((topic_name, publisher))
+        self._teleop_linear_limit_mps = max(0.0, float(nav_cfg.get("teleop_linear_limit_mps", 0.12)))
+        self._teleop_angular_limit_radps = max(0.0, float(nav_cfg.get("teleop_angular_limit_radps", 0.35)))
+        self._teleop_slow_linear_limit_mps = max(0.0, float(nav_cfg.get("teleop_slow_linear_limit_mps", 0.06)))
+        self._teleop_slow_angular_limit_radps = max(0.0, float(nav_cfg.get("teleop_slow_angular_limit_radps", 0.20)))
+        self._teleop_timeout_sec = max(0.05, float(nav_cfg.get("teleop_timeout_sec", 0.30)))
+        self._teleop_deadline_monotonic = 0.0
+        self._teleop_watchdog_active = False
+        self._route_record_enabled = bool(nav_cfg.get("route_record_enabled", True))
+        self._route_record_rate_hz = max(0.2, float(nav_cfg.get("route_record_rate_hz", 4.0)))
+        self._route_record_min_distance_m = max(0.0, float(nav_cfg.get("route_record_min_distance_m", 0.02)))
+        self._route_record_dir = Path(
+            str(
+                nav_cfg.get("route_record_dir")
+                or Path(str(config.get("log_dir", "/home/car/caragent_ws/logs/caragent_agent"))).parent
+                / "navigation_routes"
+            )
+        ).expanduser()
+        self._route_record: dict[str, Any] | None = None
+        self._route_record_last_sample_monotonic = 0.0
+        self._route_record_last_position: list[float] | None = None
         self._action_client = ActionClient(node, NavigateToPose, action_name)
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, node)
@@ -249,6 +293,12 @@ class Nav2Controller(Base_Controller):
             self._current_goal_final_yaw_deg = final_yaw_deg
             self._cancel_requested = False
             self._latest_msg = ""
+        self._start_route_record(
+            goal_sequence=goal_sequence,
+            goal_position=goal_position,
+            final_yaw_deg=final_yaw_deg,
+            nav_yaw_deg=nav_yaw_deg,
+        )
 
         self._node.get_logger().info(
             "Nav2 handoff debug: seq={seq} goal=({x:.3f},{y:.3f},{z:.3f}) "
@@ -285,10 +335,12 @@ class Nav2Controller(Base_Controller):
         if self._dry_run:
             self.update_status("dry_run_dispatched")
             self.update_latest_msg(self._arrival_message(goal_position))
+            self._finish_route_record(goal_sequence, status="dry_run_arrived", reason="Dry-run navigation completed.")
             return
 
         if not self._action_client.wait_for_server(timeout_sec=5.0):
             self.update_status("failed")
+            self._finish_route_record(goal_sequence, status="failed", reason=f"Nav2 action server '{self._action_name}' is unavailable.")
             raise RuntimeError(f"Nav2 action server '{self._action_name}' is unavailable.")
 
         if not self._wait_for_localization_handoff(
@@ -296,6 +348,14 @@ class Nav2Controller(Base_Controller):
             stage="before-pre-align",
         ):
             self.update_status("failed")
+            self._finish_route_record(
+                goal_sequence,
+                status="failed",
+                reason=(
+                    "Localization handoff gate failed before pre-align/Nav2 dispatch: "
+                    f"{self._get_localization_handoff_reason()}"
+                ),
+            )
             raise RuntimeError(
                 "Localization handoff gate failed before pre-align/Nav2 dispatch: "
                 f"{self._get_localization_handoff_reason()}"
@@ -360,17 +420,26 @@ class Nav2Controller(Base_Controller):
                 stage="after-pre-align",
             ):
                 self.update_status("failed")
+                self._finish_route_record(
+                    goal_sequence,
+                    status="failed",
+                    reason=(
+                        "Localization handoff gate failed after pre-align; Nav2 goal was not dispatched: "
+                        f"{self._get_localization_handoff_reason()}"
+                    ),
+                )
                 raise RuntimeError(
                     "Localization handoff gate failed after pre-align; Nav2 goal was not dispatched: "
                     f"{self._get_localization_handoff_reason()}"
-                )
+            )
             self._node.get_logger().info(
-                "Nav2 handoff debug: after-pre-align advisory complete seq={seq}: {reason}".format(
+                "Nav2 handoff debug: after-pre-align gate complete seq={seq}: {reason}".format(
                     seq=goal_sequence,
                     reason=self._get_localization_handoff_reason(),
                 )
             )
 
+        pose.header.stamp = self._node.get_clock().now().to_msg()
         goal = NavigateToPose.Goal()
         goal.pose = pose
         self.update_status("navigating")
@@ -678,6 +747,7 @@ class Nav2Controller(Base_Controller):
         with self._lock:
             self._latest_odom = msg
             self._latest_odom_monotonic = time.monotonic()
+        self._sample_route_record()
 
     def _on_scan(self, msg: LaserScan) -> None:
         with self._lock:
@@ -688,6 +758,191 @@ class Nav2Controller(Base_Controller):
         grid = _occupancy_grid_to_dict(msg, self._map_topic)
         with self._lock:
             self._latest_map = grid
+
+    def _start_route_record(
+        self,
+        *,
+        goal_sequence: int,
+        goal_position: list[float],
+        final_yaw_deg: float,
+        nav_yaw_deg: float,
+    ) -> None:
+        if not self._route_record_enabled:
+            return
+        with self._lock:
+            existing_record = self._route_record
+        if isinstance(existing_record, dict):
+            try:
+                existing_sequence = int(existing_record.get("goal_sequence"))
+            except Exception:
+                existing_sequence = -1
+            if existing_sequence != int(goal_sequence):
+                self._finish_route_record(
+                    existing_sequence,
+                    status="superseded",
+                    reason="A new navigation goal started before this route finished.",
+                )
+        started_at = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        record = {
+            "schema_version": 1,
+            "route_id": f"route_{started_at}_seq{int(goal_sequence)}",
+            "started_at": started_at,
+            "goal_sequence": int(goal_sequence),
+            "action_name": self._action_name,
+            "global_frame": self._global_frame,
+            "base_frame": self._base_frame,
+            "goal": {
+                "position": [float(goal_position[0]), float(goal_position[1]), float(goal_position[2])],
+                "final_yaw_deg": float(final_yaw_deg),
+                "nav_yaw_deg": float(nav_yaw_deg),
+            },
+            "sampling": {
+                "rate_hz": self._route_record_rate_hz,
+                "min_distance_m": self._route_record_min_distance_m,
+            },
+            "samples": [],
+            "_started_monotonic": time.monotonic(),
+        }
+        with self._lock:
+            self._route_record = record
+            self._route_record_last_sample_monotonic = 0.0
+            self._route_record_last_position = None
+        self._sample_route_record(force=True)
+
+    def _sample_route_record(self, *, force: bool = False) -> None:
+        if not self._route_record_enabled:
+            return
+        now = time.monotonic()
+        with self._lock:
+            record = self._route_record
+            last_sample_time = self._route_record_last_sample_monotonic
+            last_position = (
+                list(self._route_record_last_position)
+                if self._route_record_last_position is not None
+                else None
+            )
+        if not isinstance(record, dict):
+            return
+        min_period = 1.0 / max(0.2, self._route_record_rate_hz)
+        if not force and now - last_sample_time < min_period:
+            return
+        if self._simulation_mode:
+            state = self.get_current_state()
+            source = "simulation"
+        else:
+            state = self._lookup_map_base_state(timeout_sec=0.0)
+            source = "tf"
+        if state is None:
+            fallback = self._get_odom_state()
+            if fallback is None:
+                return
+            state = fallback
+            source = "odom"
+        position = state.get("position") if isinstance(state, dict) else None
+        if not isinstance(position, (list, tuple)) or len(position) < 2:
+            return
+        try:
+            sample_position = [
+                float(position[0]),
+                float(position[1]),
+                float(position[2]) if len(position) >= 3 else 0.0,
+            ]
+        except Exception:
+            return
+        if (
+            not force
+            and last_position is not None
+            and math.hypot(sample_position[0] - last_position[0], sample_position[1] - last_position[1])
+            < self._route_record_min_distance_m
+        ):
+            return
+        yaw_rad = state.get("yaw") if isinstance(state, dict) else None
+        orientation = state.get("orientation") if isinstance(state, dict) else None
+        if yaw_rad is None and isinstance(orientation, (list, tuple)) and len(orientation) >= 4:
+            try:
+                yaw_rad = _quaternion_to_yaw_rad(orientation)
+            except Exception:
+                yaw_rad = None
+        sample = {
+            "t_sec": round(now - float(record.get("_started_monotonic", now)), 3),
+            "monotonic_sec": round(now, 3),
+            "x": sample_position[0],
+            "y": sample_position[1],
+            "z": sample_position[2],
+            "yaw_deg": math.degrees(float(yaw_rad)) if yaw_rad is not None else None,
+            "source": source,
+        }
+        with self._lock:
+            current = self._route_record
+            if not isinstance(current, dict) or current.get("route_id") != record.get("route_id"):
+                return
+            current.setdefault("_started_monotonic", now)
+            if sample["t_sec"] == 0.0 and current.get("samples"):
+                sample["t_sec"] = round(now - float(current.get("_started_monotonic", now)), 3)
+            current.setdefault("samples", []).append(sample)
+            self._route_record_last_sample_monotonic = now
+            self._route_record_last_position = sample_position
+
+    def _finish_route_record(self, goal_sequence: int, *, status: str, reason: str = "") -> None:
+        if not self._route_record_enabled:
+            return
+        self._sample_route_record(force=True)
+        with self._lock:
+            record = self._route_record
+            if not isinstance(record, dict) or int(record.get("goal_sequence") or -1) != int(goal_sequence):
+                return
+            self._route_record = None
+            self._route_record_last_sample_monotonic = 0.0
+            self._route_record_last_position = None
+        finished_at = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        samples = list(record.get("samples") or [])
+        public_record = {key: value for key, value in record.items() if not str(key).startswith("_")}
+        public_record["finished_at"] = finished_at
+        public_record["status"] = str(status or "unknown")
+        public_record["reason"] = str(reason or "")
+        public_record["sample_count"] = len(samples)
+        if samples:
+            total_distance = 0.0
+            prev = samples[0]
+            for sample in samples[1:]:
+                total_distance += math.hypot(float(sample["x"]) - float(prev["x"]), float(sample["y"]) - float(prev["y"]))
+                prev = sample
+            public_record["distance_m"] = round(total_distance, 3)
+            public_record["start_position"] = {
+                "x": samples[0].get("x"),
+                "y": samples[0].get("y"),
+                "z": samples[0].get("z"),
+            }
+            public_record["end_position"] = {
+                "x": samples[-1].get("x"),
+                "y": samples[-1].get("y"),
+                "z": samples[-1].get("z"),
+            }
+        try:
+            self._route_record_dir.mkdir(parents=True, exist_ok=True)
+            base = self._route_record_dir / public_record["route_id"]
+            json_path = base.with_suffix(".json")
+            csv_path = base.with_suffix(".csv")
+            json_path.write_text(json.dumps(public_record, ensure_ascii=False, indent=2), encoding="utf-8")
+            csv_lines = ["t_sec,monotonic_sec,x,y,z,yaw_deg,source"]
+            for sample in samples:
+                csv_lines.append(
+                    "{t_sec},{monotonic_sec},{x},{y},{z},{yaw_deg},{source}".format(
+                        t_sec=sample.get("t_sec", ""),
+                        monotonic_sec=sample.get("monotonic_sec", ""),
+                        x=sample.get("x", ""),
+                        y=sample.get("y", ""),
+                        z=sample.get("z", ""),
+                        yaw_deg="" if sample.get("yaw_deg") is None else sample.get("yaw_deg"),
+                        source=sample.get("source", ""),
+                    )
+                )
+            csv_path.write_text("\n".join(csv_lines) + "\n", encoding="utf-8")
+            self._node.get_logger().info(
+                f"Navigation route recorded: {json_path} samples={len(samples)} status={status}"
+            )
+        except Exception as exc:
+            self._node.get_logger().warning(f"Failed to write navigation route record: {exc}")
 
     def _ros_image_to_pil(self, msg: ROSImage) -> PILImage.Image:
         encoding = (msg.encoding or "").lower()
@@ -795,51 +1050,12 @@ class Nav2Controller(Base_Controller):
         timeout_sec = self._localization_handoff_timeout_sec
         stage_key = str(stage or "").strip().lower()
         readiness_only = stage_key == "before-pre-align"
-        soft_stability = stage_key == "after-pre-align"
-        if soft_stability:
-            fresh, reason = self._handoff_sensors_are_fresh()
-            state = self._lookup_map_base_state(timeout_sec=0.05) if fresh else None
-            if state is not None:
-                position = state.get("position")
-                yaw = state.get("yaw")
-                detail = (
-                    "advisory ready; dispatching immediately: "
-                    "x={x:.3f}, y={y:.3f}, yaw={yaw:.2f}deg {fresh}".format(
-                        x=float(position[0])
-                        if isinstance(position, (list, tuple)) and position
-                        else float("nan"),
-                        y=float(position[1])
-                        if isinstance(position, (list, tuple)) and len(position) > 1
-                        else float("nan"),
-                        yaw=math.degrees(float(yaw)) if yaw is not None else float("nan"),
-                        fresh=reason,
-                    )
-                )
-                self._set_localization_handoff_reason(f"{stage}: {detail}")
-                self._node.get_logger().info(
-                    "Localization handoff advisory passed ({stage}); {detail}".format(
-                        stage=stage,
-                        detail=detail,
-                    )
-                )
-            else:
-                detail = reason if fresh else "sensors not fresh"
-                self._set_localization_handoff_reason(
-                    f"{stage}: advisory unavailable; dispatching immediately: {detail}"
-                )
-                self._node.get_logger().warning(
-                    "Localization handoff advisory unavailable ({stage}); dispatching Nav2 immediately: "
-                    "{reason}".format(
-                        stage=stage,
-                        reason=detail,
-                    )
-                )
-            return True
         settle_sec = self._localization_handoff_settle_sec
         max_translation = self._localization_handoff_max_translation_m
         max_yaw = self._localization_handoff_max_yaw_rad
         started = time.monotonic()
         samples: list[tuple[float, float, float, float]] = []
+        window_slack_sec = max(0.15, min(0.35, settle_sec * 0.25))
         last_reason = "waiting for localization samples"
         self._node.get_logger().info(
             "Localization handoff gate started ({stage}): "
@@ -908,9 +1124,17 @@ class Nav2Controller(Base_Controller):
                 return True
 
             samples.append((now, float(position[0]), float(position[1]), float(yaw)))
-            min_time = now - settle_sec
+            min_time = now - settle_sec - window_slack_sec
             samples = [sample for sample in samples if sample[0] >= min_time]
-            if samples and samples[-1][0] - samples[0][0] >= settle_sec:
+            sample_span = samples[-1][0] - samples[0][0] if samples else 0.0
+            last_reason = (
+                "collecting localization samples: samples={samples} span={span:.2f}s/{settle:.2f}s".format(
+                    samples=len(samples),
+                    span=sample_span,
+                    settle=settle_sec,
+                )
+            )
+            if samples and sample_span >= settle_sec:
                 x0, y0, yaw0 = samples[0][1], samples[0][2], samples[0][3]
                 max_translation_seen = max(
                     math.hypot(sample[1] - x0, sample[2] - y0)
@@ -967,12 +1191,57 @@ class Nav2Controller(Base_Controller):
         with self._lock:
             goal_handle = self._goal_handle
             self._cancel_requested = True
+            goal_sequence = self._active_goal_sequence
         if goal_handle is not None:
             goal_handle.cancel_goal_async()
         if not self._simulation_mode:
             self._publish_stop()
         self.update_status("cancelled")
         self.update_latest_msg("Navigation cancelled.")
+        self._finish_route_record(goal_sequence, status="cancelled", reason="Navigation cancelled.")
+
+    def manual_teleop(
+        self,
+        *,
+        linear: float = 0.0,
+        angular: float = 0.0,
+        mode: str = "normal",
+        cancel_navigation: bool = True,
+    ) -> dict[str, Any]:
+        """Publish a conservative manual velocity command with timeout stop."""
+
+        current_status = self.get_status()
+        if cancel_navigation and current_status not in {"manual_teleop", "manual_stop"}:
+            self.cancel_navigation()
+        normalized_mode = str(mode or "normal").strip().lower()
+        slow = normalized_mode in {"slow", "extra_slow", "safer"}
+        linear_limit = self._teleop_slow_linear_limit_mps if slow else self._teleop_linear_limit_mps
+        angular_limit = self._teleop_slow_angular_limit_radps if slow else self._teleop_angular_limit_radps
+        linear_cmd = max(-linear_limit, min(linear_limit, float(linear or 0.0)))
+        angular_cmd = max(-angular_limit, min(angular_limit, float(angular or 0.0)))
+        with self._lock:
+            self._teleop_deadline_monotonic = time.monotonic() + self._teleop_timeout_sec
+        self._publish_manual_velocity(linear_cmd, angular_cmd)
+        self.update_status("manual_teleop")
+        self.update_latest_msg("Manual teleop command received.")
+        self._ensure_teleop_watchdog()
+        return {
+            "status": "ok",
+            "linear": linear_cmd,
+            "angular": angular_cmd,
+            "mode": "slow" if slow else "normal",
+            "timeout_sec": self._teleop_timeout_sec,
+        }
+
+    def manual_stop(self, *, cancel_navigation: bool = True) -> dict[str, Any]:
+        if cancel_navigation:
+            self.cancel_navigation()
+        with self._lock:
+            self._teleop_deadline_monotonic = 0.0
+        self._publish_teleop_stop()
+        self.update_status("manual_stop")
+        self.update_latest_msg("Manual stop command received.")
+        return {"status": "ok", "summary": "Manual stop command received."}
 
     def _dispatch_simulated_navigation(
         self,
@@ -1033,6 +1302,7 @@ class Nav2Controller(Base_Controller):
             self._sim_yaw_deg = float(final_yaw_deg)
         self.update_status("arrived")
         self.update_latest_msg(self._arrival_message(goal_position))
+        self._finish_route_record(goal_sequence, status="arrived", reason="Simulation navigation arrived.")
         self._node.get_logger().info(
             f"Simulation navigation arrived; arrival message queued. goal_sequence={goal_sequence}"
         )
@@ -1049,6 +1319,7 @@ class Nav2Controller(Base_Controller):
             if self._is_active_goal_sequence(goal_sequence):
                 self.update_status("failed")
                 self.update_latest_msg(f"Nav2 goal request failed: {exc}")
+                self._finish_route_record(goal_sequence, status="failed", reason=f"Nav2 goal request failed: {exc}")
             return
 
         if not goal_handle.accepted:
@@ -1056,6 +1327,7 @@ class Nav2Controller(Base_Controller):
                 self.update_status("failed")
                 self.update_latest_msg("Nav2 goal rejected.")
                 self._node.get_logger().warning("Nav2 goal rejected by action server.")
+                self._finish_route_record(goal_sequence, status="failed", reason="Nav2 goal rejected.")
             return
 
         with self._lock:
@@ -1083,6 +1355,7 @@ class Nav2Controller(Base_Controller):
                 self.update_status("failed")
                 self.update_latest_msg(f"Nav2 result failed: {exc}")
                 self._node.get_logger().error(f"Nav2 result future failed: {exc}")
+                self._finish_route_record(goal_sequence, status="failed", reason=f"Nav2 result failed: {exc}")
             return
 
         state = self.get_current_state()
@@ -1099,12 +1372,18 @@ class Nav2Controller(Base_Controller):
             self._node.get_logger().warning(
                 f"Nav2 reported SUCCEEDED outside arrival tolerance; not treating as arrived.{debug_suffix}"
             )
+            self._finish_route_record(
+                goal_sequence,
+                status="failed",
+                reason=f"Nav2 reported SUCCEEDED outside arrival tolerance.{debug_suffix}",
+            )
         elif status == 4:
             self._handle_arrived(position, goal_sequence, "Nav2 reported SUCCEEDED")
         elif status == 5:
             self.update_status("cancelled")
             self.update_latest_msg("Navigation goal was cancelled.")
             self._node.get_logger().warning(f"Nav2 goal cancelled.{debug_suffix}")
+            self._finish_route_record(goal_sequence, status="cancelled", reason=f"Nav2 goal cancelled.{debug_suffix}")
         elif status == 6 and self._is_within_arrival_tolerance(distance_to_goal):
             self._node.get_logger().warning(
                 "Nav2 reported ABORTED, but robot is within arrival tolerance; treating as arrived. "
@@ -1115,6 +1394,11 @@ class Nav2Controller(Base_Controller):
             self.update_status("failed")
             self.update_latest_msg(f"Navigation goal finished with status {status}.{debug_suffix}")
             self._node.get_logger().warning(f"Nav2 goal finished without arrival status.{debug_suffix}")
+            self._finish_route_record(
+                goal_sequence,
+                status="failed",
+                reason=f"Navigation goal finished with status {status}.{debug_suffix}",
+            )
 
     def _is_active_goal_sequence(self, goal_sequence: int) -> bool:
         with self._lock:
@@ -1176,11 +1460,17 @@ class Nav2Controller(Base_Controller):
                 self._node.get_logger().warning(
                     f"{reason}; final left-only alignment failed before timeout."
                 )
+                self._finish_route_record(
+                    goal_sequence,
+                    status="arrived_alignment_failed",
+                    reason=f"{reason}; final left-only alignment failed before timeout.",
+                )
                 return
 
         self.update_status("arrived")
         self.update_latest_msg(self._arrival_message(position))
         self._node.get_logger().info(f"{reason}; arrival message queued.")
+        self._finish_route_record(goal_sequence, status="arrived", reason=reason)
 
     def _rotate_left_only_to_yaw(self, target_yaw_rad: float, *, goal_sequence: int, stage: str) -> bool:
         start_time = time.monotonic()
@@ -1236,9 +1526,9 @@ class Nav2Controller(Base_Controller):
         return False
 
     def _omega_for_left_only_delta(self, ccw_delta: float) -> float:
-        if ccw_delta > math.radians(45.0):
+        if ccw_delta > self._fast_threshold_rad:
             return self._fast_omega
-        if ccw_delta > math.radians(15.0):
+        if ccw_delta > self._mid_threshold_rad:
             return self._mid_omega
         return self._slow_omega
 
@@ -1258,8 +1548,53 @@ class Nav2Controller(Base_Controller):
         msg.angular.z = float(angular_z)
         self._cmd_vel_pub.publish(msg)
 
+    def _publish_manual_velocity(self, linear_x: float, angular_z: float) -> None:
+        if self._simulation_mode:
+            return
+        msg = Twist()
+        msg.linear.x = float(linear_x)
+        msg.angular.z = float(angular_z)
+        self._teleop_cmd_vel_pub.publish(msg)
+
     def _publish_stop(self) -> None:
         self._cmd_vel_pub.publish(Twist())
+
+    def _publish_teleop_stop(self) -> None:
+        msg = Twist()
+        if not self._teleop_stop_publishers:
+            self._publish_stop()
+            return
+        for _topic_name, publisher in self._teleop_stop_publishers:
+            publisher.publish(msg)
+
+    def _ensure_teleop_watchdog(self) -> None:
+        with self._lock:
+            if self._teleop_watchdog_active:
+                return
+            self._teleop_watchdog_active = True
+        threading.Thread(
+            target=self._teleop_watchdog_loop,
+            name="caragent-manual-teleop-watchdog",
+            daemon=True,
+        ).start()
+
+    def _teleop_watchdog_loop(self) -> None:
+        try:
+            while True:
+                with self._lock:
+                    deadline = float(self._teleop_deadline_monotonic or 0.0)
+                if deadline <= 0.0:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    self._publish_teleop_stop()
+                    self.update_status("manual_stop")
+                    break
+                time.sleep(min(0.05, max(0.01, remaining)))
+        finally:
+            with self._lock:
+                self._teleop_watchdog_active = False
+                self._teleop_deadline_monotonic = 0.0
 
     def _distance_to_current_goal(self, position: Any) -> float | None:
         if not isinstance(position, (list, tuple)) or len(position) < 2:

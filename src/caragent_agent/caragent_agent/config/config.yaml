@@ -30,6 +30,7 @@ llm_request_timeout_sec:
   qwen3-vl-plus: 70
   qwen-vl-max: 70
   qwen3-vl-flash: 60
+object_approach_vlm_select_timeout_sec: 22
 llm_max_retries: 1
 llm_enable_text_fallback: true
 llm_fallback_models:
@@ -53,6 +54,7 @@ navigation:
   map_topic: /global_costmap/costmap
   action_timeout_sec: 120
   arrival_tolerance_m: 0.25
+  controller_arrival_match_tolerance_m: 2.0
   dry_run_navigation: false
   # Workflow simulation mode keeps Agent/planner/executor/background logic real,
   # but does not send Nav2 actions or cmd_vel. It waits, then updates a virtual
@@ -71,9 +73,11 @@ navigation:
   final_align_enabled: true
   yaw_tolerance_deg: 6.0
   settle_time_sec: 0.7
-  fast_omega: 1.45
-  mid_omega: 0.95
-  slow_omega: 0.40
+  fast_omega: 3.40
+  mid_omega: 2.50
+  slow_omega: 1.50
+  fast_threshold_deg: 20.0
+  mid_threshold_deg: 10.0
   rotation_timeout_sec: 45.0
   rotation_loop_rate_hz: 20.0
   right_turn_shortcut_deg: 90.0
@@ -81,11 +85,28 @@ navigation:
   # Before pre-align it only requires fresh scan/odom and a valid map->base_link
   # transform. After pre-align it waits briefly for pose stability before Nav2.
   localization_handoff_gate_enabled: true
-  localization_handoff_settle_sec: 1.0
-  localization_handoff_timeout_sec: 2.0
-  localization_handoff_max_translation_m: 0.12
-  localization_handoff_max_yaw_deg: 8.0
+  localization_handoff_settle_sec: 1.8
+  localization_handoff_timeout_sec: 5.0
+  localization_handoff_max_translation_m: 0.08
+  localization_handoff_max_yaw_deg: 4.0
   localization_handoff_sensor_max_age_sec: 1.5
+  arrival_verification_enabled: false
+  arrival_verification_semantic_only: true
+  object_arrival_verify_stop_distance_m: 0.8
+  object_arrival_near_threshold_m: 1.2
+  teleop_linear_limit_mps: 0.18
+  teleop_angular_limit_radps: 0.50
+  teleop_slow_linear_limit_mps: 0.06
+  teleop_slow_angular_limit_radps: 0.20
+  teleop_timeout_sec: 0.30
+  # Manual UI teleop feeds the Nav2 velocity smoother; emergency stops also
+  # publish zero velocity directly to the base command topic.
+  teleop_cmd_vel_topic: /cmd_vel_nav
+  teleop_stop_topics: [/cmd_vel_nav, /cmd_vel]
+  route_record_enabled: true
+  route_record_rate_hz: 4.0
+  route_record_min_distance_m: 0.02
+  route_record_dir: /home/car/caragent_ws/logs/navigation_routes
 
 agent:
   is_navigation_mode: true
@@ -99,7 +120,7 @@ agent:
   object_preanalysis_wait_timeout_sec: 25.0
   object_preanalysis_wait_poll_sec: 0.5
   object_preanalysis_wait_for_record_sec: 3.0
-  object_approach_budgeted_live_after_arrival_enabled: false
+  object_approach_budgeted_live_after_arrival_enabled: true
   object_approach_budgeted_live_after_arrival_max_attempts: 1
   target_resolution_enabled: true
   target_resolution_dry_run: false
@@ -116,6 +137,18 @@ io:
   translate_input: true
   translate_output: true
   translation_model: qwen-turbo
+
+interaction_profile:
+  profile_id: semantic_guide_demo
+  display_name: 语音提示辅助导引演示
+  language: zh
+  voice_enabled_default: true
+  speak_agent_replies: true
+  speak_guidance_events: true
+  response_role_enabled: true
+  response_role: blind_assistance_companion
+  progress_reminder_interval_sec: 18.0
+  demo_safety_notice: 演示模式下请在旁站人员看护下缓慢跟随，必要时立即停止。
 
 paths:
   workspace_root: /home/car/caragent_ws

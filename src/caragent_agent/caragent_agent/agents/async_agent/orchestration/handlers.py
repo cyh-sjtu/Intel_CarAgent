@@ -13,6 +13,14 @@ from ..execution.support import (
     derive_headline_turn_response,
     normalize_turn_response_items,
 )
+from ..guidance import (
+    append_guidance,
+    failure_text,
+    navigation_arrival_text,
+    navigation_waiting_text,
+    plan_created_text,
+    task_cancelled_text,
+)
 from ..runtime.types import (
     AsyncAgentState,
     EventItem,
@@ -134,9 +142,7 @@ def build_plan_created_progress(event_payload: Optional[dict[str, Any]]) -> str:
     payload = event_payload or {}
     task_ids = payload.get("task_ids")
     task_count = len(task_ids) if isinstance(task_ids, list) else 0
-    if task_count > 0:
-        return f"I have prepared a {task_count}-step plan and will start the first step now."
-    return "I have prepared a plan and will start the first step now."
+    return plan_created_text(task_count)
 
 
 def build_plan_finished_progress(state: AsyncAgentState) -> Optional[str]:
@@ -145,7 +151,7 @@ def build_plan_finished_progress(state: AsyncAgentState) -> Optional[str]:
     response_items = normalize_turn_response_items(state.get("turn_response_items"))
     if response_items:
         return None
-    return "The plan is complete."
+    return "本次导引任务已完成。"
 
 
 def apply_task_cancelled_progress(
@@ -165,12 +171,22 @@ def apply_task_cancelled_progress(
     if not task_description:
         return state
 
-    return apply_turn_response(
+    result_state = apply_turn_response(
         state,
-        response_text=f"\u5df2\u53d6\u6d88\u4efb\u52a1: {task_description}",
+        response_text=task_cancelled_text(task_description),
         response_type="progress",
         source_event_type=str(event.get("type") or ""),
         task_id=task_id if isinstance(task_id, int) else None,
+    )
+    return append_guidance(
+        result_state,
+        event_type="cancelled",
+        text=task_cancelled_text(task_description),
+        priority="high",
+        interrupt=True,
+        dedupe_key=f"cancelled:{task_id}",
+        task_id=task_id if isinstance(task_id, int) else None,
+        source_event=event,
     )
 
 
@@ -583,6 +599,34 @@ def _arrival_receipts(state: AsyncAgentState) -> list[dict[str, Any]]:
     return [dict(item) for item in receipts if isinstance(item, dict)]
 
 
+def _has_guidance_dedupe_key(state: AsyncAgentState, dedupe_key: str) -> bool:
+    """Return True when this guidance item already exists in state."""
+
+    normalized = str(dedupe_key or "").strip()
+    if not normalized:
+        return False
+    return any(
+        isinstance(item, dict)
+        and str(item.get("dedupe_key") or "").strip() == normalized
+        for item in list(state.get("guidance_events") or [])
+    )
+
+
+def _navigation_guidance_dedupe_key(
+    event_type: str,
+    task: Optional[TaskItem],
+    task_id: Optional[int],
+) -> str:
+    """Return a plan-scoped guidance key for navigation progress events."""
+
+    plan_id = ""
+    if isinstance(task, dict):
+        plan_id = str(task.get("plan_id") or "").strip()
+    if not plan_id:
+        plan_id = "no-plan"
+    return f"{event_type}:{plan_id}:{task_id}"
+
+
 def _same_position(left: Any, right: Any, *, tolerance_m: float = 0.5) -> bool:
     if not isinstance(left, (list, tuple)) or not isinstance(right, (list, tuple)):
         return False
@@ -736,11 +780,14 @@ def handle_plan_created_event(
             if first_task.get("type") != "decision"
             else {"type": "idle"},
         }
-        result_state = apply_turn_response(
+        result_state = append_guidance(
             result_state,
-            response_text=build_plan_created_progress(event.get("payload", {})),
-            response_type="progress",
-            source_event_type=str(event.get("type") or ""),
+            event_type="plan_created",
+            text=build_plan_created_progress(event.get("payload", {})),
+            priority="normal",
+            interrupt=False,
+            dedupe_key=f"plan_created:{event.get('payload', {}).get('plan_id')}",
+            source_event=event,
         )
         return mark_event_processed_from_context(result_state, event, context)
 
@@ -894,22 +941,31 @@ def handle_task_waiting_event(
         "tasks": tasks,
         "next_action": {"type": "idle"},
     }
-    if response_items:
-        for item in response_items:
-            result_state = apply_turn_response(
-                result_state,
-                response_text=str(item.get("response_text") or "").strip() or None,
-                response_type=item.get("response_type"),
-                source_event_type=str(event.get("type") or ""),
-                task_id=waiting_task_id,
-            )
-    elif response_text:
-        result_state = apply_turn_response(
+    if (
+        waiting_task_id is not None
+        and waiting_task_id in tasks
+        and not _has_guidance_dedupe_key(
             result_state,
-            response_text=response_text,
-            response_type=response_type,
-            source_event_type=str(event.get("type") or ""),
+            _navigation_guidance_dedupe_key(
+                "navigation_start",
+                tasks[waiting_task_id],
+                waiting_task_id,
+            ),
+        )
+    ):
+        result_state = append_guidance(
+            result_state,
+            event_type="navigation_start",
+            text=navigation_waiting_text(tasks[waiting_task_id]),
+            priority="normal",
+            interrupt=False,
+            dedupe_key=_navigation_guidance_dedupe_key(
+                "navigation_start",
+                tasks[waiting_task_id],
+                waiting_task_id,
+            ),
             task_id=waiting_task_id,
+            source_event=event,
         )
 
     return mark_event_processed_from_context(
@@ -974,6 +1030,16 @@ def handle_task_failed_event(
             result_state["messages"] = state["messages"] + [
                 AIMessage(content=failure_summary)
             ]
+            result_state = append_guidance(
+                result_state,
+                event_type="failed",
+                text=failure_text(failure_summary),
+                priority="high",
+                interrupt=True,
+                dedupe_key=f"failed:{failed_task_id}:{failure_summary}",
+                task_id=failed_task_id,
+                source_event=event,
+            )
             return mark_event_processed_from_context(result_state, event, context)
 
         tasks[failed_task_id]["status"] = "failed"
@@ -1006,6 +1072,16 @@ def handle_task_failed_event(
             source_event_type=str(event.get("type") or ""),
             task_id=failed_task_id,
         )
+    result_state = append_guidance(
+        result_state,
+        event_type="failed",
+        text=failure_text(failure_summary),
+        priority="high",
+        interrupt=True,
+        dedupe_key=f"failed:{failed_task_id}:{failure_summary}",
+        task_id=failed_task_id if isinstance(failed_task_id, int) else None,
+        source_event=event,
+    )
     return mark_event_processed_from_context(result_state, event, context)
 
 
@@ -1101,11 +1177,13 @@ def handle_navigation_arrived_event(
             event=event,
         )
         _remember_arrival_receipt(state, event, task=arrived_task)
-        latest_result = (
-            (arrived_task.get("result") or [])[-1]
-            if arrived_task.get("result")
-            else None
-        )
+        raw_result = arrived_task.get("result")
+        if isinstance(raw_result, list) and raw_result:
+            latest_result = raw_result[-1] if isinstance(raw_result[-1], dict) else None
+        elif isinstance(raw_result, dict):
+            latest_result = raw_result
+        else:
+            latest_result = None
         arrival_summary = navigation_arrival_summary(arrived_task)
         if arrived_task.get("inserted"):
             arrived_task["status"] = "completed"
@@ -1119,16 +1197,24 @@ def handle_navigation_arrived_event(
                     )
                 except Exception:
                     pass
-            result_state = apply_user_facing_response(
-                finish_inserted_task_fn(
-                    state,
+            result_state = finish_inserted_task_fn(
+                state,
+                arrived_task_id,
+                tasks,
+            )
+            result_state = append_guidance(
+                result_state,
+                event_type="arrival",
+                text=navigation_arrival_text(arrived_task),
+                priority="normal",
+                interrupt=False,
+                dedupe_key=_navigation_guidance_dedupe_key(
+                    "arrival",
+                    arrived_task,
                     arrived_task_id,
-                    tasks,
                 ),
-                arrival_summary,
-                response_type="result",
-                source_event_type=str(event.get("type") or ""),
                 task_id=arrived_task_id,
+                source_event=event,
             )
             result_state = _clear_consumed_navigation_if_unchanged(result_state)
             return mark_event_processed_from_context(result_state, event, context)
@@ -1138,6 +1224,11 @@ def handle_navigation_arrived_event(
         arrival_payload["destination_description"] = str(
             arrived_task.get("description") or ""
         ).strip()
+        arrival_verification = (
+            arrival_payload.get("arrival_verification")
+            if isinstance(arrival_payload.get("arrival_verification"), dict)
+            else None
+        )
         _record_arrival_snapshot_anchor(context, arrived_task, event)
         latest_summary = str(latest_result.get("summary") or "").strip() if latest_result else ""
         if arrival_summary and arrival_summary != latest_summary:
@@ -1147,6 +1238,7 @@ def handle_navigation_arrived_event(
                 summary=arrival_summary,
                 raw_output=json.dumps(arrival_payload, ensure_ascii=False),
                 tool_name=latest_result.get("tool_name") if latest_result else None,
+                arrival_verification=arrival_verification,
             )
         if run_memory:
             try:
@@ -1158,22 +1250,30 @@ def handle_navigation_arrived_event(
             except Exception:
                 pass
         next_id = arrived_task.get("next_task_id")
-        user_facing_arrival_summary = fallback_navigation_user_facing_response_fn(
-            tasks,
-            plan_id=arrived_task.get("plan_id") or state.get("current_plan_id"),
-            user_input_id=arrived_task.get("user_input_id"),
-        ) or arrival_summary
         result_state = proceed_to_next_task_from_context_fn(
-            apply_user_facing_response(
-                state,
-                user_facing_arrival_summary,
-                response_type="result",
-                source_event_type=str(event.get("type") or ""),
-                task_id=arrived_task_id,
-            ),
+            state,
             next_id,
             tasks,
             context,
+        )
+        result_state = append_guidance(
+            result_state,
+            event_type="arrival_verification" if arrival_verification else "arrival",
+            text=(
+                str(arrival_verification.get("message") or "").strip()
+                if arrival_verification
+                else navigation_arrival_text(arrived_task)
+            ),
+            priority="normal",
+            interrupt=False,
+            dedupe_key=_navigation_guidance_dedupe_key(
+                "arrival",
+                arrived_task,
+                arrived_task_id,
+            ),
+            task_id=arrived_task_id,
+            source_event=event,
+            payload=arrival_verification,
         )
         result_state = _clear_consumed_navigation_if_unchanged(result_state)
         return mark_event_processed_from_context(result_state, event, context)

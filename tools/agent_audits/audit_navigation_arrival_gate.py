@@ -299,6 +299,60 @@ def _assert_same_position_new_navigation_is_accepted() -> None:
     assert any("decision=accepted" in line for line in logger.lines)
 
 
+def _assert_old_arrival_does_not_complete_new_navigation() -> None:
+    from caragent_agent.agents.async_agent.orchestration.runtime import (
+        build_navigation_arrival_event,
+    )
+    from langchain_core.messages import ToolMessage
+
+    state = _base_state()
+    state["active_navigation"] = {
+        "navigation_token": "nav_object",
+        "task_id": 2,
+        "plan_id": "plan_a",
+        "user_input_id": "input_a",
+        "description": "Approach the black chair",
+        "destination_position": [2.0, -1.32, 0.0],
+    }
+    state["pending_navigation"] = dict(state["active_navigation"])
+    state["tasks"][2]["description"] = "Approach the black chair"
+
+    stale_event = build_navigation_arrival_event(
+        ToolMessage(
+            content="Arrived at destination [0.053, -0.978, 0.000]",
+            tool_call_id="tool_stale",
+        ),
+        messages=[],
+        tasks=state["tasks"],
+        current_task_id=2,
+        current_plan_id="plan_a",
+        active_navigation=state["active_navigation"],
+        match_tolerance_meters=0.5,
+    )
+    assert stale_event["type"] == "navigation_arrival_unmatched"
+    assert stale_event["payload"]["unmatched_reason"] == "position_mismatch"
+    logger = FakeLogger()
+    still_waiting = _handle_unmatched(state, stale_event, logger)
+    assert still_waiting["tasks"][2]["status"] == "waiting"
+    assert any("decision=ignored_stale" in line for line in logger.lines)
+
+    fresh_event = build_navigation_arrival_event(
+        ToolMessage(
+            content="Arrived at destination [2.000, -1.320, 0.000]",
+            tool_call_id="tool_fresh",
+        ),
+        messages=[],
+        tasks=still_waiting["tasks"],
+        current_task_id=2,
+        current_plan_id="plan_a",
+        active_navigation=still_waiting["active_navigation"],
+        match_tolerance_meters=0.5,
+    )
+    assert fresh_event["type"] == "navigation_arrived"
+    accepted = _handle(still_waiting, fresh_event, logger)
+    assert accepted["tasks"][2]["status"] == "completed"
+
+
 def main() -> int:
     src_root = _repo_src_root()
     if str(src_root) not in sys.path:
@@ -308,6 +362,7 @@ def main() -> int:
     _assert_old_plan_is_stale()
     _assert_cancelled_task_is_stale()
     _assert_same_position_new_navigation_is_accepted()
+    _assert_old_arrival_does_not_complete_new_navigation()
     print("navigation_arrival_gate_audit: ok")
     return 0
 

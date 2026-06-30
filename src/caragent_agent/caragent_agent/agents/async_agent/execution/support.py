@@ -13,6 +13,10 @@ from langchain_core.tools import BaseTool, StructuredTool
 from .context import (
     is_navigation_action,
 )
+from ..guidance import (
+    navigation_arrival_text,
+    navigation_waiting_text,
+)
 from .tool_results import (
     extract_structured_tool_result,
     extract_tool_result_data,
@@ -225,13 +229,21 @@ def append_task_result(
     tool_name: Optional[str] = None,
     decision: Optional[str] = None,
     destination: Optional[dict[str, Any]] = None,
+    destination_description: Optional[str] = None,
     selected_object: Optional[dict[str, Any]] = None,
     visual_observation: Optional[dict[str, Any]] = None,
     current_place_context: Optional[dict[str, Any]] = None,
+    arrival_verification: Optional[dict[str, Any]] = None,
 ) -> None:
     """Append a structured result entry to a task."""
 
-    result_entries = list(task.get("result", []))
+    existing_result = task.get("result")
+    if isinstance(existing_result, list):
+        result_entries = list(existing_result)
+    elif isinstance(existing_result, dict):
+        result_entries = [existing_result]
+    else:
+        result_entries = []
     entry: TaskResultItem = {
         "event_id": event_id,
         "summary": summary,
@@ -245,12 +257,16 @@ def append_task_result(
         entry["decision"] = decision
     if destination:
         entry["destination"] = destination
+    if str(destination_description or "").strip():
+        entry["destination_description"] = str(destination_description or "").strip()
     if selected_object:
         entry["selected_object"] = selected_object
     if visual_observation:
         entry["visual_observation"] = visual_observation
     if current_place_context:
         entry["current_place_context"] = current_place_context
+    if arrival_verification:
+        entry["arrival_verification"] = arrival_verification
     result_entries.append(entry)
     task["result"] = result_entries
     task["updated_at"] = now_iso()
@@ -318,25 +334,13 @@ def navigation_state_for_task(task: Optional[TaskItem]) -> Optional[str]:
 def navigation_waiting_summary(task: Optional[TaskItem]) -> str:
     """Build a task-result summary for an issued navigation command."""
 
-    description = str((task or {}).get("description") or "").strip()
-    if description.lower().startswith(
-        ("approach ", "inspect ", "capture ", "photograph ", "navigate from ")
-    ):
-        return ensure_sentence_ending(f"I have started: {description}")
-    destination_label = task_destination_label(task)
-    return f"I am heading to {destination_label}."
+    return navigation_waiting_text(task)
 
 
 def navigation_arrival_summary(task: Optional[TaskItem]) -> str:
     """Build a task-result summary for a confirmed navigation arrival."""
 
-    description = str((task or {}).get("description") or "").strip()
-    if description.lower().startswith(
-        ("approach ", "inspect ", "capture ", "photograph ", "navigate from ")
-    ):
-        return ensure_sentence_ending(f"I have completed: {description}")
-    destination_label = task_destination_label(task)
-    return f"I have arrived at {destination_label}."
+    return navigation_arrival_text(task)
 
 
 def task_summary_is_user_visible(
@@ -355,6 +359,10 @@ def task_summary_is_user_visible(
     if lowered in {
         "task completed successfully.",
         "navigation command issued successfully; waiting for arrival event.",
+        "submitted a destination description for the current task.",
+        "submitted a structured destination for the current task.",
+        "submitted a structured result for the current task.",
+        "submitted an empty structured result for the current task.",
     }:
         return False
 
@@ -384,8 +392,6 @@ def build_task_user_facing_response(
         return None
 
     if event_type == "task_waiting":
-        if task is not None and is_navigation_action(task):
-            return navigation_waiting_summary(task)
         return None
 
     if (
@@ -394,7 +400,7 @@ def build_task_user_facing_response(
         and is_navigation_action(task)
         and normalized_summary.lower() == navigation_arrival_summary(task).lower()
     ):
-        return normalized_summary
+        return None
 
     if event_type not in {"task_completed", "task_failed"}:
         return None
@@ -418,8 +424,6 @@ def build_task_turn_response_type(
         return None
 
     if event_type == "task_waiting":
-        if task is not None and is_navigation_action(task):
-            return "progress"
         return None
 
     if event_type == "task_failed":
@@ -430,7 +434,7 @@ def build_task_turn_response_type(
 
     if task is not None and is_navigation_action(task):
         if normalized_summary.lower() == navigation_arrival_summary(task).lower():
-            return "result"
+            return None
 
     if task_summary_is_user_visible(task, normalized_summary, event_type=event_type):
         return "result"
@@ -738,6 +742,7 @@ def calculate_distance_between_positions(
 def submit_task_result(
     summary: str = "",
     destination: Any = None,
+    destination_description: str = "",
     selected_object: Any = None,
     visual_observation: Any = None,
     current_place_context: Any = None,
@@ -771,6 +776,8 @@ def submit_task_result(
 
     if destination:
         data["destination"] = destination
+    if str(destination_description or "").strip():
+        data["destination_description"] = str(destination_description or "").strip()
     if selected_object:
         data["selected_object"] = selected_object
     if visual_observation:
@@ -789,6 +796,8 @@ def submit_task_result(
     if not normalized_summary:
         if destination:
             normalized_summary = "Submitted a structured destination for the current task."
+        elif data.get("destination_description"):
+            normalized_summary = "Submitted a destination description for the current task."
         elif data:
             normalized_summary = "Submitted a structured result for the current task."
         else:
@@ -845,10 +854,12 @@ def build_precision_support_tools(existing_tools: Sequence[BaseTool]) -> list[Ba
                 description=(
                     "Submit the current task's final structured result to the runtime. "
                     "Use this when the task has resolved fields such as destination, "
-                    "selected_object, visual_observation, or current_place_context. "
+                    "destination_description, selected_object, visual_observation, or current_place_context. "
                     "This is not a navigation command. For a keyframe destination, call "
                     "submit_task_result(destination={\"type\":\"keyframe\",\"keyframe_id\":63}, "
-                    "summary=\"...\"). Do not invent tools named destination or selected_object."
+                    "summary=\"...\"). If you only know a natural-language destination "
+                    "from conversation, call submit_task_result(destination_description=\"...\"). "
+                    "Do not invent tools named destination or selected_object."
                 ),
             )
         )

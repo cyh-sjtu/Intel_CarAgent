@@ -29,11 +29,37 @@ API_ENV_BY_PROVIDER = {
     "doubao": "DOUBAO_API_KEY",
 }
 
+API_POOL_ENV_BY_PROVIDER = {
+    "qwen": "DASHSCOPE_API_KEYS",
+    "dashscope": "DASHSCOPE_API_KEYS",
+}
+
 API_CONFIG_KEYS_BY_PROVIDER = {
-    "qwen": ("qwen-api", "dashscope"),
-    "dashscope": ("qwen-api", "dashscope"),
-    "deepseek": ("deepseek-api", "deepseek"),
-    "doubao": ("doubao-api", "doubao"),
+    "qwen": ("qwen-api", "qwen", "dashscope", "dashscope_keys"),
+    "dashscope": ("qwen-api", "qwen", "dashscope", "dashscope_keys"),
+    "deepseek": ("deepseek-api", "deepseek", "deepseek_keys"),
+    "doubao": ("doubao-api", "doubao", "doubao_keys"),
+}
+
+TOP_LEVEL_API_KEYS_BY_PROVIDER = {
+    "qwen": (
+        "qwen-api",
+        "qwen_api_key",
+        "qwen_api_keys",
+        "dashscope",
+        "dashscope_api_key",
+        "dashscope_api_keys",
+    ),
+    "dashscope": (
+        "qwen-api",
+        "qwen_api_key",
+        "qwen_api_keys",
+        "dashscope",
+        "dashscope_api_key",
+        "dashscope_api_keys",
+    ),
+    "deepseek": ("deepseek-api", "deepseek_api_key", "deepseek_api_keys"),
+    "doubao": ("doubao-api", "doubao_api_key", "doubao_api_keys"),
 }
 
 
@@ -45,6 +71,51 @@ def _read_yaml(path: Path) -> dict[str, Any]:
     if not isinstance(loaded, dict):
         raise ValueError(f"Config file must contain a YAML mapping: {path}")
     return loaded
+
+
+def _looks_like_mojibake(value: str) -> bool:
+    """Return True for typical UTF-8 text decoded as a single-byte encoding."""
+
+    if not value:
+        return False
+    markers = ("Ã", "Â", "Ð", "Ñ", "æ", "ç", "è", "é", "å", "ï¿½", "�")
+    return any(marker in value for marker in markers)
+
+
+def _repair_mojibake_text(value: str) -> str:
+    """Repair common mojibake without changing ordinary valid strings."""
+
+    if not _looks_like_mojibake(value):
+        return value
+    candidates = []
+    for encoding in ("latin1", "cp1252"):
+        try:
+            repaired = value.encode(encoding).decode("utf-8")
+        except Exception:
+            continue
+        candidates.append(repaired)
+    if not candidates:
+        return value
+
+    def score(text: str) -> int:
+        bad_markers = sum(text.count(marker) for marker in ("Ã", "Â", "æ", "ç", "è", "é", "�"))
+        cjk_chars = sum(1 for ch in text if "\u3400" <= ch <= "\u9fff")
+        return cjk_chars * 4 - bad_markers * 8
+
+    best = max(candidates, key=score)
+    return best if score(best) > score(value) else value
+
+
+def _repair_config_text(value: Any) -> Any:
+    """Recursively repair text values loaded from config files."""
+
+    if isinstance(value, str):
+        return _repair_mojibake_text(value)
+    if isinstance(value, dict):
+        return {key: _repair_config_text(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_repair_config_text(item) for item in value]
+    return value
 
 
 def _package_share_config_path() -> Path | None:
@@ -206,7 +277,7 @@ def load_config() -> dict[str, Any]:
     if llm_api_path.exists():
         data = deep_merge(data, _read_yaml(llm_api_path))
 
-    return data
+    return _repair_config_text(data)
 
 class Config:
     _instance = None
@@ -219,39 +290,91 @@ class Config:
         return cls._instance
 
 
-def get_api_key(provider: str) -> str:
-    """Return an API key from env vars first, then local ignored config."""
+def _coerce_api_key_list(raw_value: Any) -> list[str]:
+    """Normalize API key config values into an ordered de-duplicated list."""
+
+    values: list[str] = []
+
+    if raw_value is None:
+        return values
+    if isinstance(raw_value, str):
+        values.extend(
+            item.strip()
+            for item in raw_value.replace("\n", ",").split(",")
+            if item.strip()
+        )
+    elif isinstance(raw_value, (list, tuple, set)):
+        for item in raw_value:
+            values.extend(_coerce_api_key_list(item))
+    elif isinstance(raw_value, dict):
+        matched_named_field = False
+        for key in ("keys", "api_keys", "key", "api_key", "value"):
+            if key in raw_value:
+                matched_named_field = True
+                values.extend(_coerce_api_key_list(raw_value.get(key)))
+        if not matched_named_field:
+            for item in raw_value.values():
+                values.extend(_coerce_api_key_list(item))
+    else:
+        text = str(raw_value).strip()
+        if text:
+            values.append(text)
+
+    deduped: list[str] = []
+    for value in values:
+        if value and value not in deduped:
+            deduped.append(value)
+    return deduped
+
+
+def get_api_keys(provider: str) -> list[str]:
+    """Return configured API keys from env vars first, then ignored local config."""
 
     normalized = str(provider or "").strip().lower()
+    keys: list[str] = []
+
+    pool_env_var = API_POOL_ENV_BY_PROVIDER.get(normalized)
+    if pool_env_var:
+        keys.extend(_coerce_api_key_list(os.environ.get(pool_env_var, "")))
+
     env_var = API_ENV_BY_PROVIDER.get(normalized)
     if env_var:
-        env_value = os.environ.get(env_var, "").strip()
-        if env_value:
-            return env_value
+        keys.extend(_coerce_api_key_list(os.environ.get(env_var, "")))
 
     api_keys = config.get("api_keys")
     if isinstance(api_keys, dict):
         for key in API_CONFIG_KEYS_BY_PROVIDER.get(normalized, ()):
-            value = api_keys.get(key)
-            if value and str(value).strip():
-                return str(value).strip()
+            keys.extend(_coerce_api_key_list(api_keys.get(key)))
 
-    for key in API_CONFIG_KEYS_BY_PROVIDER.get(normalized, ()):
-        value = config.get(key)
-        if value and str(value).strip():
-            return str(value).strip()
+    for key in TOP_LEVEL_API_KEYS_BY_PROVIDER.get(normalized, ()):
+        keys.extend(_coerce_api_key_list(config.get(key)))
 
-    return ""
+    deduped: list[str] = []
+    for key in keys:
+        if key and key not in deduped:
+            deduped.append(key)
+    return deduped
+
+
+def get_api_key(provider: str) -> str:
+    """Return the first configured API key for provider compatibility paths."""
+
+    keys = get_api_keys(provider)
+    return keys[0] if keys else ""
 
 
 def ensure_api_key_env(provider: str) -> str:
     """Populate the provider env var from config when a local key is available."""
 
     normalized = str(provider or "").strip().lower()
-    api_key = get_api_key(normalized)
+    api_keys = get_api_keys(normalized)
+    api_key = api_keys[0] if api_keys else ""
     env_var = API_ENV_BY_PROVIDER.get(normalized)
     if api_key and env_var and not os.environ.get(env_var):
         os.environ[env_var] = api_key
+    pool_env_var = API_POOL_ENV_BY_PROVIDER.get(normalized)
+    if api_keys and pool_env_var and not os.environ.get(pool_env_var):
+        os.environ[pool_env_var] = ",".join(api_keys)
     return api_key
 
 

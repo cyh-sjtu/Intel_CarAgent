@@ -17,7 +17,6 @@ from std_msgs.msg import String
 
 from caragent_agent.io_adapters import (
     current_controller_image,
-    detect_language,
     describe_image_for_navigation,
     normalize_language,
     prepare_user_message_for_agent,
@@ -90,9 +89,11 @@ class CarAgentROSNode(Node):
             final_align_enabled=bool(nav_cfg.get("final_align_enabled", True)),
             yaw_tolerance_deg=float(nav_cfg.get("yaw_tolerance_deg", 4.0)),
             settle_time_sec=float(nav_cfg.get("settle_time_sec", 0.7)),
-            fast_omega=float(nav_cfg.get("fast_omega", 1.15)),
-            mid_omega=float(nav_cfg.get("mid_omega", 0.75)),
-            slow_omega=float(nav_cfg.get("slow_omega", 0.32)),
+            fast_omega=float(nav_cfg.get("fast_omega", 3.40)),
+            mid_omega=float(nav_cfg.get("mid_omega", 2.50)),
+            slow_omega=float(nav_cfg.get("slow_omega", 1.50)),
+            fast_threshold_deg=float(nav_cfg.get("fast_threshold_deg", 20.0)),
+            mid_threshold_deg=float(nav_cfg.get("mid_threshold_deg", 10.0)),
             rotation_timeout_sec=float(nav_cfg.get("rotation_timeout_sec", 15.0)),
             rotation_loop_rate_hz=float(nav_cfg.get("rotation_loop_rate_hz", 20.0)),
             right_turn_shortcut_deg=float(nav_cfg.get("right_turn_shortcut_deg", 90.0)),
@@ -174,8 +175,8 @@ class CarAgentROSNode(Node):
             self._publish_photo_if_requested(user_input)
             agent_input = prepare_user_message_for_agent(
                 user_input,
-                input_language=str(self._io_cfg.get("input_language", "auto")),
-                output_language=str(self._io_cfg.get("output_language", "auto")),
+                input_language=str(self._io_cfg.get("input_language", "zh")),
+                output_language=str(self._io_cfg.get("output_language", "zh")),
                 translate_boundary=bool(self._io_cfg.get("translate_boundary", True)),
             )
             result = self.agent.run_message_turn(
@@ -207,11 +208,8 @@ class CarAgentROSNode(Node):
         return str(result)
 
     def _translate_response_for_user(self, response: str, user_input: str) -> str:
-        output_language = str(self._io_cfg.get("output_language", "auto"))
-        target = normalize_language(
-            output_language,
-            fallback=detect_language(user_input),
-        )
+        output_language = str(self._io_cfg.get("output_language", "zh"))
+        target = normalize_language(output_language, fallback="zh")
         if target == "en":
             return response
         return translate_text_for_user(response, target_language=target)

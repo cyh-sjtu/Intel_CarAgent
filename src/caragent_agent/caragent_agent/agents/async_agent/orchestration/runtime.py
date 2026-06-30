@@ -210,11 +210,34 @@ def build_pending_navigation_snapshot(
         "description": str(task.get("description") or "").strip(),
         "created_at": created_at or now_iso(),
     }
-    latest_result = (
-        (task.get("result") or [])[-1]
-        if task.get("result")
-        else None
-    )
+    target = task.get("target")
+    if isinstance(target, dict):
+        snapshot["target"] = {
+            str(key): value
+            for key, value in target.items()
+            if key
+            in {
+                "type",
+                "target_source",
+                "target_kind",
+                "query",
+                "display_label",
+                "user_query",
+                "object_description",
+                "keyframe_id",
+                "task_id",
+                "field",
+                "stop_distance_m",
+            }
+            and value not in (None, "", [], {})
+        }
+    raw_result = task.get("result")
+    if isinstance(raw_result, list) and raw_result:
+        latest_result = raw_result[-1] if isinstance(raw_result[-1], dict) else None
+    elif isinstance(raw_result, dict):
+        latest_result = raw_result
+    else:
+        latest_result = None
     latest_raw_output = latest_result.get("raw_output") if latest_result else None
     keyframe_id = extract_selected_keyframe_id_from_raw_output(latest_raw_output)
     position = extract_selected_position_from_raw_output(latest_raw_output)
@@ -321,6 +344,8 @@ def build_navigation_arrival_event(
             event["payload"]["destination_keyframe_id"] = navigation.get(
                 "destination_keyframe_id"
             )
+        if isinstance(navigation.get("target"), dict):
+            event["payload"]["target"] = dict(navigation.get("target") or {})
         if destination_position is not None:
             event["payload"]["destination_position"] = destination_position
         if event.get("task_id") not in tasks:
@@ -365,12 +390,21 @@ def build_user_input_received_event(
 
     if existing_user_input is None:
         attached_images = extract_attached_images_from_content(message.content)
+        additional_kwargs = getattr(message, "additional_kwargs", None)
+        if not isinstance(additional_kwargs, dict):
+            additional_kwargs = {}
+        original_content = str(additional_kwargs.get("original_content") or "").strip()
+        agent_content = str(additional_kwargs.get("agent_content") or "").strip()
         existing_user_input = {
             "user_input_id": new_structured_id("user_input"),
             "message_id": message_id,
             "content": str(message.content),
             "created_at": now_iso(),
         }
+        if original_content:
+            existing_user_input["original_content"] = original_content
+        if agent_content:
+            existing_user_input["agent_content"] = agent_content
         if attached_images:
             existing_user_input["attached_images"] = attached_images
         updated_user_inputs.append(existing_user_input)
@@ -386,6 +420,10 @@ def build_user_input_received_event(
             "content": existing_user_input["content"],
         },
     }
+    if existing_user_input.get("original_content"):
+        event["payload"]["original_content"] = existing_user_input.get("original_content")
+    if existing_user_input.get("agent_content"):
+        event["payload"]["agent_content"] = existing_user_input.get("agent_content")
     if existing_user_input.get("attached_images"):
         event["payload"]["attached_images"] = existing_user_input.get("attached_images")
     return event, updated_user_inputs
