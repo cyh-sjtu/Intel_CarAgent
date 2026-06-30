@@ -31,6 +31,7 @@ def generate_launch_description():
     min_time_sec = LaunchConfiguration("min_time_sec")
     min_distance_m = LaunchConfiguration("min_distance_m")
     min_yaw_deg = LaunchConfiguration("min_yaw_deg")
+    manual_only = LaunchConfiguration("manual_only")
     init_pose_delay_sec = LaunchConfiguration("init_pose_delay_sec")
     max_tf_age_sec = LaunchConfiguration("max_tf_age_sec")
     enforce_tf_age = LaunchConfiguration("enforce_tf_age")
@@ -112,6 +113,7 @@ def generate_launch_description():
                 "odom_topic": "/odom",
                 "map_frame": "map",
                 "base_frame": "base_link",
+                "map_file_name": map_file_name,
                 "session_name": session_name,
                 "output_root": output_root,
                 "left_width": ParameterValue(camera_left_width, value_type=int),
@@ -119,6 +121,7 @@ def generate_launch_description():
                 "min_time_sec": ParameterValue(min_time_sec, value_type=float),
                 "min_distance_m": ParameterValue(min_distance_m, value_type=float),
                 "min_yaw_deg": ParameterValue(min_yaw_deg, value_type=float),
+                "manual_only": ParameterValue(manual_only, value_type=bool),
                 "init_pose_delay_sec": ParameterValue(init_pose_delay_sec, value_type=float),
                 "max_tf_age_sec": ParameterValue(max_tf_age_sec, value_type=float),
                 "enforce_tf_age": ParameterValue(enforce_tf_age, value_type=bool),
@@ -154,6 +157,7 @@ def generate_launch_description():
             DeclareLaunchArgument("min_time_sec", default_value="1.5"),
             DeclareLaunchArgument("min_distance_m", default_value="0.65"),
             DeclareLaunchArgument("min_yaw_deg", default_value="30.0"),
+            DeclareLaunchArgument("manual_only", default_value="false"),
             DeclareLaunchArgument("init_pose_delay_sec", default_value="3.0"),
             DeclareLaunchArgument("max_tf_age_sec", default_value="0.5"),
             DeclareLaunchArgument("enforce_tf_age", default_value="false"),

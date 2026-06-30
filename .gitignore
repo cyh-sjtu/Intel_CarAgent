@@ -12,6 +12,17 @@ weights/
 hf_cache/
 perception_outputs/
 calibration/
+data/navigation_routes/
+perception_datasets/
+.codex_backup*/
+.codex_model_battle/
+.openvino_cache/
+.tmp_*/
+*.pid
+*.log
+*.tmp
+*.bak_*
+*.codex_*_bak
 
 # Large model checkpoints accidentally placed under source trees
 *.pth
@@ -32,7 +43,11 @@ __pycache__/
 
 # Local secrets and machine-specific overrides
 local_config.yaml
+local_config.yaml*
 llm_api.yaml
+llm_api.yaml*
+config/
+anchor_strategy_*.csv
 
 # Local editor/system files
 .vscode/

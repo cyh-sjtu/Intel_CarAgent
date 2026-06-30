@@ -18,6 +18,7 @@ from caragent_agent.agents.async_agent.execution.support import (
     submit_task_result,
     stringify_tool_content,
 )
+from caragent_agent.agents.async_agent.guidance import navigation_waiting_text
 from caragent_agent.agents.async_agent.execution.tool_results import parse_json_like_payload
 from caragent_agent.agents.async_agent.runtime.types import TaskItem
 from caragent_agent.agents.async_agent.target_resolution import TargetResolver
@@ -77,6 +78,43 @@ def _log_structured_navigation(message: str) -> None:
     logger = _runtime_logger()
     if logger:
         logger(message)
+
+
+def _notify_navigation_dispatch_start(
+    current_task: TaskItem,
+    *,
+    tool_name: str,
+    nav_args: dict[str, Any],
+) -> None:
+    """Notify UI listeners at the moment a navigation command is dispatched."""
+
+    runtime_context = get_runtime_tool_context()
+    callback = runtime_context.get("navigation_start_callback")
+    if not callable(callback):
+        return
+    task_id = current_task.get("task_id") if isinstance(current_task, dict) else None
+    try:
+        task_id = int(task_id)
+    except Exception:
+        task_id = None
+    plan_id = ""
+    if isinstance(current_task, dict):
+        plan_id = str(current_task.get("plan_id") or "").strip()
+    if not plan_id:
+        plan_id = "no-plan"
+    try:
+        callback(
+            {
+                "event_type": "navigation_start",
+                "text": navigation_waiting_text(current_task),
+                "task_id": task_id,
+                "tool_name": tool_name,
+                "nav_args": dict(nav_args or {}),
+                "dedupe_key": f"navigation_start:{plan_id}:{task_id}",
+            }
+        )
+    except Exception:
+        return
 
 
 def _log_target_resolution(
@@ -337,6 +375,8 @@ def _semantic_keyframe_context(
     return {
         "target_type": "semantic_keyframe",
         "query": query,
+        "display_label": target.get("display_label"),
+        "user_query": target.get("user_query"),
         "selection_policy": target.get("selection_policy"),
         "resolution_status": data.get("resolution_status"),
         "recommended_keyframe_id": recommended_keyframe_id,
@@ -633,6 +673,7 @@ def _submit_resolution_needs_observation(
             "required_next_step": required_next_step,
         },
     )
+    event_type = "task_failed" if target_type == "semantic_object" else "task_completed"
     return {
         "summary": summary,
         "tool_name": "target_resolution",
@@ -652,7 +693,7 @@ def _submit_resolution_needs_observation(
             ],
             "final_ai_content": summary,
         },
-        "event_type": "task_completed",
+        "event_type": event_type,
     }
 
 
@@ -678,6 +719,8 @@ def _submit_resolution_anchor(result: dict[str, Any]) -> dict[str, Any]:
         current_place_context = {
             "target_type": target_type,
             "query": target_ref.get("query") or target_ref.get("description"),
+            "display_label": target_ref.get("display_label"),
+            "user_query": target_ref.get("user_query"),
             "target_source": target_ref.get("source"),
             "target_resolution": {
                 "status": result.get("status"),
@@ -688,6 +731,9 @@ def _submit_resolution_anchor(result: dict[str, Any]) -> dict[str, Any]:
         }
         if target_type == "semantic_object":
             current_place_context["object_description"] = target_ref.get("description")
+            current_place_context["display_label"] = (
+                target_ref.get("display_label") or target_ref.get("user_query")
+            )
             current_place_context["staging_keyframe_id"] = destination["keyframe_id"]
             current_place_context["staging_reason"] = (
                 (result.get("required_next_step") or {}).get("reason")
@@ -712,7 +758,17 @@ def _submit_resolution_anchor(result: dict[str, Any]) -> dict[str, Any]:
             if evidence_data.get(key) not in (None, "", [], {}):
                 current_place_context[key] = evidence_data.get(key)
         return submit_task_result(
-            destination=destination,
+            destination={
+                **destination,
+                **{
+                    key: value
+                    for key, value in {
+                        "display_label": target_ref.get("display_label"),
+                        "user_query": target_ref.get("user_query"),
+                    }.items()
+                    if value not in (None, "")
+                },
+            },
             current_place_context=current_place_context,
             summary=f"Resolved semantic navigation target to keyframe {destination['keyframe_id']}.",
         )
@@ -891,6 +947,12 @@ def _dispatch_keyframe_anchor_navigation(
     submitted = _submit_resolution_anchor(result)
     tool_args = {"keyframe_node_id": keyframe_id}
     try:
+        if current_task is not None:
+            _notify_navigation_dispatch_start(
+                current_task,
+                tool_name="go_to_keyframe",
+                nav_args=tool_args,
+            )
         raw_navigation = _invoke_tool(navigation_tool, tool_args)
     except Exception as exc:
         raw_navigation = {
@@ -982,28 +1044,43 @@ def _dispatch_position_anchor_navigation(
 def _extract_named_field_from_task_payload(value: Any, field: str) -> Any:
     """Extract an explicit named task-output field without scanning tool candidates."""
 
-    if not field:
+    normalized_field = _normalize_task_output_field(field)
+    if not normalized_field:
         return value
     if value is None:
         return None
     if isinstance(value, str):
         parsed = parse_json_like_payload(value.strip())
         if parsed is not None and parsed is not value:
-            return _extract_named_field_from_task_payload(parsed, field)
+            return _extract_named_field_from_task_payload(parsed, normalized_field)
         embedded_json = _extract_json_object_from_text(value)
         if embedded_json is not None:
-            return _extract_named_field_from_task_payload(embedded_json, field)
+            return _extract_named_field_from_task_payload(embedded_json, normalized_field)
         return None
     if isinstance(value, (list, tuple)):
         for item in reversed(list(value)):
-            extracted = _extract_named_field_from_task_payload(item, field)
+            extracted = _extract_named_field_from_task_payload(item, normalized_field)
             if extracted is not None:
                 return extracted
         return None
     if not isinstance(value, dict):
         return None
-    if value.get(field) is not None:
-        return value.get(field)
+    if normalized_field == "destination":
+        if (
+            _extract_keyframe_id_from_value(value) is not None
+            or _extract_position_destination_from_value(value) is not None
+        ):
+            return value
+        for key in (
+            "destination",
+            "destination_query",
+            "destination_description",
+            "target_query",
+        ):
+            if value.get(key) is not None:
+                return value.get(key)
+    if value.get(normalized_field) is not None:
+        return value.get(normalized_field)
     for key in (
         "data",
         "result",
@@ -1019,10 +1096,17 @@ def _extract_named_field_from_task_payload(value: Any, field: str) -> Any:
         nested = value.get(key)
         if nested is value:
             continue
-        extracted = _extract_named_field_from_task_payload(nested, field)
+        extracted = _extract_named_field_from_task_payload(nested, normalized_field)
         if extracted is not None:
             return extracted
     return None
+
+
+def _normalize_task_output_field(field: Any) -> str:
+    value = str(field or "").strip()
+    if value in {"destination_query", "destination_description", "target_query"}:
+        return "destination"
+    return value
 
 
 def _latest_task_result_payload(task: Optional[TaskItem]) -> Any:
@@ -1048,6 +1132,80 @@ def _latest_task_result_payload(task: Optional[TaskItem]) -> Any:
         if embedded_json is not None:
             return embedded_json
     return latest
+
+
+def _task_output_destination_description(
+    current_task: Optional[TaskItem],
+    tasks: dict[int, TaskItem],
+) -> str:
+    target = current_task.get("target") if isinstance(current_task, dict) else None
+    if not isinstance(target, dict) or target.get("type") != "task_output":
+        return ""
+    try:
+        source_task_id = int(target.get("task_id"))
+    except Exception:
+        return ""
+    source_task = tasks.get(source_task_id)
+    source_payload = _latest_task_result_payload(source_task)
+    value = _extract_named_field_from_task_payload(source_payload, "destination_description")
+    return str(value or "").strip()
+
+
+def _dispatch_keyframe_navigation(
+    current_task: TaskItem,
+    tools: Sequence[BaseTool],
+    keyframe_id: int,
+) -> dict[str, Any]:
+    navigation_tool = find_tool_by_name(tools, "go_to_keyframe")
+    if navigation_tool is None:
+        summary = "Navigation tool go_to_keyframe is unavailable."
+        return {
+            "summary": summary,
+            "tool_name": None,
+            "tool_trace": {"tool_calls": [], "tool_results": [], "final_ai_content": summary},
+            "event_type": "task_failed",
+        }
+
+    tool_args = {"keyframe_node_id": keyframe_id}
+    try:
+        _notify_navigation_dispatch_start(
+            current_task,
+            tool_name="go_to_keyframe",
+            nav_args=tool_args,
+        )
+        raw_navigation = _invoke_tool(navigation_tool, tool_args)
+    except Exception as exc:
+        raw_navigation = {
+            "status": "error",
+            "summary": "Navigation dispatch raised an exception.",
+            "error": {"message": str(exc)},
+        }
+
+    tool_trace = {
+        "tool_calls": [{"name": "go_to_keyframe", "args": tool_args}],
+        "tool_results": [
+            {
+                "name": "go_to_keyframe",
+                "content": stringify_tool_content(raw_navigation),
+                "tool_call_id": None,
+            }
+        ],
+        "final_ai_content": f"Dispatched structured navigation_action to keyframe {keyframe_id}.",
+    }
+    if tool_result_status_ok(raw_navigation):
+        return {
+            "summary": navigation_waiting_summary(current_task),
+            "tool_name": "go_to_keyframe",
+            "tool_trace": tool_trace,
+            "event_type": "task_waiting",
+        }
+    failure = find_tool_failure_message(tool_trace) or "Navigation dispatch failed."
+    return {
+        "summary": failure,
+        "tool_name": "go_to_keyframe",
+        "tool_trace": tool_trace,
+        "event_type": "task_failed",
+    }
 
 
 def resolve_navigation_action_keyframe_id(
@@ -1077,7 +1235,7 @@ def resolve_navigation_action_keyframe_id(
         source_task = tasks.get(source_task_id)
         if source_task is None:
             return None, f"navigation_action target references missing task {source_task_id}."
-        field = str(target.get("field") or "destination").strip()
+        field = _normalize_task_output_field(target.get("field") or "destination")
         source_payload = _latest_task_result_payload(source_task)
         payload = source_payload
         if field:
@@ -1123,7 +1281,7 @@ def resolve_navigation_action_position(
         source_task = tasks.get(source_task_id)
         if source_task is None:
             return None, f"navigation_action target references missing task {source_task_id}."
-        field = str(target.get("field") or "destination").strip()
+        field = _normalize_task_output_field(target.get("field") or "destination")
         source_payload = _latest_task_result_payload(source_task)
         payload = source_payload
         if field:
@@ -1252,6 +1410,37 @@ def try_dispatch_structured_navigation_action(
         position_destination, position_error = resolve_navigation_action_position(current_task, tasks)
         if position_destination is not None:
             return _dispatch_position_navigation(current_task, tools, position_destination, None)
+        keyframe_id, keyframe_error = resolve_navigation_action_keyframe_id(current_task, tasks)
+        if keyframe_id is not None:
+            return _dispatch_keyframe_navigation(current_task, tools, keyframe_id)
+        destination_description = _task_output_destination_description(current_task, tasks)
+        if destination_description:
+            semantic_target = {
+                "type": "semantic_keyframe",
+                "target_source": "scene_memory",
+                "target_kind": (target or {}).get("target_kind") or "place",
+                "query": destination_description,
+                "display_label": (target or {}).get("display_label")
+                or (target or {}).get("user_query")
+                or destination_description,
+                "user_query": (target or {}).get("user_query")
+                or (target or {}).get("display_label")
+                or destination_description,
+            }
+            if (target or {}).get("selection_policy"):
+                semantic_target["selection_policy"] = (target or {}).get("selection_policy")
+            return try_dispatch_structured_navigation_action(
+                {**current_task, "target": semantic_target},
+                tasks=tasks,
+                tools=tools,
+            )
+        error = keyframe_error or position_error or "Task output does not contain a destination."
+        return {
+            "summary": error,
+            "tool_name": None,
+            "tool_trace": {"tool_calls": [], "tool_results": [], "final_ai_content": error},
+            "event_type": "task_failed",
+        }
 
     keyframe_id, error = resolve_navigation_action_keyframe_id(current_task, tasks)
     if error:
@@ -1261,51 +1450,7 @@ def try_dispatch_structured_navigation_action(
             "tool_trace": {"tool_calls": [], "tool_results": [], "final_ai_content": error},
             "event_type": "task_failed",
         }
-    navigation_tool = find_tool_by_name(tools, "go_to_keyframe")
-    if navigation_tool is None:
-        summary = "Navigation tool go_to_keyframe is unavailable."
-        return {
-            "summary": summary,
-            "tool_name": None,
-            "tool_trace": {"tool_calls": [], "tool_results": [], "final_ai_content": summary},
-            "event_type": "task_failed",
-        }
-
-    tool_args = {"keyframe_node_id": keyframe_id}
-    try:
-        raw_navigation = _invoke_tool(navigation_tool, tool_args)
-    except Exception as exc:
-        raw_navigation = {
-            "status": "error",
-            "summary": "Navigation dispatch raised an exception.",
-            "error": {"message": str(exc)},
-        }
-
-    tool_trace = {
-        "tool_calls": [{"name": "go_to_keyframe", "args": tool_args}],
-        "tool_results": [
-            {
-                "name": "go_to_keyframe",
-                "content": stringify_tool_content(raw_navigation),
-                "tool_call_id": None,
-            }
-        ],
-        "final_ai_content": f"Dispatched structured navigation_action to keyframe {keyframe_id}.",
-    }
-    if tool_result_status_ok(raw_navigation):
-        return {
-            "summary": navigation_waiting_summary(current_task),
-            "tool_name": "go_to_keyframe",
-            "tool_trace": tool_trace,
-            "event_type": "task_waiting",
-        }
-    failure = find_tool_failure_message(tool_trace) or "Navigation dispatch failed."
-    return {
-        "summary": failure,
-        "tool_name": "go_to_keyframe",
-        "tool_trace": tool_trace,
-        "event_type": "task_failed",
-    }
+    return _dispatch_keyframe_navigation(current_task, tools, keyframe_id)
 
 
 def _semantic_object_description(current_task: TaskItem, target: dict[str, Any]) -> str:
@@ -1528,6 +1673,11 @@ def _dispatch_semantic_object_navigation(
     }
     nav_start = time.perf_counter()
     try:
+        _notify_navigation_dispatch_start(
+            current_task,
+            tool_name="go_to_position",
+            nav_args=nav_args,
+        )
         raw_navigation = _invoke_tool(navigation_tool, nav_args)
     except Exception as exc:
         raw_navigation = {
@@ -1792,6 +1942,11 @@ def _dispatch_semantic_keyframe_navigation(
     nav_args = {"keyframe_node_id": int(recommended_keyframe_id)}
     nav_start = time.perf_counter()
     try:
+        _notify_navigation_dispatch_start(
+            current_task,
+            tool_name="go_to_keyframe",
+            nav_args=nav_args,
+        )
         raw_navigation = _invoke_tool(navigation_tool, nav_args)
     except Exception as exc:
         raw_navigation = {
@@ -2025,6 +2180,11 @@ def _dispatch_attached_image_keyframe_navigation(
     nav_args = {"keyframe_node_id": int(recommended_keyframe_id)}
     nav_start = time.perf_counter()
     try:
+        _notify_navigation_dispatch_start(
+            current_task,
+            tool_name="go_to_keyframe",
+            nav_args=nav_args,
+        )
         raw_navigation = _invoke_tool(navigation_tool, nav_args)
     except Exception as exc:
         raw_navigation = {
@@ -2114,6 +2274,12 @@ def _dispatch_position_navigation(
         "yaw_deg": float(position_destination.get("yaw_deg") or 0.0),
     }
     try:
+        if current_task is not None:
+            _notify_navigation_dispatch_start(
+                current_task,
+                tool_name="go_to_position",
+                nav_args=tool_args,
+            )
         raw_navigation = _invoke_tool(navigation_tool, tool_args)
     except Exception as exc:
         raw_navigation = {

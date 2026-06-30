@@ -32,6 +32,7 @@ from caragent_agent.agents.async_agent.planning.plan_edit import (
 )
 from caragent_agent.agents.async_agent.planning.prompting import AGENT_PROMPTS
 from caragent_agent.agents.async_agent.planning.task_graph import (
+    derive_display_label_from_user_text,
     parse_planned_tasks_from_response,
 )
 from caragent_agent.agents.async_agent.runtime.control import (
@@ -43,9 +44,28 @@ from caragent_agent.agents.async_agent.runtime.types import AsyncAgentState, Tas
 
 
 PLAN_EDIT_PROGRESS_TEXT = {
-    "insert_after_current": "I have updated the plan and inserted the requested follow-up steps.",
-    "replan_future_after_current": "I have replanned the remaining future steps.",
+    "insert_after_current": "已加入临时任务。",
+    "replan_future_after_current": "已更新计划。",
 }
+
+
+def _build_planner_user_request(selected_user_input: dict[str, Any]) -> str:
+    """Expose original wording and translated work text to the planner."""
+
+    work_request = str(selected_user_input.get("content") or "").strip()
+    original_request = str(selected_user_input.get("original_content") or "").strip()
+    if not original_request or original_request == work_request:
+        return work_request
+    return (
+        "Original user request (preserve this language for target.display_label):\n"
+        f"{original_request}\n\n"
+        "Working translated request (use this for planning semantics if clearer):\n"
+        f"{work_request}\n\n"
+        "When producing semantic navigation targets, write target.display_label as "
+        "a short target phrase from the original user request. Do not include "
+        "follow-up actions or questions in display_label."
+    )
+
 
 def _log_plan_error(
     logger: Optional[Any],
@@ -293,7 +313,7 @@ def create_plan_node(
 
         if plan_mode in editable_plan_modes:
             planning_messages = build_plan_editing_messages(
-                user_request=selected_user_input["content"],
+                user_request=_build_planner_user_request(selected_user_input),
                 current_task=current_task,
                 tasks=state.get("tasks", {}),
                 current_plan_id=current_plan_id,
@@ -302,7 +322,7 @@ def create_plan_node(
         else:
             planning_messages = [
                 SystemMessage(content=AGENT_PROMPTS.get("plan_system", "")),
-                HumanMessage(content=selected_user_input["content"]),
+                HumanMessage(content=_build_planner_user_request(selected_user_input)),
             ]
 
         plan_text = ""
@@ -385,10 +405,10 @@ def create_plan_node(
                     result_state,
                     response_text=PLAN_EDIT_PROGRESS_TEXT.get(
                         plan_mode,
-                        "I have updated the plan.",
+                        "已更新计划。",
                     ),
                     response_type="progress",
-                    source_event_type="plan_edited",
+                    source_event_type="plan_updated",
                 )
 
             parsed_tasks, first_task_id = parse_planned_tasks_from_response(
@@ -396,6 +416,10 @@ def create_plan_node(
                 plan_id=plan_id,
                 user_input_id=user_input_id,
                 created_at=created_at,
+                user_display_label=derive_display_label_from_user_text(
+                    selected_user_input.get("original_content")
+                    or selected_user_input.get("content")
+                ),
             )
 
             tasks = parsed_tasks

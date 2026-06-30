@@ -77,10 +77,22 @@ profiles:
 
     # Optional local API keys. Prefer environment variables when possible:
     #   DASHSCOPE_API_KEY
+    #   DASHSCOPE_API_KEYS="sk-1,sk-2,sk-3"
     #   DEEPSEEK_API_KEY
     #   DOUBAO_API_KEY
     #
+    # For offline scene-memory annotation, put the team's DashScope key pool
+    # here. The annotation tool will distribute one batch across the available
+    # keys and still respect the UI/CLI batch_size as the total concurrency cap.
+    #
     # api_keys:
-    #   dashscope: "sk-..."
+    #   dashscope:
+    #     - "sk-xxx"
+    #     - "sk-yyy"
+    #     - "sk-zzz"
+    #   # Or group by teammate; both forms are accepted.
+    #   # dashscope:
+    #   #   teammate_a: ["sk-xxx", "sk-yyy"]
+    #   #   teammate_b: ["sk-zzz"]
     #   deepseek: "sk-..."
     #   doubao: "..."

@@ -204,6 +204,118 @@ def make_unique_branch_label(label: str, used_labels: set[str]) -> str:
     return candidate
 
 
+def derive_display_label_from_user_text(text: Any) -> str:
+    """Return a compact user-language target label from an original request."""
+
+    label = str(text or "").strip()
+    if not label:
+        return ""
+    label = re.sub(r"\s+", " ", label)
+    label = label.strip(" \t\r\n。.!?！？")
+    if not label:
+        return ""
+
+    # Generic request-wrapper cleanup: preserve the user's own target words for
+    # display/voice while keeping the executor's work-language query separate.
+    replacements = (
+        (r"^我想(?:找|寻找|去找|去|到|前往|靠近|看|看看)\s*", ""),
+        (r"^请(?:你)?(?:帮我)?\s*", ""),
+        (r"^(?:帮我)?(?:去找|找|寻找|去|到|前往|靠近|带我去|带我到)\s*", ""),
+        (r"(?:，|,)?\s*(?:请)?(?:帮我)?(?:找一个合适的位置)?(?:，|,)?\s*(?:并)?(?:带我过去|带我去|带我到那里|领我过去|导航过去|过去)$", ""),
+        (r"^(?:i want to|please|help me|can you)\s+", ""),
+        (r"^(?:find|look for|navigate to|go to|guide me to|take me to)\s+", ""),
+        (r"(?:,\s*)?(?:please\s*)?(?:find a suitable location and\s*)?(?:take me there|guide me there|navigate there)$", ""),
+    )
+    for pattern, replacement in replacements:
+        label = re.sub(pattern, replacement, label, flags=re.IGNORECASE).strip()
+        label = label.strip(" \t\r\n。.!?！？")
+    return label[:80]
+
+
+def _semantic_target_needs_display_label(target: dict[str, Any]) -> bool:
+    return str(target.get("type") or "").strip() in {
+        "semantic_keyframe",
+        "semantic_object",
+    }
+
+
+def _apply_user_display_label_to_target(
+    target: dict[str, Any],
+    *,
+    user_display_label: str,
+) -> dict[str, Any]:
+    if not _semantic_target_needs_display_label(target):
+        return target
+    updated = dict(target)
+    existing_label = str(updated.get("display_label") or "").strip()
+    if existing_label:
+        updated["display_label"] = existing_label
+    else:
+        candidate = _semantic_target_label_candidate(updated, fallback="")
+        if candidate:
+            updated["display_label"] = candidate
+        elif user_display_label:
+            updated["display_label"] = user_display_label
+
+    existing_query = str(updated.get("user_query") or "").strip()
+    if existing_query:
+        updated["user_query"] = existing_query
+    elif updated.get("display_label"):
+        updated["user_query"] = str(updated["display_label"])
+    return updated
+
+
+def _semantic_target_label_candidate(
+    target: dict[str, Any],
+    *,
+    fallback: str = "",
+) -> str:
+    """Return the target-local phrase suitable for UI display/voice."""
+
+    for key in ("display_label", "object_description", "query", "user_query"):
+        value = str(target.get(key) or "").strip()
+        if value:
+            return value[:80]
+    return str(fallback or "").strip()[:80]
+
+
+_TASK_OUTPUT_TEMPLATE_RE = re.compile(
+    r"^\s*\{\{\s*task\s*(\d+)\s*\.\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}\s*$"
+)
+
+
+def _coerce_template_target_to_task_output(
+    target: dict[str, Any],
+) -> dict[str, Any]:
+    """Convert unresolved planner templates into the existing task_output target."""
+
+    target_type = str(target.get("type") or "").strip()
+    if target_type not in {"semantic_keyframe", "semantic_object"}:
+        return target
+    template_source = None
+    for key in ("query", "object_description"):
+        value = str(target.get(key) or "").strip()
+        match = _TASK_OUTPUT_TEMPLATE_RE.match(value)
+        if match:
+            template_source = match
+            break
+    if template_source is None:
+        return target
+    source_task_id = int(template_source.group(1))
+    field = str(template_source.group(2) or "destination").strip()
+    if field in {"destination_query", "destination_description", "target_query"}:
+        field = "destination"
+    converted = {
+        "type": "task_output",
+        "task_id": source_task_id,
+        "field": field,
+    }
+    for key in ("display_label", "user_query", "target_kind", "selection_policy"):
+        if target.get(key) not in (None, "", [], {}):
+            converted[key] = target.get(key)
+    return converted
+
+
 def decision_condition_text(task: TaskItem) -> str:
     """Extract the most useful human-readable condition for a decision task."""
 
@@ -343,6 +455,7 @@ def parse_planned_tasks_from_response(
     plan_id: str,
     user_input_id: str,
     created_at: str,
+    user_display_label: str = "",
 ) -> tuple[dict[int, TaskItem], Optional[int]]:
     """Parse planner JSON into normalized task records."""
 
@@ -384,7 +497,22 @@ def parse_planned_tasks_from_response(
         if isinstance(task_info.get("inputs_from"), dict):
             parsed_tasks[task_id]["inputs_from"] = dict(task_info["inputs_from"])
         if isinstance(task_info.get("target"), dict):
-            parsed_tasks[task_id]["target"] = dict(task_info["target"])
+            parsed_target = _apply_user_display_label_to_target(
+                dict(task_info["target"]),
+                user_display_label=user_display_label,
+            )
+            parsed_target = _coerce_template_target_to_task_output(parsed_target)
+            parsed_tasks[task_id]["target"] = parsed_target
+            if parsed_target.get("type") == "task_output":
+                try:
+                    source_task_id = int(parsed_target.get("task_id"))
+                except Exception:
+                    source_task_id = None
+                if source_task_id is not None:
+                    depends_on = list(parsed_tasks[task_id].get("depends_on") or [])
+                    if source_task_id not in depends_on:
+                        depends_on.append(source_task_id)
+                    parsed_tasks[task_id]["depends_on"] = depends_on
         if isinstance(task_info.get("image_refs"), list):
             parsed_tasks[task_id]["image_refs"] = [
                 str(value).strip()
@@ -394,6 +522,8 @@ def parse_planned_tasks_from_response(
         for optional_key in (
             "scene_context",
             "selection_policy",
+            "display_label",
+            "user_query",
         ):
             optional_value = task_info.get(optional_key)
             if optional_value is not None and str(optional_value).strip():
@@ -462,6 +592,8 @@ def remap_plan_task_ids(
         for optional_key in (
             "scene_context",
             "selection_policy",
+            "display_label",
+            "user_query",
         ):
             if task.get(optional_key) is not None:
                 remapped_task[optional_key] = str(task.get(optional_key) or "")

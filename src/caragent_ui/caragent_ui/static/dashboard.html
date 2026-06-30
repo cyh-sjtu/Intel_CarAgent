@@ -59,12 +59,14 @@
   </select>
   <button onclick="loadPorts()">刷新端口</button>
   <button onclick="refreshAll()">刷新</button>
+  <a href="/demo" target="_blank" style="color:#e5e7eb;text-decoration:none;border:1px solid var(--line);background:#14532d;border-radius:6px;padding:8px 11px;font-size:14px">展示模式</a>
   <button class="danger" onclick="stopAll()">停止全部</button>
 </header>
 <div class="layout">
 <nav>
   <button onclick="showTab('mapping')">建图</button>
   <button onclick="showTab('navigation')">导航</button>
+  <button onclick="showTab('rotation')">旋转调参</button>
   <button onclick="showTab('scene')">场景地图</button>
   <button onclick="showTab('agent')">Agent</button>
   <button onclick="showTab('tests')">测试工具</button>
@@ -121,21 +123,82 @@
     </div>
   </section>
 
+  <section id="rotation">
+    <h2>旋转对齐调参</h2>
+    <div class="grid">
+      <div class="card">
+        <h3>角度状态</h3>
+        <div class="item">
+          <div>当前角度：<b id="rot-current-yaw">--</b></div>
+          <div>目标角度：<b id="rot-target-yaw">--</b></div>
+          <div>剩余误差：<b id="rot-error">--</b></div>
+          <div>逆时针剩余：<b id="rot-ccw">--</b></div>
+          <div>当前角速度：<b id="rot-omega">--</b></div>
+          <div>角度来源：<b id="rot-source">--</b></div>
+          <div>状态：<b id="rot-status">--</b></div>
+        </div>
+        <p class="hint">调参控制通路与 Lite 遥控一致，发布到 /cmd_vel_nav，并同步对 /cmd_vel 发控制/停车。实验前请确认底盘速度使能已启动。</p>
+      </div>
+      <div class="card">
+        <h3>目标角度</h3>
+        <label>绝对目标角度 deg</label><input id="rot-target-deg" value="90" type="number" min="-180" max="180" step="1">
+        <label>相对旋转角度 deg</label><input id="rot-delta-deg" value="90" type="number" min="-360" max="360" step="1">
+        <div class="row" style="margin-top:12px">
+          <button class="primary" onclick="startRotationTuneAbsolute()">按绝对角开始</button>
+          <button class="ok" onclick="startRotationTuneRelative()">按相对角开始</button>
+          <button onclick="setRotationTargetFromCurrent()">填入当前角</button>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <button onclick="quickRotationDelta(45)">当前 +45°</button>
+          <button onclick="quickRotationDelta(90)">当前 +90°</button>
+          <button onclick="quickRotationDelta(180)">当前 +180°</button>
+          <button class="danger" onclick="stopRotationTune()">急停</button>
+        </div>
+      </div>
+      <div class="card wide">
+        <h3>left-only 分段参数</h3>
+        <div class="grid">
+          <div class="card third">
+            <label>高速角速度 rad/s</label><input id="rot-fast-omega" value="3.40" type="number" min="0" max="3.50" step="0.01">
+            <label>中速角速度 rad/s</label><input id="rot-mid-omega" value="2.50" type="number" min="0" max="3.50" step="0.01">
+            <label>低速角速度 rad/s</label><input id="rot-slow-omega" value="1.50" type="number" min="0" max="3.50" step="0.01">
+          </div>
+          <div class="card third">
+            <label>高速阈值 deg</label><input id="rot-fast-threshold" value="20" type="number" min="0" max="180" step="1">
+            <label>中速阈值 deg</label><input id="rot-mid-threshold" value="10" type="number" min="0" max="180" step="1">
+            <label>到达容差 deg</label><input id="rot-tolerance" value="4" type="number" min="0.1" max="30" step="0.1">
+          </div>
+          <div class="card third">
+            <label>允许小角度右转阈值 deg</label><input id="rot-right-shortcut" value="90" type="number" min="0" max="180" step="1">
+            <label>稳定等待 s</label><input id="rot-settle" value="0.20" type="number" min="0" max="5" step="0.05">
+            <label>超时 s</label><input id="rot-timeout" value="20" type="number" min="1" max="120" step="1">
+            <label>固件角速度上限 rad/s</label><input id="rot-omega-cap" value="3.50" type="number" min="0.1" max="3.50" step="0.01">
+          </div>
+        </div>
+        <div class="row" style="margin-top:12px">
+          <button class="ok" onclick="saveRotationTuneDefaults()">保存为默认参数</button>
+          <span id="rot-save-status" class="small muted"></span>
+        </div>
+        <p class="small muted">阈值逻辑与当前 left-only takeover 一致：误差大于高速阈值用高速，大于中速阈值用中速，否则用低速；若目标在右侧且小于“允许小角度右转阈值”，允许短右转。</p>
+      </div>
+    </div>
+  </section>
+
   <section id="scene">
     <h2>场景地图</h2>
     <div class="grid">
       <div class="card">
-        <h3>采集与筛选</h3>
+        <h3>采集与场景记忆</h3>
         <label>Session 名称</label><input id="kf-session" placeholder="session_YYYYMMDD_HHMMSS">
         <label>定位地图</label><select id="kf-map"></select>
-        <div class="row" style="margin-top:12px"><button class="primary" onclick="startKeyframes()">开始录制</button><button class="danger" onclick="stopProcess('keyframe_record')">结束录制</button><button onclick="selectKeyframes()">离线筛选</button></div>
+        <div class="row" style="margin-top:12px"><button class="primary" onclick="startKeyframes()">开始录制</button><button class="danger" onclick="stopKeyframes()">结束并生成场景记忆</button><button onclick="buildSceneMemory()">重建场景记忆</button></div>
       </div>
       <div class="card">
         <h3>语义与可视化</h3>
         <label>Session / selected</label><select id="scene-session"></select>
-        <div class="split"><div><label>Batch Size</label><input id="anno-batch" value="5" type="number" min="1" max="20"></div><div><label>API Key (DashScope)</label><input id="anno-apikey" placeholder="sk-... 留空用配置文件"></div></div>
-        <div class="row"><button onclick="visualizeScene()">生成场景地图 HTML</button><button onclick="annotateScene(false)">VLM 标注未标注帧</button><button onclick="showReannotateModal()">选择重标</button></div>
-        <p class="small muted">部分关键帧重标作为 v1.1；MVP 先支持全量/未标注。</p>
+        <label>Batch Size</label><input id="anno-batch" value="36" type="number" min="1" max="60">
+        <div class="row"><button onclick="visualizeScene()">生成场景地图 HTML</button><button onclick="annotateScene(false)">VLM 标注未标注帧</button><button onclick="showReannotateModal()">选择重标</button><button class="danger" onclick="showRemoveKeyframesModal()">剔除关键帧</button></div>
+        <p class="small muted">录制结束会自动筛选关键帧、生成 keyframe nodes、尝试语义标注并预构建 semantic chunk index。</p>
       </div>
       <div class="card wide"><h3>已有场景地图</h3><div id="sessions-list" class="list"></div></div>
     </div>
@@ -151,6 +214,9 @@
         <label><input id="agent-cmd" type="checkbox" style="width:auto"> 速度使能 enable_cmd_vel</label>
         <label>config_file <span class="muted">(高级，留空=默认)</span></label><input id="agent-config">
         <div class="row"><button class="primary" onclick="startAgent()">启动 Agent</button><button class="danger" onclick="stopProcess('agent')">停止 Agent</button><a id="agent-link" target="_blank">打开 Agent UI</a></div>
+        <label>虚拟仿真延迟 s</label><input id="agent-sim-delay" value="8" type="number" min="1" max="60" step="1">
+        <div class="row" style="margin-top:10px"><button class="ok" onclick="startAgentSim()">启动虚拟仿真 Agent</button><button class="danger" onclick="stopProcess('agent_sim')">停止仿真</button><a id="agent-sim-link" target="_blank">打开仿真可视化</a><a id="agent-sim-lite-link" target="_blank">仿真 Lite</a></div>
+        <p class="small muted">虚拟仿真只模拟导航到达，不控制实机底盘；planner、resolver、检索、播报状态仍走真实 Agent。</p>
       </div>
       <div class="card">
         <h3>SSH 隧道</h3>
@@ -290,6 +356,7 @@
 
 <script>
 let statusCache = {};
+let rotationParamsLoaded = false;
 const $ = id => document.getElementById(id);
 const api = async (url, opts={}) => {
   const r = await fetch(url, opts);
@@ -303,7 +370,14 @@ function toast(msg){ console.log(msg); }
 function showTab(id){ document.querySelectorAll('main section').forEach(s=>s.classList.remove('active')); $(id).classList.add('active'); }
 function opt(sel, value, text){ const o=document.createElement('option'); o.value=value; o.textContent=text||value; sel.appendChild(o); }
 function fileLink(path, text){ return path ? `<a target="_blank" href="/api/file?path=${encodeURIComponent(path)}">${text||path.split('/').pop()}</a>` : ''; }
+function stamp(){ const d=new Date(); const p=n=>String(n).padStart(2,'0'); return `${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`; }
+function safeSessionName(value){ const cleaned=String(value||'').trim().replace(/[^A-Za-z0-9_.-]+/g,'_').replace(/^_+|_+$/g,''); return cleaned || `session_${stamp()}`; }
+function sceneBuildBody(dataset){
+  return {dataset, annotate:'auto', chunk_index:'auto', batch_size:parseInt($('anno-batch').value)||36};
+}
 function globalPorts(){ return { laser_port:$('global-laser').value, stm32_port:$('global-stm32').value, camera_device:$('global-camera').value, camera_resolution:$('global-camera-resolution').value }; }
+function degText(value){ return Number.isFinite(value) ? `${value.toFixed(1)}°` : '--'; }
+function numText(value, digits=2){ return Number.isFinite(value) ? value.toFixed(digits) : '--'; }
 async function loadPorts(){
   const data = await api('/api/ports');
   const serial = data.serial?.length ? data.serial : ['/dev/ttyUSB0','/dev/ttyUSB1'];
@@ -317,6 +391,10 @@ async function refreshStatus(){
   $('ssh-tunnel').value = statusCache.ssh_tunnel || '';
   $('agent-link').href = `http://${location.hostname}:${statusCache.agent_web_port || 8123}`;
   $('agent-link').textContent = `http://${location.hostname}:${statusCache.agent_web_port || 8123}`;
+  $('agent-sim-link').href = `http://${location.hostname}:${statusCache.agent_sim_web_port || 8124}/sim`;
+  $('agent-sim-link').textContent = `http://${location.hostname}:${statusCache.agent_sim_web_port || 8124}/sim`;
+  $('agent-sim-lite-link').href = `http://${location.hostname}:${statusCache.agent_sim_web_port || 8124}/lite`;
+  $('agent-sim-lite-link').textContent = `http://${location.hostname}:${statusCache.agent_sim_web_port || 8124}/lite`;
   $('agent-config').value ||= `${statusCache.workspace}/src/caragent_agent/config/config.yaml`;
   $('obj-out').value ||= `${statusCache.workspace}/perception_outputs/scan_monodepth_validation`;
   $('oa-out').value ||= `${statusCache.workspace}/perception_outputs/object_approach_live`;
@@ -330,6 +408,85 @@ async function refreshStatus(){
   $('any-running').className = 'status-dot ' + (running?'on':'');
   $('system-status').textContent = running ? 'process running' : 'idle';
   const f=$('log-filter'); const old=f.value; f.innerHTML=''; opt(f,'','全部'); Object.keys(procs).forEach(k=>opt(f,k,k)); f.value=old;
+}
+async function refreshRotationTune(){
+  if(!$('rot-current-yaw')) return;
+  try{
+    const s = await api('/api/rotation_tune/status');
+    $('rot-current-yaw').textContent = degText(s.current_yaw_deg);
+    $('rot-target-yaw').textContent = degText(s.target_yaw_deg);
+    $('rot-error').textContent = degText(s.shortest_error_deg);
+    $('rot-ccw').textContent = degText(s.ccw_remaining_deg);
+    $('rot-omega').textContent = `${numText(s.current_omega,2)} rad/s (${s.direction || 'stop'})`;
+    $('rot-source').textContent = `${s.yaw_source || '--'}${Number.isFinite(s.yaw_age_sec)?`, ${s.yaw_age_sec.toFixed(2)}s`:''}`;
+    $('rot-status').textContent = `${s.status || '--'} ${s.message || ''}`.trim();
+    if(!rotationParamsLoaded && s.params){
+      const entries = [
+        ['rot-fast-omega','fast_omega'], ['rot-mid-omega','mid_omega'], ['rot-slow-omega','slow_omega'],
+        ['rot-fast-threshold','fast_threshold_deg'], ['rot-mid-threshold','mid_threshold_deg'],
+        ['rot-tolerance','yaw_tolerance_deg'], ['rot-right-shortcut','right_turn_shortcut_deg'],
+        ['rot-settle','settle_time_sec'], ['rot-timeout','timeout_sec'], ['rot-omega-cap','omega_cap'],
+      ];
+      for(const [id,key] of entries){
+        const el = $(id);
+        const value = s.params[key];
+        if(el && Number.isFinite(value)) el.value = String(value);
+      }
+      rotationParamsLoaded = true;
+    }
+    const saved = $('rot-save-status');
+    if(saved && s.config_saved) saved.textContent = `已加载默认参数：${s.config_path || ''}`;
+  }catch(e){
+    $('rot-status').textContent = '状态读取失败: '+e.message;
+  }
+}
+function rotationTuneBody(){
+  return {
+    fast_omega:parseFloat($('rot-fast-omega').value)||0,
+    mid_omega:parseFloat($('rot-mid-omega').value)||0,
+    slow_omega:parseFloat($('rot-slow-omega').value)||0,
+    fast_threshold_deg:parseFloat($('rot-fast-threshold').value)||20,
+    mid_threshold_deg:parseFloat($('rot-mid-threshold').value)||10,
+    yaw_tolerance_deg:parseFloat($('rot-tolerance').value)||4,
+    right_turn_shortcut_deg:parseFloat($('rot-right-shortcut').value)||90,
+    settle_time_sec:parseFloat($('rot-settle').value)||0,
+    timeout_sec:parseFloat($('rot-timeout').value)||20,
+    omega_cap:parseFloat($('rot-omega-cap').value)||3.5,
+  };
+}
+async function startRotationTuneAbsolute(){
+  const body = {...rotationTuneBody(), mode:'absolute', target_yaw_deg:parseFloat($('rot-target-deg').value)||0};
+  await api('/api/rotation_tune/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  await refreshRotationTune();
+}
+async function startRotationTuneRelative(){
+  const body = {...rotationTuneBody(), mode:'relative', relative_delta_deg:parseFloat($('rot-delta-deg').value)||0};
+  await api('/api/rotation_tune/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  await refreshRotationTune();
+}
+async function quickRotationDelta(deg){
+  $('rot-delta-deg').value = String(deg);
+  await startRotationTuneRelative();
+}
+async function stopRotationTune(){
+  await api('/api/rotation_tune/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+  await refreshRotationTune();
+}
+async function saveRotationTuneDefaults(){
+  const el = $('rot-save-status');
+  if(el) el.textContent = '保存中...';
+  try{
+    const s = await api('/api/rotation_tune/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(rotationTuneBody())});
+    rotationParamsLoaded = false;
+    if(el) el.textContent = `已保存：${s.config_path || ''}`;
+    await refreshRotationTune();
+  }catch(e){
+    if(el) el.textContent = '保存失败: '+e.message;
+  }
+}
+async function setRotationTargetFromCurrent(){
+  const s = await api('/api/rotation_tune/status');
+  if(Number.isFinite(s.current_yaw_deg)) $('rot-target-deg').value = s.current_yaw_deg.toFixed(1);
 }
 async function refreshMaps(){
   const data = await api('/api/maps');
@@ -345,7 +502,7 @@ async function refreshKeyframes(){
   if(sessions.some(x=>(x.selected_path||x.path)===old))sel.value=old;
   if(sessions.some(x=>(x.selected_path||x.path)===aold))asel.value=aold;
   if(vsel && sessions.some(x=>(x.selected_path||x.path)===vold))vsel.value=vold;
-  $('sessions-list').innerHTML=sessions.map(x=>`<div class="item"><b>${x.name}</b><div class="small muted mono">${x.path}</div><div>candidate=${x.candidate_frames} selected=${x.selected_frames} nodes=${x.keyframe_nodes} semantic=${x.semantic_nodes}</div><div>${fileLink(x.review_html,'review')} ${fileLink(x.scene_html,'scene map')}</div></div>`).join('') || '<div class="muted">暂无 session</div>';
+  $('sessions-list').innerHTML=sessions.map(x=>`<div class="item"><b>${x.name}</b> <span class="small muted">${x.build_status||'recorded'}</span><div class="small muted mono">${x.path}</div><div>candidate=${x.candidate_frames} selected=${x.selected_frames} nodes=${x.keyframe_nodes} semantic=${x.semantic_nodes} chunks=${x.semantic_chunks||0}</div><div>${fileLink(x.review_html,'review')} ${fileLink(x.scene_html,'scene map')} ${fileLink(x.summary_json,'summary')} ${fileLink(x.manifest_json,'manifest')}</div></div>`).join('') || '<div class="muted">暂无 session</div>';
 }
 async function refreshVlmImages(){
   const session = $('vlm-session')?.value || '';
@@ -402,18 +559,40 @@ async function clearChanges(){ try{ const r=await api('/api/slam/clear_changes',
 async function toggleAutoClear(){ const enable=$('auto-clear').checked; const r=await api('/api/slam/auto_clear',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enable})}); if(!r.ok){ alert(r.error); $('auto-clear').checked=false; } }
 function startSlam(){ startProcess('slam',{...globalPorts(), map_base:$('slam-map').value}); }
 function startNavigation(){ startProcess('navigation',{...globalPorts(), map_base:$('nav-map').value, enable_cmd_vel:$('nav-cmd').checked, enable_left_only_goal_proxy:$('nav-left-only').checked, max_linear_mps:$('nav-max-linear').value, pre_align_strategy:$('nav-pre-align-strategy').value, path_heading_lookahead_m:$('nav-path-lookahead').value}); }
-function startKeyframes(){ startProcess('keyframe_record',{...globalPorts(), session_name:$('kf-session').value, map_base:$('kf-map').value}); }
-async function selectKeyframes(){ const chosen=$('scene-session').value; const dataset=chosen.endsWith('/selected') ? chosen.slice(0,-9) : chosen; await api('/api/keyframes/select',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dataset})}); showTab('logs'); $('log-filter').value='keyframe_select'; refreshLogs(); }
+function startKeyframes(){ const session=safeSessionName($('kf-session').value); $('kf-session').value=session; startProcess('keyframe_record',{...globalPorts(), session_name:session, map_base:$('kf-map').value}); }
+async function stopKeyframes(){
+  const session=$('kf-session').value.trim();
+  const workspace=statusCache.workspace || '';
+  const dataset=(session && workspace) ? `${workspace}/keyframes/${session}` : '';
+  const body={kind:'keyframe_record', build_scene_memory:true, session_name:session, ...sceneBuildBody(dataset)};
+  await api('/api/process/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  await refreshAll();
+  showTab('logs'); $('log-filter').value='keyframe_build'; refreshLogs();
+}
+async function buildSceneMemory(){
+  const chosen=$('scene-session').value;
+  if(!chosen){ alert('请先选择 Session'); return; }
+  const dataset=chosen.endsWith('/selected') ? chosen.slice(0,-9) : chosen;
+  const body=sceneBuildBody(dataset);
+  body.adopt_existing = false;
+  await api('/api/keyframes/select',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  showTab('logs'); $('log-filter').value='keyframe_build'; refreshLogs();
+}
+async function selectKeyframes(){ await buildSceneMemory(); }
 async function visualizeScene(){ const r=await api('/api/keyframes/visualize',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dataset:$('scene-session').value})}); await refreshKeyframes(); if(r.path) window.open('/api/file?path='+encodeURIComponent(r.path),'_blank'); }
-async function annotateScene(force){ const body={dataset:$('scene-session').value,force,batch_size:parseInt($('anno-batch').value)||5}; const apikey=$('anno-apikey').value.trim(); if(apikey) body.api_key=apikey; await api('/api/keyframes/annotate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); showTab('logs'); $('log-filter').value='keyframe_annotate'; refreshLogs(); }
-let kfNodesCache=[],kfSelected= new Set();
-async function showReannotateModal(){ const dataset=$('scene-session').value; if(!dataset){ alert('请先选择 Session'); return; } try{ const r=await api('/api/keyframes/nodes',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dataset})}); kfNodesCache=r.nodes||[];kfSelected=new Set(); renderKfList(); $('reannotate-modal').classList.add('show'); }catch(e){ alert('加载关键帧失败: '+e.message); } }
+async function annotateScene(force){ const body={dataset:$('scene-session').value,force,batch_size:parseInt($('anno-batch').value)||36}; await api('/api/keyframes/annotate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); showTab('logs'); $('log-filter').value='keyframe_annotate'; refreshLogs(); }
+let kfNodesCache=[],kfSelected= new Set(),kfModalMode='annotate';
+async function openKeyframeModal(mode){ const dataset=$('scene-session').value; if(!dataset){ alert('请先选择 Session'); return; } try{ const r=await api('/api/keyframes/nodes',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dataset})}); kfModalMode=mode;kfNodesCache=r.nodes||[];kfSelected=new Set(); renderKfList(); $('kf-modal-title').textContent=mode==='remove'?'选择要剔除的关键帧':'选择要重标的关键帧'; $('kf-modal-submit').textContent=mode==='remove'?'剔除所选':'标注所选'; $('kf-modal-submit').className=mode==='remove'?'danger':'ok'; $('reannotate-modal').classList.add('show'); }catch(e){ alert('加载关键帧失败: '+e.message); } }
+async function showReannotateModal(){ await openKeyframeModal('annotate'); }
+async function showRemoveKeyframesModal(){ await openKeyframeModal('remove'); }
 function closeModal(){ $('reannotate-modal').classList.remove('show'); }
 function renderKfList(){ const list=$('reannotate-list'); list.innerHTML=kfNodesCache.map(n=>`<label class="kf-item${kfSelected.has(n.kf_id)?' selected':''}" onclick="toggleKf(${n.kf_id},this)"><input type="checkbox" ${kfSelected.has(n.kf_id)?'checked':''} style="pointer-events:none"><span>kf_${n.kf_id}</span><span class="muted" style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${n.semantic||'(无标注)'}</span><span class="muted small">x=${n.x.toFixed(1)} y=${n.y.toFixed(1)}</span></label>`).join(''); }
 function toggleKf(id,el){ if(kfSelected.has(id)){ kfSelected.delete(id); el.classList.remove('selected'); }else{ kfSelected.add(id); el.classList.add('selected'); } }
 function toggleSelectAll(){ if(kfSelected.size===kfNodesCache.length){ kfSelected.clear(); }else{ kfNodesCache.forEach(n=>kfSelected.add(n.kf_id)); } renderKfList(); }
-async function submitReannotate(){ if(kfSelected.size===0){ alert('请至少选择一个关键帧'); return; } const ids=Array.from(kfSelected).join(','); closeModal(); const body={dataset:$('scene-session').value,ids,batch_size:parseInt($('anno-batch').value)||5}; const apikey=$('anno-apikey').value.trim(); if(apikey) body.api_key=apikey; await api('/api/keyframes/annotate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); showTab('logs'); $('log-filter').value='keyframe_annotate'; refreshLogs(); }
+async function submitKeyframeModal(){ if(kfSelected.size===0){ alert('请至少选择一个关键帧'); return; } const ids=Array.from(kfSelected).sort((a,b)=>a-b).join(','); if(kfModalMode==='remove' && !confirm(`确认从当前 selected 场景记忆中剔除这些关键帧？\n${ids}\n\n原始采集数据会保留，selected 索引和网页会刷新。`)) return; closeModal(); if(kfModalMode==='remove'){ const r=await api('/api/keyframes/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dataset:$('scene-session').value,ids})}); alert(`已剔除 ${r.removed||0} 个关键帧，当前 selected=${r.selected_frames||0}`); await refreshKeyframes(); }else{ const body={dataset:$('scene-session').value,ids,batch_size:parseInt($('anno-batch').value)||36}; await api('/api/keyframes/annotate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); showTab('logs'); $('log-filter').value='keyframe_annotate'; refreshLogs(); } }
+async function submitReannotate(){ await submitKeyframeModal(); }
 function startAgent(){ startProcess('agent',{...globalPorts(), dataset_dir:$('agent-session').value,config_file:$('agent-config').value,map_base:$('agent-map').value,enable_cmd_vel:$('agent-cmd').checked}); }
+function startAgentSim(){ startProcess('agent_sim',{dataset_dir:$('agent-session').value,config_file:$('agent-config').value,web_port:statusCache.agent_sim_web_port || 8124,delay_sec:parseFloat($('agent-sim-delay').value)||8}); }
 function startObjectPipeline(){ startProcess('object_pipeline',{...globalPorts(), target:$('obj-target').value,label_query:$('obj-label').value,truth_distance_m:$('obj-truth').value,localization_mode:$('obj-mode').value,output_dir:$('obj-out').value}); }
 function startObjectApproachLive(){
   startProcess('object_approach_live',{
@@ -537,13 +716,13 @@ function renderLogs(lines){
   $('log').scrollTop = $('log').scrollHeight;
 }
 async function refreshAll(){ await loadPorts(); await refreshStatus(); await refreshMaps(); await refreshKeyframes(); await refreshVlmImages(); await refreshResults(); await refreshObjectDepthDatasets(); await refreshLogs(); }
-refreshAll(); setInterval(()=>{refreshStatus(); refreshLogs(); loadPorts();},2500);
+refreshAll(); setInterval(()=>{refreshStatus(); refreshLogs(); loadPorts();},2500); setInterval(refreshRotationTune,300);
 </script>
 <div class="modal-overlay" id="reannotate-modal">
 <div class="modal-box">
-<div class="modal-header"><h2>选择要重标的关键帧</h2><span id="kf-select-all" onclick="toggleSelectAll()">全选/取消</span><button onclick="closeModal()" style="border:none;background:none;font-size:18px;cursor:pointer">&times;</button></div>
+<div class="modal-header"><h2 id="kf-modal-title">选择要重标的关键帧</h2><span id="kf-select-all" onclick="toggleSelectAll()">全选/取消</span><button onclick="closeModal()" style="border:none;background:none;font-size:18px;cursor:pointer">&times;</button></div>
 <div class="modal-body" id="reannotate-list"></div>
-<div class="modal-footer"><button onclick="closeModal()">取消</button><button class="ok" onclick="submitReannotate()">标注所选</button></div>
+<div class="modal-footer"><button onclick="closeModal()">取消</button><button class="ok" id="kf-modal-submit" onclick="submitKeyframeModal()">标注所选</button></div>
 </div></div>
 </body>
 </html>

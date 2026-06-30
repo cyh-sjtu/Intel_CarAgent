@@ -8,6 +8,7 @@
   <license>MIT</license>
 
   <exec_depend>caragent_bringup</exec_depend>
+  <exec_depend>caragent_agent</exec_depend>
   <exec_depend>caragent_vision</exec_depend>
   <exec_depend>cv_bridge</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>

@@ -100,6 +100,8 @@ class NavigationTarget(TypedDict):
     task_id: NotRequired[int]
     field: NotRequired[str]
     query: NotRequired[str]
+    display_label: NotRequired[str]
+    user_query: NotRequired[str]
     selection_policy: NotRequired[str]
     object_description: NotRequired[str]
     stop_distance_m: NotRequired[float]
@@ -142,9 +144,11 @@ class TaskResultItem(TypedDict):
     decision: NotRequired[str]
     tool_name: NotRequired[str]
     destination: NotRequired[dict[str, Any]]
+    destination_description: NotRequired[str]
     selected_object: NotRequired[dict[str, Any]]
     visual_observation: NotRequired[dict[str, Any]]
     current_place_context: NotRequired[dict[str, Any]]
+    arrival_verification: NotRequired[dict[str, Any]]
 
 
 class UserInputItem(TypedDict):
@@ -156,6 +160,7 @@ class UserInputItem(TypedDict):
     created_at: str
     attached_images: NotRequired[list[dict[str, Any]]]
     original_content: NotRequired[str]
+    agent_content: NotRequired[str]
     resolved_referent_id: NotRequired[str]
     resolved_referent_ids: NotRequired[list[str]]
     resolution_note: NotRequired[str]
@@ -216,6 +221,22 @@ class TurnResponseItem(TypedDict):
     created_at: str
     source_event_type: NotRequired[str]
     task_id: NotRequired[int]
+
+
+class GuidanceEventItem(TypedDict):
+    """One UI/voice guidance event emitted outside the task scheduler."""
+
+    event_id: str
+    event_type: str
+    text: str
+    created_at: str
+    priority: str
+    interrupt: bool
+    dedupe_key: str
+    task_id: NotRequired[int]
+    source_event_id: NotRequired[str]
+    source_event_type: NotRequired[str]
+    payload: NotRequired[dict[str, Any]]
 
 
 class NextAction(TypedDict):
@@ -300,6 +321,7 @@ class AsyncAgentState(TypedDict):
     turn_response_id: NotRequired[Optional[str]]
     user_facing_response: NotRequired[Optional[str]]
     user_facing_response_id: NotRequired[Optional[str]]
+    guidance_events: NotRequired[list[GuidanceEventItem]]
 
 
 class OrchestrateContext(TypedDict):
@@ -326,6 +348,7 @@ __all__ = [
     "BackgroundAnalysisStatus",
     "EventItem",
     "EventType",
+    "GuidanceEventItem",
     "NavigationImageFocus",
     "NavigationTarget",
     "NavigationTargetKind",

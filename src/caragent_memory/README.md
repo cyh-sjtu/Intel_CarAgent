@@ -1,6 +1,6 @@
 # caragent_memory
 
-`caragent_memory` 负责关键帧候选采集、图像质量评估、CLIP/DINOv2 特征生成和离线关键帧筛选。它将机器人经过的位置与视觉观测绑定起来，为 Agent 提供轻量化语义场景地图。
+`caragent_memory` 负责关键帧候选采集、图像质量评估、CLIP/DINOv2 特征生成和场景记忆构建。它将机器人经过的位置与视觉观测绑定起来，为 Agent 提供轻量化语义场景地图。
 
 ## 模块定位
 
@@ -12,7 +12,8 @@
 | --- | --- |
 | `launch/caragent_keyframe_collect.launch.py` | 启动定位、相机和 keyframe recorder |
 | `keyframe_recorder_node.py` | 在线记录图像、位姿、scan 摘要和质量指标 |
-| `select_keyframes.py` | 离线筛选关键帧并生成 selected 数据集 |
+| `build_scene_memory.py` | 从一次录制 session 自动完成关键帧筛选、语义标注、chunk index 和统一 manifest |
+| `select_keyframes.py` | 关键帧筛选与 selected 数据集基础结构生成 |
 | `dataset.py` | 数据集结构、manifest 读写和记录解析 |
 | `image_quality.py` | 清晰度、亮度、对比度等图像质量评估 |
 | `openvino_clip.py` / `convert_clip_openvino.py` | CLIP OpenVINO 图像特征推理与转换 |
@@ -36,16 +37,19 @@
 └── session.json     采集参数快照
 ```
 
-离线筛选输出：
+场景记忆输出：
 
 ```text
 selected/
 ├── selected_manifest.jsonl
 ├── rejected_manifest.jsonl
 ├── review.html
+├── scene_memory_summary.json
 ├── embeddings/
 └── constructed_memory/
     ├── keyframe_nodes/
+    ├── keyframe_graph.json
+    ├── scene_memory_manifest.json
     ├── semantic_chunk_index_records.json
     └── semantic_chunk_index_matrix.npy
 ```
@@ -72,18 +76,36 @@ selected/
 
 DINOv2 是当前默认去重后端，并默认通过 OpenVINO NPU 生成视觉特征；PyTorch 后端保留为回退路径。CLIP OpenVINO 图像编码用于边缘端语义检索加速。
 
+## 一键构建场景记忆
+
+录制结束后推荐使用统一入口：
+
+```bash
+ros2 run caragent_memory build_scene_memory \
+  --dataset ~/caragent_ws/keyframes/session_YYYYMMDD_HHMMSS \
+  --clip-model ~/caragent_ws/models/clip-vit-base-patch32/image_encoder.xml \
+  --dinov2-model ~/caragent_ws/models/dinov2 \
+  --device GPU \
+  --dinov2-device auto \
+  --annotate auto \
+  --chunk-index auto
+```
+
+`--annotate auto` 会在 `DASHSCOPE_API_KEY`、`DASHSCOPE_API_KEYS` 或本地忽略配置可用时自动调用 VLM 标注；没有 API key 时跳过语义阶段但仍保留完整 selected/keyframe_nodes 结构。团队多 key 建议写在 `caragent_agent/config/local_config.yaml` 的 `api_keys.dashscope` 列表中，`--annotation-batch-size` 仍表示总并发上限，标注工具会把同一批请求轮询分摊到可用 key。`--chunk-index auto` 会在存在语义描述时预计算 `semantic_chunk_index_*`，减少 Agent 首次查询延迟。
+
 ## 与其他模块关系
 
 - 上游依赖 `caragent_bringup` 提供定位、雷达和相机。
 - 输出的 selected 数据集由 `caragent_agent.impression_graph.SceneMemory` 加载。
 - `caragent_agent` 的关键帧检索、参考图片匹配和导航工具依赖该数据集中的图像、位姿和特征。
-- Dashboard 调用 `select_keyframes`、关键帧可视化和语义标注相关流程。
+- Dashboard 在“结束并生成场景记忆”时调用 `build_scene_memory`，手动“重建场景记忆”也走同一入口。
 
 ## 已实现能力
 
 - 在线采集带 map 位姿的双目关键帧候选。
 - 保存 scan 摘要和图像质量指标，便于后续审计。
-- 使用 CLIP / DINOv2 特征进行离线筛选和冗余去除。
+- 使用 CLIP / DINOv2 特征进行筛选和冗余去除。
+- 自动写出 `scene_memory_manifest.json`，将 keyframe nodes、graph、语义 chunk index 等产物收敛到一个完整模块。
 - 支持预计算 semantic chunk index，减少 live Agent 首次查询延迟。
 
 ## 边界说明

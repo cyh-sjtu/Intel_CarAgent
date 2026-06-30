@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CarAgent 展示控制台</title>
+<style>
+  :root{--bg:#f6f7fb;--panel:#fff;--ink:#172033;--muted:#64748b;--line:#d8dee8;--blue:#1d76d3;--green:#18864b;--red:#c23838;--amber:#a16207}
+  *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif}
+  header{height:62px;display:flex;align-items:center;gap:12px;padding:0 18px;background:#102033;color:white;position:sticky;top:0;z-index:5}
+  h1{font-size:20px;margin:0;font-weight:700}.spacer{flex:1}.pill{font-size:13px;padding:6px 10px;border:1px solid rgba(255,255,255,.25);border-radius:999px;color:#dbeafe}
+  main{display:grid;grid-template-columns:340px 1fr;gap:16px;padding:16px;max-width:1500px;margin:0 auto}
+  aside,.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:0 8px 22px rgba(15,23,42,.05)}
+  aside{padding:14px;position:sticky;top:78px;height:calc(100vh - 94px);overflow:auto}.panel{padding:16px;margin-bottom:16px}
+  h2{font-size:18px;margin:0 0 12px}h3{font-size:14px;margin:0 0 10px;color:var(--muted);text-transform:uppercase;letter-spacing:.03em}
+  label{font-size:12px;color:var(--muted);display:block;margin:10px 0 4px}
+  input,select,textarea{width:100%;border:1px solid var(--line);border-radius:6px;padding:8px 10px;background:white;color:var(--ink);font-size:14px}
+  button,a.btn{border:1px solid var(--line);background:#eef2f7;color:var(--ink);border-radius:6px;padding:8px 11px;font-size:14px;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;gap:6px}
+  button.primary,a.primary{background:var(--blue);border-color:var(--blue);color:white}button.ok{background:var(--green);border-color:var(--green);color:white}button.danger{background:var(--red);border-color:var(--red);color:white}
+  .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.wide{grid-column:1/-1}
+  .status-list{display:grid;gap:8px}.status{border:1px solid var(--line);border-radius:7px;padding:9px;background:#f8fafc}.status.running{border-color:#93c5fd;background:#eff6ff}.status.failed,.status.warning{border-color:#fecaca;background:#fff1f2}
+  .small{font-size:12px}.muted{color:var(--muted)}.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.log{height:250px;overflow:auto;background:#0f172a;color:#dbeafe;border-radius:8px;padding:10px;white-space:pre-wrap;font-size:12px;line-height:1.45}
+  .notice{display:none;position:fixed;left:50%;top:18%;transform:translateX(-50%);background:#0f172a;color:#fff;border:3px solid #38bdf8;border-radius:14px;padding:24px 34px;font-size:42px;font-weight:800;z-index:20;box-shadow:0 18px 50px rgba(0,0,0,.25)}
+  .notice.show{display:block}.links a{margin-right:10px}.hint{border:1px dashed var(--line);border-radius:6px;padding:9px;color:var(--muted);background:#fbfdff}
+  @media(max-width:980px){main{grid-template-columns:1fr}aside{position:static;height:auto}.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header>
+  <h1>CarAgent 展示控制台</h1>
+  <span class="pill" id="run-pill">加载中</span>
+  <div class="spacer"></div>
+  <a class="btn" href="/" target="_blank">开发者 Dashboard</a>
+  <a class="btn primary" id="agent-lite-link" target="_blank">用户聊天界面</a>
+</header>
+<div class="notice" id="keyframe-notice"></div>
+<main>
+  <aside>
+    <h2>设备端口</h2>
+    <label>Laser</label><select id="laser"></select>
+    <label>STM32</label><select id="stm32"></select>
+    <label>Camera</label><select id="camera"></select>
+    <label>Camera Resolution</label><select id="camera-resolution">
+      <option value="3840x1200">3840x1200</option>
+      <option value="3840x1080">3840x1080</option>
+      <option value="2560x720">2560x720</option>
+      <option value="1280x480">1280x480</option>
+    </select>
+    <div class="row" style="margin-top:12px">
+      <button onclick="loadPorts()">刷新端口</button>
+      <button class="danger" onclick="stopAll()">停止全部</button>
+    </div>
+    <hr>
+    <h2>窗口布局</h2>
+    <p class="small muted">下载后在本地 Windows 演示电脑运行，会尝试一次性摆放浏览器、RViz 和摄像头窗口。</p>
+    <div class="row">
+      <a class="btn" href="/start_demo_layout.ps1" download>下载布局脚本</a>
+      <button onclick="copyLayoutCommand()">复制运行命令</button>
+    </div>
+    <textarea id="layout-command" readonly style="margin-top:8px;height:70px"></textarea>
+  </aside>
+  <section>
+    <div class="grid">
+      <div class="panel">
+        <h3>外设测试</h3>
+        <div class="row">
+          <button class="primary" onclick="startProcess('lidar_test', ports())">雷达测试</button>
+          <button class="primary" onclick="startProcess('stm32_test', ports())">STM32 测试</button>
+          <button class="primary" onclick="startProcess('camera_test', ports())">双目预览</button>
+        </div>
+        <p class="hint small">双目预览默认使用当前标定文件显示校正后的左右图，并绘制水平校正线。</p>
+      </div>
+      <div class="panel">
+        <h3>运行 Agent</h3>
+        <label>基础地图</label><select id="agent-map"></select>
+        <label>关键帧场景</label><select id="agent-session"></select>
+        <div class="row" style="margin-top:12px">
+          <button class="primary" onclick="startAgent()">启动 Agent</button>
+          <button class="danger" onclick="stopProcess('agent')">停止 Agent</button>
+        </div>
+      </div>
+      <div class="panel">
+        <h3>全新建图</h3>
+        <div class="row">
+          <button class="primary" onclick="startMapping()">启动 SLAM + RViz</button>
+          <button class="danger" onclick="stopProcess('slam')">停止建图</button>
+        </div>
+        <label>地图名称</label><input id="map-name">
+        <div class="row" style="margin-top:10px"><button class="ok" onclick="saveMap()">保存地图</button><span id="map-save" class="small muted"></span></div>
+      </div>
+      <div class="panel">
+        <h3>场景记忆</h3>
+        <label>场景名称</label><input id="scene-name">
+        <label>定位地图</label><select id="scene-map"></select>
+        <div class="row" style="margin-top:10px">
+          <button class="primary" onclick="startKeyframes()">开始采集</button>
+          <button class="danger" onclick="stopKeyframes()">停止并构建</button>
+        </div>
+        <label>已有场景</label><select id="scene-session"></select>
+        <div class="row" style="margin-top:10px">
+          <button class="primary" onclick="startManualRecord()">开始人工补录</button>
+          <button onclick="captureOnce()">保存当前帧</button>
+          <button class="ok" onclick="finishManualRecord()">结束补录并重建</button>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <button onclick="visualizeScene()">打开场景地图</button>
+          <button onclick="annotateScene(false)">补充标注</button>
+          <button onclick="annotateScene(true)">重标全部</button>
+        </div>
+        <label>剔除关键帧编号</label><input id="remove-kf-ids" placeholder="例如 1-5,7-9">
+        <div class="row" style="margin-top:10px">
+          <button class="danger" onclick="removeKeyframes()">从 selected 中剔除</button>
+        </div>
+      </div>
+      <div class="panel wide">
+        <h3>当前状态</h3>
+        <div class="status-list" id="status-list"></div>
+      </div>
+      <div class="panel wide">
+        <h3>轻量日志</h3>
+        <div class="log" id="light-log"></div>
+      </div>
+      <div class="panel wide">
+        <h3>地图与场景文件</h3>
+        <div id="artifact-list" class="links small"></div>
+      </div>
+    </div>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+let stateCache = {};
+let lastNoticeFrame = "";
+function stamp(prefix){ const d=new Date(), p=(n)=>String(n).padStart(2,"0"); return `${prefix}_${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`; }
+function opt(sel,val,label){ const o=document.createElement("option"); o.value=val; o.textContent=label||val; sel.appendChild(o); }
+async function api(path, options={}){ const r=await fetch(path,{headers:{"Content-Type":"application/json"},...options}); const d=await r.json(); if(!r.ok) throw new Error(d.error||"请求失败"); return d; }
+function ports(){ return {laser_port:$("laser").value||"/dev/ttyUSB0", stm32_port:$("stm32").value||"/dev/ttyACM0", camera_device:$("camera").value||"/dev/video0", camera_resolution:$("camera-resolution").value}; }
+async function loadPorts(){ const data=await api("/api/ports"); const serial=data.serial||[], cams=data.cameras||[]; fillSelect($("laser"), serial, "/dev/ttyUSB0"); fillSelect($("stm32"), serial, "/dev/ttyACM0"); fillSelect($("camera"), cams, "/dev/video0"); }
+function fillSelect(sel, values, preferred){ const old=sel.value; sel.innerHTML=""; const merged=[preferred,...values.filter(v=>v!==preferred)]; merged.forEach(v=>opt(sel,v)); sel.value=values.includes(old)?old:preferred; }
+async function startProcess(kind, body={}){ await api("/api/process/start",{method:"POST",body:JSON.stringify({kind,...body})}); await refresh(); }
+async function stopProcess(kind){ await api("/api/process/stop",{method:"POST",body:JSON.stringify({kind})}); await refresh(); }
+async function stopAll(){ await api("/api/process/stop_all",{method:"POST",body:"{}"}); await refresh(); }
+function selectedValue(id){ return $(id).value || ""; }
+async function startMapping(){ await startProcess("slam", {...ports(), map_base:""}); }
+async function saveMap(){ const name=$("map-name").value.trim()||stamp("map"); $("map-name").value=name; const r=await api("/api/map/save",{method:"POST",body:JSON.stringify({name})}); $("map-save").innerHTML=r.files?.map(p=>`<a target="_blank" href="/api/file?path=${encodeURIComponent(p)}">${p.split("/").pop()}</a>`).join(" ")||"保存失败"; await refresh(); }
+async function startKeyframes(){ const session=$("scene-name").value.trim()||stamp("SceneMemory"); $("scene-name").value=session; await startProcess("keyframe_record",{...ports(), session_name:session, map_base:selectedValue("scene-map")}); }
+async function stopKeyframes(){ await api("/api/process/stop",{method:"POST",body:JSON.stringify({kind:"keyframe_record", build_scene_memory:true, session_name:$("scene-name").value})}); await refresh(); }
+function selectedSceneDataset(){ return selectedValue("scene-session"); }
+function selectedSceneName(){
+  const dataset=selectedSceneDataset();
+  if(!dataset) return "";
+  const parts=dataset.replace(/\\/g,"/").split("/").filter(Boolean);
+  if(parts[parts.length-1]==="selected") return parts[parts.length-2]||"";
+  return parts[parts.length-1]||"";
+}
+async function startManualRecord(){
+  const dataset=selectedSceneDataset();
+  if(!dataset){ showNotice("请先选择已有场景"); return; }
+  $("scene-name").value=selectedSceneName();
+  await api("/api/keyframes/manual_record/start",{method:"POST",body:JSON.stringify({dataset, map_base:selectedValue("scene-map"), ...ports()})});
+  showNotice("已进入人工补录");
+  await refresh();
+}
+async function finishManualRecord(){
+  const dataset=selectedSceneDataset();
+  if(!dataset){ showNotice("请先选择已有场景"); return; }
+  await api("/api/process/stop",{method:"POST",body:JSON.stringify({kind:"keyframe_record", build_scene_memory:true, dataset, session_name:selectedSceneName()})});
+  showNotice("正在重建场景记忆");
+  await refresh();
+}
+async function captureOnce(){
+  const dataset=selectedSceneDataset();
+  try{
+    const r=await api("/api/keyframes/capture_once",{method:"POST",body:JSON.stringify({dataset})});
+    showNotice(r.message||"已保存关键帧");
+  }catch(e){
+    showNotice(e.message||"补录失败");
+  }
+  await refresh();
+}
+async function visualizeScene(){ const dataset=selectedValue("scene-session"); if(!dataset) return; const r=await api("/api/keyframes/visualize",{method:"POST",body:JSON.stringify({dataset})}); if(r.path) window.open("/api/file?path="+encodeURIComponent(r.path),"_blank"); await refresh(); }
+async function annotateScene(force){ const dataset=selectedValue("scene-session"); if(!dataset) return; await api("/api/keyframes/annotate",{method:"POST",body:JSON.stringify({dataset, force, batch_size:36})}); await refresh(); }
+async function removeKeyframes(){
+  const dataset=selectedValue("scene-session");
+  const ids=$("remove-kf-ids").value.trim();
+  if(!dataset){ showNotice("请先选择已有场景"); return; }
+  if(!ids){ showNotice("请填写关键帧编号"); return; }
+  if(!confirm(`确认从当前 selected 场景记忆中剔除关键帧 ${ids}？\n原始采集数据会保留。`)) return;
+  const r=await api("/api/keyframes/remove",{method:"POST",body:JSON.stringify({dataset,ids})});
+  showNotice(`已剔除 ${r.removed||0} 帧`);
+  await refresh();
+}
+async function startAgent(){ await startProcess("agent",{...ports(), map_base:selectedValue("agent-map"), dataset_dir:selectedValue("agent-session"), enable_cmd_vel:true}); }
+function showNotice(text){ const el=$("keyframe-notice"); el.textContent=text; el.classList.add("show"); setTimeout(()=>el.classList.remove("show"),1500); }
+function fileLink(path,label){ return path?`<a target="_blank" href="/api/file?path=${encodeURIComponent(path)}">${label}</a>`:""; }
+function refreshSelects(data){ const maps=data.maps||[], sessions=data.sessions||[]; [["agent-map",maps],["scene-map",maps]].forEach(([id,items])=>{ const old=$(id).value; $(id).innerHTML=""; items.forEach(m=>opt($(id),m.base_path,m.name)); if(items.some(m=>m.base_path===old)) $(id).value=old; }); [["agent-session",sessions],["scene-session",sessions]].forEach(([id,items])=>{ const old=$(id).value; $(id).innerHTML=""; items.forEach(s=>opt($(id),s.selected_path||s.path,s.name)); if(items.some(s=>(s.selected_path||s.path)===old)) $(id).value=old; }); }
+function render(data){ stateCache=data; $("agent-lite-link").href=`http://${location.hostname}:${data.agent_web_port||8123}/lite`; $("run-pill").textContent=(data.processes||[]).some(p=>p.running)?"运行中":"空闲"; refreshSelects(data); $("status-list").innerHTML=(data.processes||[]).map(p=>`<div class="status ${p.status}"><b>${p.name}</b> · ${p.stage}<div class="small muted">${p.latest||""}</div></div>`).join("")||'<div class="muted">暂无运行进程</div>'; $("light-log").textContent=(data.light_logs||[]).join("\\n")||"暂无提示"; const notice=data.latest_keyframe_notice; if(notice&&notice.frame_id!==lastNoticeFrame){ lastNoticeFrame=notice.frame_id; showNotice(notice.message); } $("artifact-list").innerHTML=[...(data.maps||[]).slice(0,6).map(m=>`<div><b>${m.name}</b> ${fileLink(m.yaml_path,"yaml")} ${m.files?.map(p=>fileLink(p,p.split("/").pop())).join(" ")||""}</div>`),...(data.sessions||[]).slice(0,8).map(s=>`<div><b>${s.name}</b> ${s.build_status||""} ${fileLink(s.review_html,"review")} ${fileLink(s.scene_html,"scene map")} ${fileLink(s.summary_json,"summary")} ${fileLink(s.manifest_json,"manifest")}</div>`)].join(""); const cmd=`powershell -ExecutionPolicy Bypass -File .\\\\start_demo_layout.ps1 -DashboardUrl http://${location.hostname}:${data.dashboard_port||8234}/demo -AgentUrl http://${location.hostname}:${data.agent_web_port||8123}/lite`; $("layout-command").value=cmd; }
+async function refresh(){ try{ render(await api("/api/demo/status")); }catch(e){ $("light-log").textContent=e.message||String(e); } }
+async function copyLayoutCommand(){ await navigator.clipboard.writeText($("layout-command").value); }
+$("map-name").value=stamp("map"); $("scene-name").value=stamp("SceneMemory"); loadPorts(); refresh(); setInterval(refresh,2000);
+</script>
+</body>
+</html>

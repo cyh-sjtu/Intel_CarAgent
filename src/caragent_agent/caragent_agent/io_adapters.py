@@ -14,6 +14,17 @@ from PIL import Image
 
 _LOGGER = logging.getLogger(__name__)
 _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+_LANGUAGE_ALIASES = {
+    "zh": "zh",
+    "zh-cn": "zh",
+    "cn": "zh",
+    "chinese": "zh",
+    "中文": "zh",
+    "en": "en",
+    "en-us": "en",
+    "english": "en",
+    "英文": "en",
+}
 _TRANSLATION_CACHE: dict[tuple[str, str, str], str] = {}
 _TRANSLATION_CACHE_MAX = 128
 
@@ -27,19 +38,17 @@ def detect_language(text: str) -> str:
 def language_name(language: str) -> str:
     """Return the human-readable language name expected in prompts."""
 
-    normalized = str(language or "auto").lower()
-    if normalized in {"zh", "zh-cn", "chinese"}:
+    normalized = normalize_language(language, fallback="en")
+    if normalized == "zh":
         return "Chinese"
-    if normalized in {"en", "english"}:
-        return "English"
-    return str(language or "the user's language")
+    return "English"
 
 
 def prepare_user_message_for_agent(
     message: str,
     *,
-    input_language: str = "auto",
-    output_language: str = "auto",
+    input_language: str = "zh",
+    output_language: str = "zh",
     translate_boundary: bool = True,
 ) -> str:
     """Translate the external user message into the agent's English work language.
@@ -52,25 +61,32 @@ def prepare_user_message_for_agent(
     if not clean_message or not translate_boundary or not _translation_enabled("input"):
         return clean_message
 
-    detected = detect_language(clean_message)
-    source = normalize_language(input_language, fallback=detected)
+    source = normalize_language(input_language, fallback="zh")
     if source == "en":
+        _LOGGER.debug("Input boundary translation skipped; input_language=en.")
         return clean_message
 
+    _LOGGER.info(
+        "Input boundary translation enabled: input_language=%s -> agent_language=en.",
+        source,
+    )
     return translate_text_for_agent(clean_message, source_language=source)
 
 
 def normalize_language(language: str | None, *, fallback: str = "en") -> str:
-    """Normalize UI/config language values to compact tags."""
+    """Normalize explicit UI/config language values to compact ``zh``/``en`` tags."""
 
-    raw = str(language or "auto").strip().lower()
-    if raw in {"auto", ""}:
-        return fallback
-    if raw in {"zh", "zh-cn", "chinese"}:
-        return "zh"
-    if raw in {"en", "english"}:
-        return "en"
-    return raw
+    raw = str(language or "").strip().lower()
+    normalized = _LANGUAGE_ALIASES.get(raw)
+    if normalized:
+        return normalized
+
+    fallback_raw = str(fallback or "").strip().lower()
+    fallback_normalized = _LANGUAGE_ALIASES.get(fallback_raw)
+    if fallback_normalized:
+        return fallback_normalized
+
+    return "en"
 
 
 def _translation_enabled(direction: str) -> bool:
@@ -99,6 +115,73 @@ def _translation_model() -> str:
         or config.get("llm_model")
         or "deepseek-chat"
     )
+
+
+def _interaction_profile() -> dict[str, Any]:
+    """Return the UI interaction profile without importing the guidance module."""
+
+    from caragent_agent.config.config import config
+
+    raw_profile = config.get("interaction_profile", {}) or {}
+    if isinstance(raw_profile, dict):
+        return dict(raw_profile)
+    if isinstance(raw_profile, str):
+        return {"profile_id": raw_profile}
+    return {}
+
+
+def response_role_enabled() -> bool:
+    """Return whether the user-facing reply role layer is enabled."""
+
+    profile = _interaction_profile()
+    if "response_role_enabled" in profile:
+        return bool(profile.get("response_role_enabled"))
+    return True
+
+
+def _response_role_prompt(target_language: str) -> str:
+    """Build the optional final reply role-layer prompt."""
+
+    target = normalize_language(target_language, fallback="zh")
+    profile = _interaction_profile()
+    role = str(profile.get("response_role") or "blind_assistance_companion").strip()
+    language = language_name(target)
+    if role == "none":
+        role = "plain_robot_assistant"
+
+    return (
+        f"Rewrite the assistant response in {language} for CarAgent's user-facing "
+        f"voice/display layer. Role profile: {role}. "
+        "The user may be blind or have low vision and is relying on the robot "
+        "for calm, useful guidance. Return only the rewritten response, with no "
+        "markdown and no explanation. Keep it short and warm. Preserve the real "
+        "meaning, uncertainty, destination names, object names, coordinates when "
+        "they are essential, and safety-critical warnings. Do not invent progress "
+        "or claim arrival unless the original says so. Avoid reading internal "
+        "system state, task ids, plan ids, keyframe ids, tool names, topics, file paths, logs, "
+        "JSON fields, provider names, or debugging wording unless the user asked "
+        "for those details. For navigation, do not give continuous turn-by-turn "
+        "motion commands; say only what the person needs now, such as that the "
+        "robot is starting, has arrived, needs clarification, or is waiting."
+    )
+
+
+def adapt_response_role_for_user(text: str, *, target_language: str = "zh") -> str:
+    """Apply the optional blind-assistance reply role layer."""
+
+    clean_text = str(text or "").strip()
+    if not clean_text or not response_role_enabled():
+        return clean_text
+
+    try:
+        adapted = _run_text_llm(
+            _response_role_prompt(target_language),
+            clean_text,
+        )
+        return adapted or clean_text
+    except Exception as exc:
+        _LOGGER.warning("Response role adaptation failed; using original text: %s", exc)
+        return clean_text
 
 
 def _remember_translation(cache_key: tuple[str, str, str], value: str) -> str:
@@ -148,7 +231,14 @@ def translate_text_for_agent(text: str, *, source_language: str = "zh") -> str:
                 "Preserve the user's action verb and intent. Do not compress an action "
                 "request into only a noun phrase: for example, translate requests to "
                 "approach, go to, inspect, photograph, compare, follow, wait, stop, or "
-                "change a plan with the corresponding explicit verb still present."
+                "change a plan with the corresponding explicit verb still present. "
+                "Translate conservatively: preserve the user's modifiers, relations, "
+                "and referential scope instead of interpreting or enriching them. "
+                "Do not add current-view or camera-view meaning unless the user explicitly "
+                "said the target is in the robot's camera/current image/current view, "
+                "or in front of the robot/you. Preserve ordinary landmark/spatial phrases "
+                "such as 'next to the table', 'beside the elevator', 'left of the door' "
+                "as scene-memory target constraints, not as current-view evidence."
             ),
             clean_text,
         )
@@ -162,45 +252,48 @@ def translate_text_for_user(text: str, *, target_language: str = "zh") -> str:
     """Translate an agent response for display, preserving technical payloads."""
 
     clean_text = str(text or "").strip()
-    target = normalize_language(target_language, fallback="en")
+    target = normalize_language(target_language, fallback="zh")
+    if not clean_text:
+        return clean_text
+
     if not _translation_enabled("output"):
-        _LOGGER.debug("Output boundary translation is disabled; using original text.")
-        return clean_text
-    if not clean_text or target == "en":
-        return clean_text
+        _LOGGER.debug("Output boundary translation is disabled; applying role layer only.")
+        return adapt_response_role_for_user(clean_text, target_language=target)
+
+    if target == "en":
+        return adapt_response_role_for_user(clean_text, target_language=target)
+
     try:
+        _LOGGER.info("Output boundary translation enabled: agent_language=en -> output_language=%s.", target)
         translated = _run_text_llm(
             (
                 f"Translate the assistant response into {language_name(target)}. "
                 "Return only the translated response. Make Chinese output natural, concise, "
                 "and conversational, like a robot assistant reporting to its user. Avoid stiff "
                 "literal translation and phrases such as \"根据导航记忆\" when a simpler phrase "
-                "like \"我去过\" is enough. Preserve JSON snippets, tool names, keyframe ids, "
-                "coordinates, topic names, file paths, and error codes exactly."
+                "like \"我去过\" is enough. Preserve essential place names, object names, "
+                "coordinates, and safety-critical warnings exactly."
             ),
             clean_text,
         )
-        return translated or clean_text
+        return adapt_response_role_for_user(
+            translated or clean_text,
+            target_language=target,
+        )
     except Exception as exc:
         _LOGGER.warning("Output boundary translation failed; using original text: %s", exc)
-        return clean_text
+        return adapt_response_role_for_user(clean_text, target_language=target)
 
 
 def adapt_turn_result_language(
     turn_result: dict[str, Any],
     *,
-    output_language: str = "auto",
-    original_input_language: str = "auto",
+    output_language: str = "zh",
+    original_input_language: str = "zh",
 ) -> dict[str, Any]:
     """Translate final response fields for the UI/ROS boundary when requested."""
 
-    target = normalize_language(
-        output_language,
-        fallback=normalize_language(original_input_language, fallback="en"),
-    )
-    if target == "en" or not _translation_enabled("output"):
-        return turn_result
-
+    target = normalize_language(output_language, fallback="zh")
     adapted = dict(turn_result)
     adapted["output_language"] = target
     adapted["language_adapted"] = True

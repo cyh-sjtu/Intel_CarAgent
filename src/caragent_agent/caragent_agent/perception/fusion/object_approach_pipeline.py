@@ -77,6 +77,14 @@ def _json_from_text(text: str) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+def _object_approach_vlm_select_timeout_sec() -> float:
+    raw = config.get("object_approach_vlm_select_timeout_sec", 22)
+    try:
+        return max(5.0, float(raw))
+    except Exception:
+        return 22.0
+
+
 def _pil_to_bgr(image: PILImage.Image) -> np.ndarray:
     rgb = np.asarray(image.convert("RGB"))
     return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
@@ -401,7 +409,12 @@ Rules:
             result["stages"].append({"name": "snapshot", "status": "ok", "paths": dict(result["paths"])})
             result["stages"].append({"name": "label_plan", "status": label_plan.get("status", "ok"), "paths": {"label_plan_json": str(label_plan_path)}})
             emit_progress("grounding_vlm_select", "running", "Running GroundingDINO detection and VLM box selection.")
-            vlm_payload = self._run_vlm_selection(image_path, output_dir, label_plan)
+            vlm_payload = self._run_vlm_selection(
+                image_path,
+                output_dir,
+                label_plan,
+                progress=emit_progress,
+            )
             result["vlm_selection"] = vlm_payload
             vlm_paths = _paths_from_mapping(vlm_payload.get("paths"))
             result["paths"].update(vlm_paths)
@@ -665,9 +678,22 @@ Rules:
                 path.mkdir(parents=True, exist_ok=True)
         return runner
 
-    def _run_vlm_selection(self, image_path: Path, output_dir: Path, label_plan: dict[str, Any]) -> dict[str, Any]:
+    def _run_vlm_selection(
+        self,
+        image_path: Path,
+        output_dir: Path,
+        label_plan: dict[str, Any],
+        *,
+        progress: Callable[[str, str, str], None] | None = None,
+    ) -> dict[str, Any]:
         runner = self._get_runner(output_dir)
-        return self._run_vlm_selection_with_runner(runner, image_path, output_dir, label_plan)
+        return self._run_vlm_selection_with_runner(
+            runner,
+            image_path,
+            output_dir,
+            label_plan,
+            progress=progress,
+        )
 
     def _run_vlm_selection_with_runner(
         self,
@@ -675,6 +701,8 @@ Rules:
         image_path: Path,
         output_dir: Path,
         label_plan: dict[str, Any],
+        *,
+        progress: Callable[[str, str, str], None] | None = None,
     ) -> dict[str, Any]:
         from caragent_agent.perception.grounding.vlm_select_box import (
             ask_vlm_to_select,
@@ -700,19 +728,35 @@ Rules:
         if grounding_query and grounding_query[-1] not in ".。!?！？":
             grounding_query = f"{grounding_query} ."
 
+        def emit_stage(name: str, status: str, message: str = "") -> None:
+            if progress is None:
+                return
+            try:
+                progress(name, status, message)
+            except Exception:
+                return
+
         if runner.grounding_model is None:
             raise RuntimeError("GroundingDINO model is not loaded for object approach.")
+        emit_stage("grounding_dino_detect", "running", "Running GroundingDINO open-vocabulary detection.")
         grounding = runner.grounding_model.detect(
             image_path=image_path,
             text_prompt=grounding_query,
             box_threshold=0.25,
             text_threshold=0.20,
         )
+        emit_stage(
+            "grounding_dino_detect",
+            "ok",
+            f"GroundingDINO returned {len(grounding.get('detections') or [])} raw boxes.",
+        )
         image = PILImage.open(image_path).convert("RGB")
         all_candidates = prepare_candidates(
             grounding.get("detections", []),
             image_size=image.size,
             max_candidates=999,
+            nms_iou_threshold=None,
+            max_area_ratio=None,
         )
         candidates = prepare_candidates(
             grounding.get("detections", []),
@@ -737,16 +781,39 @@ Rules:
                 "query": vlm_query,
             }
         else:
-            selection, raw_vlm_response = asyncio.run(
-                ask_vlm_to_select(
-                    vlm_query=vlm_query,
-                    grounding_query=grounding_query,
-                    image_size=image.size,
-                    candidates=candidates,
-                    candidate_overlay_path=candidates_png,
-                    crop_grid_path=crops_png,
-                    model=str(config.get("vlm_model_analyse_images", "qwen3-vl-plus")),
+            timeout_sec = _object_approach_vlm_select_timeout_sec()
+            emit_stage(
+                "vlm_box_select",
+                "running",
+                f"Asking VLM to select one object box; timeout={timeout_sec:.1f}s.",
+            )
+            try:
+                selection, raw_vlm_response = asyncio.run(
+                    asyncio.wait_for(
+                        ask_vlm_to_select(
+                            vlm_query=vlm_query,
+                            grounding_query=grounding_query,
+                            image_size=image.size,
+                            candidates=candidates,
+                            candidate_overlay_path=candidates_png,
+                            crop_grid_path=crops_png,
+                            model=str(config.get("vlm_model_analyse_images", "qwen3-vl-plus")),
+                        ),
+                        timeout=timeout_sec,
+                    )
                 )
+            except asyncio.TimeoutError:
+                selection = {
+                    "status": "vlm_timeout",
+                    "selected_id": None,
+                    "confidence": 0.0,
+                    "reason": f"VLM box selection timed out after {timeout_sec:.1f}s.",
+                    "query": vlm_query,
+                }
+            emit_stage(
+                "vlm_box_select",
+                str(selection.get("status") or "unknown"),
+                str(selection.get("reason") or "VLM box selection finished."),
             )
         draw_selected_overlay(image_path, candidates, selection, selected_png)
 

@@ -261,7 +261,7 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "max_angular_radps",
-                default_value="1.25",
+                default_value="3.50",
                 description="STM32 cmd_vel angular clamp for navigation mode.",
             ),
             DeclareLaunchArgument(

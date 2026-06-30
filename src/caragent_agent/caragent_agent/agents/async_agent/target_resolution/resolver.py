@@ -516,6 +516,14 @@ class TargetResolver:
                 "evidence": [],
                 "failure_reason": "semantic_keyframe target is missing query.",
             }
+        if _contains_unresolved_template({"query": query, "target_ref": target_ref, "raw_target": draft.get("raw_target")}):
+            return {
+                "status": "failed",
+                "draft": draft,
+                "target_ref": target_ref,
+                "evidence": [],
+                "failure_reason": "semantic_keyframe target contains unresolved upstream template text.",
+            }
         background_anchor = self._semantic_keyframe_anchor_from_background()
         if background_anchor is not None:
             evidence = [

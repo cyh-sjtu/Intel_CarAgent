@@ -417,6 +417,33 @@ def _load_persisted_chunk_index(scene) -> dict | None:
         return None
 
 
+def _load_compatible_persisted_chunk_index(scene) -> dict | None:
+    """Load an older chunk index for row-level reuse when scene nodes changed."""
+
+    records_path, matrix_path = _chunk_index_paths(scene)
+    if not records_path.exists() or not matrix_path.exists():
+        return None
+    try:
+        payload = json.loads(records_path.read_text(encoding="utf-8"))
+        metadata = payload.get("metadata") if isinstance(payload, dict) else {}
+        records = payload.get("records") if isinstance(payload, dict) else None
+        if not isinstance(metadata, dict) or not isinstance(records, list):
+            return None
+        if int(metadata.get("version") or 0) != 1:
+            return None
+        if int(metadata.get("chunk_max_chars") or 0) != int(CHUNK_MAX_CHARS):
+            return None
+        if int(metadata.get("chunk_limit_per_keyframe") or 0) != int(CHUNK_LIMIT_PER_KEYFRAME):
+            return None
+        matrix = np.load(matrix_path).astype(np.float32)
+        if matrix.ndim != 2 or matrix.shape[0] != len(records):
+            return None
+        backend = str(metadata.get("backend") or "")
+        return {"records": records, "matrix": matrix, "backend": backend, "persisted": True}
+    except Exception:
+        return None
+
+
 def _save_persisted_chunk_index(scene, index: dict) -> None:
     records = list(index.get("records") or [])
     matrix = np.asarray(index.get("matrix"), dtype=np.float32)
@@ -436,6 +463,102 @@ def _save_persisted_chunk_index(scene, index: dict) -> None:
         encoding="utf-8",
     )
     np.save(matrix_path, matrix)
+
+
+def _current_chunk_records(scene) -> tuple[list[dict], list[str]]:
+    chunk_records: list[dict] = []
+    chunk_texts: list[str] = []
+    for kf_id, node in scene.keyframe_nodes.items():
+        semantic = str(getattr(node, "semantic", "") or "")
+        for chunk in split_semantic_chunks(semantic):
+            chunk_records.append({"keyframe_id": int(kf_id), "text": chunk})
+            chunk_texts.append(chunk)
+    return chunk_records, chunk_texts
+
+
+def _encode_chunks_with_openvino(scene, chunks: list[str]) -> np.ndarray | None:
+    encoder = getattr(scene, "clip_text_encoder", None)
+    if encoder is None:
+        return None
+    embeddings = []
+    for chunk in chunks:
+        embeddings.append(encoder.encode_text(chunk))
+    if not embeddings:
+        return None
+    return np.stack(embeddings).astype(np.float32)
+
+
+def _encode_chunks_for_backend(scene, chunks: list[str], backend: str) -> np.ndarray | None:
+    if not chunks:
+        return np.zeros((0, 0), dtype=np.float32)
+    if backend == "openvino_text":
+        return _encode_chunks_with_openvino(scene, chunks)
+    if backend == "torch_text":
+        return _encode_chunks_with_torch(scene, chunks)
+    return None
+
+
+def _build_incremental_chunk_index(
+    scene,
+    chunk_records: list[dict],
+    chunk_texts: list[str],
+) -> dict | None:
+    persisted = _load_compatible_persisted_chunk_index(scene)
+    if persisted is None:
+        return None
+    backend = str(persisted.get("backend") or "")
+    if backend not in {"openvino_text", "torch_text"}:
+        return None
+    if backend == "openvino_text" and getattr(scene, "clip_text_encoder", None) is None:
+        return None
+    if backend == "torch_text" and getattr(scene, "clip_model", None) is None:
+        return None
+
+    old_records = list(persisted.get("records") or [])
+    old_matrix = np.asarray(persisted.get("matrix"), dtype=np.float32)
+    if old_matrix.ndim != 2 or old_matrix.shape[0] != len(old_records):
+        return None
+
+    reusable: dict[tuple[int, str], np.ndarray] = {}
+    for idx, record in enumerate(old_records):
+        try:
+            key = (int(record.get("keyframe_id")), str(record.get("text") or ""))
+        except Exception:
+            continue
+        reusable[key] = old_matrix[idx].astype(np.float32)
+
+    rows: list[np.ndarray | None] = []
+    missing_indices: list[int] = []
+    missing_texts: list[str] = []
+    for idx, record in enumerate(chunk_records):
+        key = (int(record["keyframe_id"]), str(record["text"]))
+        existing = reusable.get(key)
+        if existing is None:
+            rows.append(None)
+            missing_indices.append(idx)
+            missing_texts.append(chunk_texts[idx])
+        else:
+            rows.append(existing)
+
+    if not missing_indices:
+        matrix = np.stack([row for row in rows if row is not None]).astype(np.float32)
+        return {"records": chunk_records, "matrix": matrix, "backend": backend, "persisted": False}
+
+    new_matrix = _encode_chunks_for_backend(scene, missing_texts, backend)
+    if new_matrix is None or new_matrix.ndim != 2 or new_matrix.shape[0] != len(missing_indices):
+        return None
+    if old_matrix.shape[1] != new_matrix.shape[1]:
+        return None
+    for idx, row in zip(missing_indices, new_matrix):
+        rows[idx] = row.astype(np.float32)
+    if any(row is None for row in rows):
+        return None
+    matrix = np.stack([row for row in rows if row is not None]).astype(np.float32)
+    _log_search_progress(
+        f"semantic chunk index reused {len(chunk_records) - len(missing_indices)} rows; "
+        f"encoded {len(missing_indices)} new rows"
+    )
+    return {"records": chunk_records, "matrix": matrix, "backend": backend, "persisted": False}
 
 
 def _encode_chunks_with_torch(scene, chunks: list[str]) -> np.ndarray | None:
@@ -495,25 +618,27 @@ def _build_chunk_index(
                 _CHUNK_INDEX_CACHE[cache_key] = persisted
                 return persisted
 
-    chunk_records: list[dict] = []
-    chunk_texts: list[str] = []
-    for kf_id, node in scene.keyframe_nodes.items():
-        semantic = str(getattr(node, "semantic", "") or "")
-        for chunk in split_semantic_chunks(semantic):
-            chunk_records.append({"keyframe_id": int(kf_id), "text": chunk})
-            chunk_texts.append(chunk)
+    chunk_records, chunk_texts = _current_chunk_records(scene)
     if not chunk_texts:
         return None
+
+    if prefer_persisted and not force_rebuild:
+        incremental = _build_incremental_chunk_index(scene, chunk_records, chunk_texts)
+        if incremental is not None:
+            matrix = np.asarray(incremental["matrix"], dtype=np.float32)
+            norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+            incremental["matrix"] = matrix / np.maximum(norms, 1e-12)
+            if persist:
+                _save_persisted_chunk_index(scene, incremental)
+                incremental["persisted"] = True
+            _CHUNK_INDEX_CACHE[cache_key] = incremental
+            return incremental
 
     matrix = None
     backend = ""
     if getattr(scene, "clip_text_encoder", None) is not None:
-        embeddings = []
-        for chunk in chunk_texts:
-            embeddings.append(scene.clip_text_encoder.encode_text(chunk))
-        if embeddings:
-            matrix = np.stack(embeddings).astype(np.float32)
-            backend = "openvino_text"
+        matrix = _encode_chunks_with_openvino(scene, chunk_texts)
+        backend = "openvino_text" if matrix is not None else ""
     if matrix is None:
         matrix = _encode_chunks_with_torch(scene, chunk_texts)
         backend = "torch_text" if matrix is not None else ""

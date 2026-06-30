@@ -29,6 +29,7 @@ setup(
         "console_scripts": [
             "keyframe_recorder_node = caragent_memory.keyframe_recorder_node:main",
             "select_keyframes = caragent_memory.select_keyframes:main",
+            "build_scene_memory = caragent_memory.build_scene_memory:main",
             "convert_clip_openvino = caragent_memory.convert_clip_openvino:main",
             "convert_dinov2_openvino = caragent_memory.convert_dinov2_openvino:main",
         ],

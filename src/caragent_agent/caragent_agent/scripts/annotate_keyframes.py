@@ -14,9 +14,10 @@ import json
 import os
 import sys
 import threading
+from typing import Any
 from pathlib import Path
 
-from caragent_agent.config.config import config, ensure_api_key_env
+from caragent_agent.config.config import config, ensure_api_key_env, get_api_keys
 from caragent_agent.impression_graph.scene_memory import SceneMemory
 from caragent_agent.utils.llm_handler import UnifiedLLMClient
 from caragent_agent.utils.llm_request_generator import (
@@ -55,13 +56,60 @@ def _extract_semantic(response_data, req_id: int) -> str:
     if isinstance(response_data, dict):
         if not response_data:
             return ""
+        if "error" in response_data:
+            return ""
         value = response_data.get(req_id)
         if value is None:
             value = response_data.get(str(req_id))
         if value is None:
             value = next(iter(response_data.values()), "")
+        if isinstance(value, dict) and "error" in value:
+            return ""
         return "" if value is None else str(value).strip()
     return str(response_data).strip()
+
+
+def _result_error(response_data: Any, req_id: int) -> str:
+    if response_data is None:
+        return "no response"
+    if not isinstance(response_data, dict):
+        return ""
+    if "error" in response_data:
+        return str(response_data.get("error") or "error")
+    value = response_data.get(req_id)
+    if value is None:
+        value = response_data.get(str(req_id))
+    if isinstance(value, dict) and "error" in value:
+        return str(value.get("error") or "error")
+    return ""
+
+
+def _dashscope_key_pool() -> list[str]:
+    return get_api_keys("qwen")
+
+
+async def _run_annotation_batch(
+    requests: list[dict[str, Any]],
+    clients: list[UnifiedLLMClient],
+) -> dict[int, Any]:
+    async def _run_single(request: dict[str, Any]) -> tuple[int, Any]:
+        req_id = int(request["request_id"])
+        client_index = int(request.get("client_index", 0)) % len(clients)
+        client = clients[client_index]
+        try:
+            response = await client.chat_completion(
+                request["model"],
+                request["messages"],
+                **request.get("kwargs", {}),
+            )
+            return req_id, {req_id: response}
+        except Exception as exc:
+            return req_id, {req_id: {"error": str(exc)}}
+
+    completed = await asyncio.gather(
+        *(_run_single(request) for request in requests)
+    )
+    return {req_id: result for req_id, result in completed}
 
 
 async def _retry_single_annotation(
@@ -117,6 +165,7 @@ def annotate(
         if skipped:
             print(f"Skipping {skipped} already-annotated keyframes (use --force to redo).")
     total = len(pending)
+    batch_size = max(1, int(batch_size))
     print(f"Annotating {total} keyframes with model={model}, batch_size={batch_size}")
 
     ensure_api_key_env("qwen")
@@ -139,40 +188,59 @@ def annotate(
             else:
                 print("CLIP model unavailable, skipping semantic_clip_encoding.")
 
-    client = UnifiedLLMClient()
+    key_pool = _dashscope_key_pool()
+    if key_pool:
+        print(f"Using DashScope API key pool: {len(key_pool)} key(s).")
+        clients = [
+            UnifiedLLMClient(
+                api_key_overrides={"qwen": key},
+                limiter_namespace=f"dashscope_key_{index}",
+            )
+            for index, key in enumerate(key_pool)
+        ]
+    else:
+        clients = [UnifiedLLMClient()]
     annotated = 0
+    failed = 0
 
     for batch_start in range(0, total, batch_size):
         batch = pending[batch_start : batch_start + batch_size]
         requests = []
-        for node in batch:
+        client_index_by_req: dict[int, int] = {}
+        for offset, node in enumerate(batch):
             messages = vlm_single_image_request_message_kf(node)
+            client_index = (batch_start + offset) % len(clients)
+            client_index_by_req[int(node.kf_id)] = client_index
             requests.append({
+                "client_index": client_index,
                 "request_id": node.kf_id,
                 "model": model,
                 "messages": messages,
             })
 
         try:
-            results = asyncio.run(client.batch_chat_completion(requests))
+            results = asyncio.run(_run_annotation_batch(requests, clients))
         except Exception as exc:
             print(f"Batch [{batch_start}:{batch_start + len(batch)}] failed: {exc}")
+            failed += len(batch)
             continue
 
         for node in batch:
             req_id = node.kf_id
-            if req_id not in results or "error" in results.get(req_id, {}):
-                status = results.get(req_id, {}).get("error", "no response")
+            response_data = results.get(req_id)
+            status = _result_error(response_data, req_id)
+            if req_id not in results or status:
+                status = status or "no response"
                 print(f"  kf_{req_id}: FAILED — {status}")
+                failed += 1
                 continue
 
-            response_data = results[req_id]
             semantic = _extract_semantic(response_data, req_id)
             if not semantic:
                 try:
                     semantic = asyncio.run(
                         _retry_single_annotation(
-                            client,
+                            clients[client_index_by_req.get(int(req_id), 0)],
                             node,
                             model=model,
                             reason="EMPTY response",
@@ -183,6 +251,7 @@ def annotate(
                     semantic = ""
             if not semantic:
                 print(f"  kf_{req_id}: EMPTY response after retry, skipping.")
+                failed += 1
                 continue
 
             node.semantic = semantic
@@ -209,7 +278,7 @@ def annotate(
             annotated += 1
             print(f"  kf_{req_id}: OK ({annotated}/{total}) — {node.semantic[:80]}...")
 
-    print(f"\nDone. Annotated {annotated}/{total} keyframes.")
+    print(f"\nDone. Annotated {annotated}/{total} keyframes. failed={failed}")
     return annotated
 
 

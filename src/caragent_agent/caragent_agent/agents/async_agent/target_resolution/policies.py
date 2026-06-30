@@ -58,6 +58,9 @@ def target_ref_from_draft(
             "source": draft["source_hint"],
             "description": draft["description"],
         }
+        for label_key in ("display_label", "user_query"):
+            if target.get(label_key):
+                ref[label_key] = str(target.get(label_key) or "").strip()
         if target.get("image_refs"):
             ref["image_refs"] = target.get("image_refs")
         image_focus = str(target.get("image_focus") or "").strip().lower()
@@ -82,6 +85,9 @@ def target_ref_from_draft(
         "description": draft["description"],
         "query": draft["description"],
     }
+    for label_key in ("display_label", "user_query"):
+        if target.get(label_key):
+            ref[label_key] = str(target.get(label_key) or "").strip()
     if target.get("image_refs"):
         ref["image_refs"] = target.get("image_refs")
     image_focus = str(target.get("image_focus") or "").strip().lower()

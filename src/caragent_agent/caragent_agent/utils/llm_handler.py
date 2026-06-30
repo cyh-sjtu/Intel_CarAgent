@@ -58,16 +58,45 @@ class UnifiedLLMClient:
     _foreground_active = 0
     _foreground_provider_demand: Dict[str, int] = {}
     
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        api_key_overrides: Optional[Dict[str, str]] = None,
+        limiter_namespace: Optional[str] = None,
+    ):
         self.models: Dict[str, BaseLLM] = {}
         self.callback_handler = LLMCallbackHandler()
+        self._api_key_overrides = self._normalize_api_key_overrides(api_key_overrides)
+        self._limiter_namespace = str(limiter_namespace or "").strip()
         self._init_models()
+
+    def _normalize_api_key_overrides(
+        self,
+        raw_overrides: Optional[Dict[str, str]],
+    ) -> Dict[str, str]:
+        if not raw_overrides:
+            return {}
+        normalized: Dict[str, str] = {}
+        for provider, value in raw_overrides.items():
+            key = str(provider or "").strip().lower()
+            if key == "dashscope":
+                key = "qwen"
+            text = str(value or "").strip()
+            if key and text:
+                normalized[key] = text
+        return normalized
+
+    def _api_key_for_provider(self, provider: str) -> str:
+        normalized = str(provider or "").strip().lower()
+        if normalized == "dashscope":
+            normalized = "qwen"
+        return self._api_key_overrides.get(normalized) or ensure_api_key_env(normalized)
     
     def _init_models(self):
         """Initialize all supported model backends."""
-        dashscope_api_key = ensure_api_key_env("qwen")
-        deepseek_api_key = ensure_api_key_env("deepseek")
-        doubao_api_key = ensure_api_key_env("doubao")
+        dashscope_api_key = self._api_key_for_provider("qwen")
+        deepseek_api_key = self._api_key_for_provider("deepseek")
+        doubao_api_key = self._api_key_for_provider("doubao")
         raw_request_timeout = config.get("llm_request_timeout_sec", 25)
         if isinstance(raw_request_timeout, dict):
             raw_request_timeout = raw_request_timeout.get("default", 25)
@@ -320,6 +349,11 @@ class UnifiedLLMClient:
                 secondary_lookup_key=provider,
             ),
         )
+
+    def _limiter_key(self, key: str) -> str:
+        if not self._limiter_namespace:
+            return key
+        return f"{self._limiter_namespace}:{key}"
 
     @classmethod
     def _get_shared_limiter(
@@ -578,12 +612,12 @@ class UnifiedLLMClient:
         )
         model_limiter = self._get_shared_limiter(
             self._model_limiters,
-            model,
+            self._limiter_key(model),
             model_limit,
         )
         provider_limiter = self._get_shared_limiter(
             self._provider_limiters,
-            provider,
+            self._limiter_key(provider),
             provider_limit,
         )
 

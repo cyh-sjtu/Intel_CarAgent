@@ -1512,6 +1512,7 @@ def _state_excerpt(state: dict[str, Any]) -> dict[str, Any]:
         "recent_events": _to_jsonable(events[-8:]),
         "background_results": background_excerpt,
         "turn_response_items": _to_jsonable(state.get("turn_response_items", [])),
+        "guidance_events": _to_jsonable(state.get("guidance_events", [])[-12:]),
         "turn_response_type": state.get("turn_response_type"),
         "turn_response_text": state.get("turn_response_text"),
         "user_facing_response": state.get("user_facing_response"),
@@ -2364,6 +2365,52 @@ class AsyncAgentRunMemory:
             },
         )
 
+    def record_session_initial_pose(
+        self,
+        *,
+        position: list[float],
+        orientation: Optional[Any] = None,
+        source: str = "controller",
+        details: Optional[dict[str, Any]] = None,
+    ) -> bool:
+        """Record the first valid robot pose of this Agent session once."""
+
+        pose = _safe_float_triplet(position)
+        if pose is None:
+            return False
+
+        with self._lock:
+            for item in self._data.get("observations", []):
+                if (
+                    isinstance(item, dict)
+                    and str(item.get("source") or "").strip() == "session_initial_pose"
+                ):
+                    return False
+
+            self._data.setdefault("observations", []).append(
+                _to_jsonable(
+                    {
+                        "thread_id": None,
+                        "plan_id": None,
+                        "task_id": None,
+                        "summary": "Agent 启动后记录的初始机器人位置。",
+                        "keyframe_id": None,
+                        "position": pose,
+                        "anchor_id": "session_initial_pose",
+                        "source": "session_initial_pose",
+                        "details": {
+                            **(details or {}),
+                            "orientation": orientation,
+                            "pose_source": source,
+                            "route_role": "session_start",
+                        },
+                        "recorded_at": _utc_now_iso(),
+                    }
+                )
+            )
+            self._flush_locked()
+            return True
+
     def record_tool_trace(
         self,
         *,
@@ -2876,17 +2923,50 @@ class AsyncAgentRunMemory:
                 _safe_int(task_row.get("task_id")),
             )
             task_row_by_identity.setdefault(identity, task_row_id)
-        for index, item in enumerate(self._confirmed_route_items_locked(), start=1):
+
+        for item in self._data.get("observations", []):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("source") or "").strip() != "session_initial_pose":
+                continue
+            position = _safe_float_triplet(item.get("position"))
+            if position is None:
+                continue
+            rows.append(
+                {
+                    "row_id": f"navigation_{len(rows) + 1}",
+                    "order": len(rows) + 1,
+                    "anchor_id": item.get("anchor_id") or "session_initial_pose",
+                    "label": "Agent 启动初始位置",
+                    "description": "Agent 启动后记录的初始机器人位置，可作为本次路线起点。",
+                    "plan_id": None,
+                    "task_id": None,
+                    "related_task_row_id": None,
+                    "keyframe_id": None,
+                    "position": position,
+                    "arrived_at": None,
+                    "route_role": "session_start",
+                    "source": "session_initial_pose",
+                    "source_event_id": None,
+                    "details": _to_jsonable(item.get("details") or {}),
+                    "created_at": item.get("recorded_at"),
+                }
+            )
+            break
+
+        for item in self._confirmed_route_items_locked():
             position = _safe_float_triplet(item.get("destination_position"))
             arrived_at_text = item.get("arrived_at")
             task_identity = (
                 str(item.get("plan_id") or "").strip(),
                 _safe_int(item.get("task_id")),
             )
+            index = len(rows) + 1
             rows.append(
                 {
                     "row_id": f"navigation_{index}",
-                    "order": item.get("order") or index,
+                    "order": index,
+                    "arrival_order": item.get("order"),
                     "anchor_id": f"anchor_{index}",
                     "label": item.get("description"),
                     "description": item.get("description"),
@@ -2896,6 +2976,7 @@ class AsyncAgentRunMemory:
                     "keyframe_id": item.get("destination_keyframe_id"),
                     "position": position or item.get("destination_position"),
                     "arrived_at": arrived_at_text,
+                    "route_role": "arrival",
                     "source": item.get("source"),
                     "source_event_id": item.get("source_event_id"),
                     "created_at": arrived_at_text,

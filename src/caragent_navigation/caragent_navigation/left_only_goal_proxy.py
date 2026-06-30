@@ -68,9 +68,11 @@ class LeftOnlyGoalProxy(Node):
         self.declare_parameter("arrival_tolerance_m", 0.25)
         self.declare_parameter("yaw_tolerance_deg", 4.0)
         self.declare_parameter("settle_time_sec", 0.7)
-        self.declare_parameter("fast_omega", 1.45)
-        self.declare_parameter("mid_omega", 0.95)
-        self.declare_parameter("slow_omega", 0.40)
+        self.declare_parameter("fast_omega", 3.40)
+        self.declare_parameter("mid_omega", 2.50)
+        self.declare_parameter("slow_omega", 1.50)
+        self.declare_parameter("fast_threshold_deg", 20.0)
+        self.declare_parameter("mid_threshold_deg", 10.0)
         self.declare_parameter("rotation_timeout_sec", 15.0)
         self.declare_parameter("rotation_loop_rate_hz", 20.0)
         self.declare_parameter("right_turn_shortcut_deg", 90.0)
@@ -119,6 +121,12 @@ class LeftOnlyGoalProxy(Node):
         self._fast_omega = max(0.0, float(self.get_parameter("fast_omega").value))
         self._mid_omega = max(0.0, float(self.get_parameter("mid_omega").value))
         self._slow_omega = max(0.0, float(self.get_parameter("slow_omega").value))
+        self._fast_threshold_rad = math.radians(
+            max(0.0, float(self.get_parameter("fast_threshold_deg").value))
+        )
+        self._mid_threshold_rad = math.radians(
+            max(0.0, float(self.get_parameter("mid_threshold_deg").value))
+        )
         self._rotation_timeout_sec = max(
             0.5, float(self.get_parameter("rotation_timeout_sec").value)
         )
@@ -563,9 +571,9 @@ class LeftOnlyGoalProxy(Node):
         return False
 
     def _omega_for_delta(self, ccw_delta: float) -> float:
-        if ccw_delta > math.radians(45.0):
+        if ccw_delta > self._fast_threshold_rad:
             return self._fast_omega
-        if ccw_delta > math.radians(15.0):
+        if ccw_delta > self._mid_threshold_rad:
             return self._mid_omega
         return self._slow_omega
 
